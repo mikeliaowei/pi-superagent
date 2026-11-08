@@ -42,8 +42,9 @@ policy, the effect queue and the "confirm once, then stay quiet" reply style com
   last 3,000 characters of output go back to the same Pi session, which fixes and reports ready again. After
   `max_test_retries` failed fixes the Ticket is reported blocked ("tests still failing: <command>").
 - **Delivery.** On `ready` (and passing tests), the service (not the worker) pushes `agent/<name>` with its token
-  and opens or reuses a PR. It first fetches the worktree's HEAD into its own bare repo and pushes from there
-  (`<state_dir>/push.git` in the single-repo form, `<state_dir>/push/<owner>__<name>.git` with `[[repos]]`). The
+  and opens or reuses a PR. For every push it creates a new private bare repo next to `<state_dir>/push.git`
+  (single-repo form) or `<state_dir>/push/<owner>__<name>.git` (`[[repos]]`), fetches the worktree's HEAD into
+  it, pushes from it, and deletes it, so nothing a worker wrote earlier can change how the token is sent. The
   body states the tests (``Tests: `<command>` passed in <N>s`` or `Tests: no test command configured for
   <repo>.`) and says `Closes #<n>` when the request came from an issue. No commits means a "no changes" reply
   and no PR. The Ticket ends when the PR is merged or closed, or when someone stops it.
@@ -94,6 +95,13 @@ venv. Workers find `superagent-report` because the service puts its own `bin` di
    `ANTHROPIC_API_KEY` in the service's environment, or sign Pi in with a claude.ai account that has extra usage
    turned on. Pi's subscription sign-in alone is refused for third-party use ("Third-party apps now draw from your
    extra usage"); the run then fails, and the agent says so on the thread.
+
+   Any provider Pi is already signed in to works the same way, with no key in this config: workers use the
+   logins stored in Pi's agent dir (`~/.pi/agent`). See which are ready with
+   `~/.pi/agent/bin/pi auth check --provider <name> --json`, list models with `pi --list-models`, then set for
+   example `provider = "ollama"` and `model = "gemma4:31b-cloud"`. A GitHub Copilot sign-in works only for models
+   your Copilot plan has enabled; otherwise Pi answers `The requested model is not supported`. Smaller models get
+   more tickets `blocked` or `failed` on long multi-step tasks.
 
 Then check everything:
 
@@ -161,6 +169,17 @@ tells Pi to confirm ambiguous requests and stops with you and never to touch the
 `--agent-dir DIR` installs elsewhere (default: `$PI_CODING_AGENT_DIR` or `~/.pi/agent`). It refuses to overwrite
 files it did not write unless you pass `--force`; `superagent pi-install --uninstall` removes only its own files.
 
+### Look inside a worker's Pi session
+
+Each Ticket is one Pi session named after its id, stored in `<state_dir>/sessions`. To read what a worker did,
+or continue it by hand, open it in Pi from the Ticket's worktree (the panel's ticket details show the path),
+only while that Ticket's worker is not running:
+
+```sh
+cd <worktree shown in the panel>
+~/.pi/agent/bin/pi --session-dir ~/.local/share/pi-superagent/sessions --session <ticket-id>
+```
+
 ## Operator commands
 
 | Command | What it does |
@@ -215,13 +234,17 @@ record the same requests as `superagent stop|retry` (Answer and New request as `
 - Worktrees share `.git/config` and hooks with the checkout, so a worker can plant hooks or URL rewrites there.
   Every git command the service runs therefore has hooks off (`-c core.hooksPath=/dev/null`), no system or global
   git config, and no token or `secret_env` variable in its environment. The token is used only by the final
-  `git push` from the service's own bare push repo, whose environment holds nothing but `PATH`, `HOME` and the auth header.
+  `git push`, which runs from a bare repo created for that push alone (mode 0700, deleted afterwards) with proxy
+  and TLS settings pinned and an environment holding nothing but `PATH`, `HOME` and the auth header. A long-lived
+  push repo would not be safe: a worker could plant a repo-specific `http.<url>.proxy` there, which beats any pin.
   Because global git config is off, `git fetch origin` in the checkout cannot use a credential helper configured
   there; use an SSH remote or a public repository for `checkout`.
 - Workers get git credential helpers and prompts turned off (`credential.helper=`, `GIT_TERMINAL_PROMPT=0`,
   `GIT_ASKPASS=/usr/bin/false`, `SSH_ASKPASS=/usr/bin/false`), so their `git push` cannot fall back on your
   keychain. This only raises the bar: a worker with `bash` runs as your user and can still read any file you can
   read, including `<state_dir>`. Container isolation is the real fix.
+- Workers can use Pi's stored provider logins (that is how signed-in providers work), and a worker with `bash`
+  could also read that file. Treat model credentials Pi holds as reachable by workers.
 - **Pi does not ask before running tools.** A worker can run any shell command its `bash` tool allows, as your
   user. Use a test repository and a machine you do not mind it touching. Container isolation is not built yet.
 
