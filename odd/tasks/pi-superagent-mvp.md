@@ -23,7 +23,7 @@ Branch: main (new repo, no commits yet). Delivery: ask-on-risk. Runner: `.venv/b
 | T1 | S1 S4 S9 | inline | done | 13 tests GREEN; commit 3db9106 |
 | T2 | S2 S3 S8 | delegated (parallel unit, disjoint surface) | done | 36 tests GREEN; commit 54843d1; Risk: item 2 (token handling) |
 | T3 | S5 S6 S7 | delegated (parallel unit, disjoint surface) | done | 27 tests GREEN; commit 84ec9c0; Risk: item 2 (secret stripping, report auth) |
-| T4 | S8 S9 S10 | delegated after T2/T3 (context backstop) | done | 26 e2e tests GREEN, 102 total; commit 3c5ae32; Risk: items 2 and 4 |
+| T4 | S8 S9 S10 | delegated after T2/T3 (context backstop) | done | commit 3c5ae32; verified; fixes c1d41e8, f814963; 121 tests GREEN; Risk: items 2 and 4 |
 | T5 | all | inline | open | live run once an Anthropic API key or extra usage is available |
 
 Route evidence: T2 and T3 are independent units of behavior with disjoint edit surfaces, each several hundred lines (Writer trigger, parallelism); T4 is delegated by the long-session context backstop.
@@ -34,3 +34,7 @@ Route evidence: T2 and T3 are independent units of behavior with disjoint edit s
 - L2 (2026-11-08) User answers: Sources "GitHub only (Recommended)"; Model "Claude via API key (Recommended)"; Identity "Separate bot account (Recommended)"; Safety "Worktree + limited tools (Recommended)".
 - L3 Analysis: dsh-superagent source read directly (open source TypeScript, so REA was not needed). Its `src/core` has no DSH imports; only the executor, sessions, sources' plugin glue and panel depend on DSH. Pi `--mode rpc` replaces the in-process DSH session.
 - L4 Verified Pi 1.4.0 RPC live: `get_state` ok, `prompt` -> `disposition: started`, events end with `agent_settled`. A provider failure arrives as assistant `message_end` with `stopReason: "error"` (here: Anthropic OAuth "Third-party apps now draw from your extra usage"), so OAuth subscription use needs extra usage or an API key.
+- L5 (2026-11-08) Independent verification (high-risk items 2 and 4): 102 tests OK; blockers B1 worker could reach the bot token through service git commands in the shared worktree config/hooks, B2 shared SQLite connection unsafe across threads, B3 edited handled request/stop comments re-triggered work, B4 provider error after `ready` recorded as settled; plus advisories A1-A6.
+- L6 One correction batch c1d41e8 fixed B1-B4 and A1-A6 with RED/GREEN regression tests (121 tests). Recheck limited to B1-B4: all fixed, no new blocker (e.g. 1,440 concurrent reports all 200; no hook ran; token only in the final push env).
+- L7 Recheck advisory fixed inline f814963: the token-bearing push pins proxy and TLS settings (plain and github.com-specific), verified with real git (`--get-urlmatch` returns no proxy). 121 tests OK.
+- L8 Known limits: a worker runs as the same OS user, so it can read the user's files and write state_dir; container isolation is the real fix (not built). Private HTTPS origins cannot be fetched because global git config is disabled for service git commands; use SSH or a public test repo. Next: T5 live run needs a bot account + fine-grained token, a test repo with a local clone, and model access (ANTHROPIC_API_KEY or claude.ai extra usage). Engram mirror pending (memory tools unavailable in this session).
