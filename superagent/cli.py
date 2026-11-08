@@ -95,14 +95,17 @@ def cmd_run(cfg, args):
     return 0
 
 
-def cmd_status(cfg, args):
-    store = open_store(cfg)
+def status_data(cfg, store):
+    """What `superagent status` prints; the web panel shows the same facts."""
     stages = Counter(stage(t) for t in store.tickets(state='open'))
     failing = [{'kind': e['kind'], 'key': e['key'], 'attempts': e['attempts'], 'error': e['last_error']}
                for e in store.failing_effects()]
-    print(json.dumps({'repo': cfg.repo, 'agent_login': cfg.agent_login, 'token': 'yes' if cfg.token else 'no',
-                      'open_tickets': dict(stages), 'failing_effects': failing,
-                      'last_poll': store.get('last-poll')}, indent=2))
+    return {'repo': cfg.repo, 'agent_login': cfg.agent_login, 'token': 'yes' if cfg.token else 'no',
+            'open_tickets': dict(stages), 'failing_effects': failing, 'last_poll': store.get('last-poll')}
+
+
+def cmd_status(cfg, args):
+    print(json.dumps(status_data(cfg, open_store(cfg)), indent=2))
     return 0
 
 
@@ -131,19 +134,47 @@ def cmd_tickets(cfg, args):
     return 0
 
 
+def request_action(store, ref, action):
+    """Record an operator `stop` or `retry` request for the service and return the confirmation line.
+
+    Shared by the CLI and the web panel; raises RuntimeError when the Ticket is unknown or already ended.
+    """
+    t = find_ticket(store, ref)
+    if not t:
+        raise RuntimeError(f'no ticket {ref!r} (see `superagent tickets --all`)')
+    if t.state == 'ended':
+        raise RuntimeError(f'ticket {t.name} already ended ({t.outcome})')
+    from .model import now_iso
+    store.put(f'operator:{action}:{t.id}', now_iso())
+    return f'{action} requested for {t.name} ({t.id}); the running service applies it within one poll round'
+
+
 def _request(action):
     def cmd(cfg, args):
-        store = open_store(cfg)
-        t = find_ticket(store, args.ticket)
-        if not t:
-            raise RuntimeError(f'no ticket {args.ticket!r} (see `superagent tickets --all`)')
-        if t.state == 'ended':
-            raise RuntimeError(f'ticket {t.name} already ended ({t.outcome})')
-        from .model import now_iso
-        store.put(f'operator:{action}:{t.id}', now_iso())
-        print(f'{action} requested for {t.name} ({t.id}); the running service applies it within one poll round')
+        print(request_action(open_store(cfg), args.ticket, action))
         return 0
     return cmd
+
+
+PANEL_EXTRA = 'install the panel extra: pip install -e ".[panel]"'
+
+
+def cmd_panel(cfg, args):
+    try:
+        import streamlit  # noqa: F401
+    except ImportError:
+        raise ConfigError(PANEL_EXTRA) from None
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(('127.0.0.1', args.port))
+        except OSError:
+            raise RuntimeError(f'port {args.port} is in use on 127.0.0.1; pick another with --port') from None
+    panel = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'panel.py')
+    env = {**os.environ, 'SUPERAGENT_CONFIG': os.path.abspath(os.path.expanduser(args.config))}
+    print(f'superagent panel on http://127.0.0.1:{args.port} (Ctrl+C to stop)', file=sys.stderr)
+    return subprocess.run([sys.executable, '-m', 'streamlit', 'run', panel, '--server.address', '127.0.0.1',
+                           '--server.port', str(args.port), '--server.headless', 'true',
+                           '--browser.gatherUsageStats', 'false'], env=env).returncode
 
 
 def cmd_check(cfg, args):
@@ -195,7 +226,7 @@ def cmd_check(cfg, args):
 
 
 COMMANDS = {'run': cmd_run, 'status': cmd_status, 'tickets': cmd_tickets, 'stop': _request('stop'),
-            'retry': _request('retry'), 'check': cmd_check}
+            'retry': _request('retry'), 'check': cmd_check, 'panel': cmd_panel}
 
 
 def parser():
@@ -213,6 +244,8 @@ def parser():
         s = sub.add_parser(name, help=text)
         s.add_argument('ticket', help='ticket id or name')
     sub.add_parser('check', help='preflight: config, token, checkout, pi, report port')
+    pn = sub.add_parser('panel', help='local web panel (needs the panel extra)')
+    pn.add_argument('--port', type=int, default=8742, help='port on 127.0.0.1 (default 8742)')
     return p
 
 

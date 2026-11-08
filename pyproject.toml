@@ -6,6 +6,9 @@ requires-python = ">=3.11"
 license = "MIT"
 dependencies = []
 
+[project.optional-dependencies]
+panel = ["streamlit>=1.67", "pandas>=2"]
+
 [project.scripts]
 superagent = "superagent.cli:main"
 superagent-report = "superagent.report:main"

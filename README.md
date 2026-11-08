@@ -110,11 +110,28 @@ Ticket's name; the token is never logged.
 | `superagent tickets [--all] [--json]` | Tickets with id, name, stage, issue number, PR and last report. |
 | `superagent stop <ticket>` | Stop a Ticket (id or name). |
 | `superagent retry <ticket>` | Relaunch a Ticket whose last run ended, or retry a failed delivery. |
+| `superagent panel [--port 8742]` | Local web panel (see below); needs the `panel` extra. |
 
 `stop` and `retry` write a request to the store (`operator:stop:<ticket>` / `operator:retry:<ticket>` in the kv
 table). The running service applies it at its next poll round; if the service is not running, it applies it at
 the next start. All commands take `--config PATH` (default `~/.config/pi-superagent/config.toml`) and `-v` for
 debug logging. Exit codes: 0 ok, 1 runtime error, 2 configuration error.
+
+## Web panel
+
+A local web panel shows what needs a person first, in the spirit of dsh-superagent's panel: Tickets waiting for
+an answer, a review, or help after a block, failure or delivery error, each with its thread link and Stop / Retry
+buttons. Its other tabs list Tickets (filter by stage, open/all, text; details show the mandate, assignments,
+request and pending inputs), recent Triggers with the policy decision (`accept`, `stop`, `context`, `ignore`), and
+the loaded settings (whether the token is set, never its value).
+
+```sh
+pip install -e ".[panel]"
+superagent panel            # http://127.0.0.1:8742, --port to change
+```
+
+It binds to 127.0.0.1 only and refreshes every 10 s. It reads the same database as `superagent run`; Stop and Retry
+record the same requests as `superagent stop|retry`, which the running service applies at its next poll round.
 
 ## Safety model
 
@@ -142,7 +159,7 @@ debug logging. Exit codes: 0 ok, 1 runtime error, 2 configuration error.
 
 - Explicit requests only: no observe mode or proactive rules.
 - No LLM router; the policy gate is deterministic.
-- No web panel; use the CLI.
+- The web panel is read-only apart from Stop and Retry; no login, so keep it on localhost.
 - GitHub only; other sources (Slack, email, ...) are not ported.
 - One repository per service.
 
