@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import unittest
 
 from superagent import cli
@@ -128,7 +129,9 @@ class CrossRepoTest(ServiceBase):
         self.assertIn(b_url, replies[1])
         self.assertEqual(self.two.posted(), [])
         dirs = sorted(next(a for a in argv if a.startswith('--git-dir=')) for argv, _ in self.git.pushes)
-        self.assertEqual(dirs, [f'--git-dir={self.state}/push/a__one.git', f'--git-dir={self.state}/push/b__two.git'])
+        self.assertEqual([re.sub(r'\.git\.\w+$', '.git', d) for d in dirs],
+                         [f'--git-dir={self.state}/push/a__one.git', f'--git-dir={self.state}/push/b__two.git'])
+        self.assertFalse(any(os.path.exists(d.split('=', 1)[1]) for d in dirs))  # each fresh push repo is removed
         self.assertEqual(len(self.effect_keys('test')), 1)
 
         # A replayed delivery neither pushes nor opens again.
@@ -265,7 +268,8 @@ class CompatibilityTest(unittest.TestCase):
         s.db.execute('INSERT INTO tickets VALUES (?, ?, ?, ?)', ('tk-old', 'github:o/r#1', 'open', json.dumps(old)))
         t = s.ticket('tk-old')
         self.assertEqual((t.parts, t.worktree, t.pr_number, t.test_failures), ([], '/w/fix-it', 7, 1))
-        self.assertEqual({k: v for k, v in t.to_dict().items() if k in old}, old)
+        self.assertEqual({k: v for k, v in old.items() if k != 'test_result'}, t.to_dict())  # unused test_result not written
+        self.assertEqual(Ticket.from_dict(t.to_dict()), t)
         self.assertIsInstance(t, Ticket)
 
 

@@ -8,7 +8,9 @@ import http.client
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -356,8 +358,10 @@ def push_branch(worktree, branch, token, repo, push_dir, run=subprocess.run, env
     """Push the worktree's HEAD to <branch> on GitHub.
 
     The worker can write its worktree's git config and hooks, so the token never runs there. HEAD is first fetched,
-    without the token, into `push_dir`, a bare repo only the service uses; the push runs from that repo with hooks
-    off and an environment holding nothing but the token's extra HTTP header (never argv) and the basics.
+    without the token, into a bare repo the service creates for this push alone (next to `push_dir`, mode 0700,
+    removed afterwards); the push runs from it with hooks off and an environment holding nothing but the token's
+    extra HTTP header (never argv) and the basics. A long-lived push repo would not be enough: a worker running as
+    the same user could plant a path-specific `http.<url>.proxy` in its config, which beats any command-line pin.
     """
     auth = base64.b64encode(f'x-access-token:{token}'.encode()).decode()
     env = git_env(secrets=[token, auth]) if env is None else env
@@ -370,16 +374,21 @@ def push_branch(worktree, branch, token, repo, push_dir, run=subprocess.run, env
                 err = err.replace(secret, '***') if secret else err
             raise GitHubError(f'git push {branch} failed ({step}): {err.strip()}')
 
-    if not os.path.exists(os.path.join(push_dir, 'HEAD')):
-        git('init', ['git', *GIT_HARDEN, 'init', '--bare', '-q', push_dir], env)
-    in_push_repo = ['git', f'--git-dir={push_dir}', *GIT_HARDEN]
-    git('fetch', [*in_push_repo, 'fetch', '--no-tags', worktree, f'+HEAD:refs/heads/{branch}'], env)
-    push_env = {k: os.environ[k] for k in ('PATH', 'HOME') if k in os.environ}
-    push_env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0',
-                    GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',
-                    GIT_CONFIG_VALUE_0=f'AUTHORIZATION: basic {auth}')
-    git('push', [*in_push_repo, *PUSH_PINS, 'push', '--no-verify', f'https://github.com/{repo}.git',
-                 f'+refs/heads/{branch}:refs/heads/{branch}'], push_env)
+    parent = os.path.dirname(os.path.abspath(push_dir))
+    os.makedirs(parent, exist_ok=True)
+    git_dir = tempfile.mkdtemp(prefix=os.path.basename(push_dir) + '.', dir=parent)  # 0700, unpredictable name
+    try:
+        git('init', ['git', *GIT_HARDEN, 'init', '--bare', '-q', git_dir], env)
+        in_push_repo = ['git', f'--git-dir={git_dir}', *GIT_HARDEN]
+        git('fetch', [*in_push_repo, 'fetch', '--no-tags', worktree, f'+HEAD:refs/heads/{branch}'], env)
+        push_env = {k: os.environ[k] for k in ('PATH', 'HOME') if k in os.environ}
+        push_env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0',
+                        GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',
+                        GIT_CONFIG_VALUE_0=f'AUTHORIZATION: basic {auth}')
+        git('push', [*in_push_repo, *PUSH_PINS, 'push', '--no-verify', f'https://github.com/{repo}.git',
+                     f'+refs/heads/{branch}:refs/heads/{branch}'], push_env)
+    finally:
+        shutil.rmtree(git_dir, ignore_errors=True)
 
 
 def has_new_commits(worktree, base_ref, run=subprocess.run, env=None):

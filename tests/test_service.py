@@ -185,7 +185,8 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f'Closes #{n}', pr['body'])
         self.assertEqual(self.git.pushes[0][0][-2:], ['https://github.com/o/r.git',
                                                       '+refs/heads/agent/fix-the-login-bug:refs/heads/agent/fix-the-login-bug'])
-        self.assertIn(f"--git-dir={os.path.join(self.cfg.state_dir, 'push.git')}", self.git.pushes[0][0])
+        git_dir = next(a for a in self.git.pushes[0][0] if a.startswith('--git-dir='))
+        self.assertTrue(git_dir.startswith(f"--git-dir={os.path.join(self.cfg.state_dir, 'push.git')}."))  # fresh per push
         self.assertEqual(t.pr_number, pr['number'])
         self.assertEqual(stage(t), 'person/review')
         posted = self.gh.posted(n)

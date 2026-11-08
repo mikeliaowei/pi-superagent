@@ -109,7 +109,8 @@ class GitSecretsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.run_git.pushes), 1)
         push = self.run_git.pushes[0]
         self.assertIn(GITHUB_URL, push)
-        self.assertIn(f"--git-dir={os.path.join(self.cfg.state_dir, 'push.git')}", push)
+        git_dir = next(a for a in push if a.startswith('--git-dir='))
+        self.assertTrue(git_dir.startswith(f"--git-dir={os.path.join(self.cfg.state_dir, 'push.git')}."))  # fresh per push
         ref = 'refs/heads/agent/fix-a'
         self.assertEqual(subprocess.run(['git', '--git-dir', self.github, 'rev-parse', '--verify', '-q', ref],
                                         capture_output=True).returncode, 0, 'push did not reach GitHub')

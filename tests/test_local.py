@@ -116,6 +116,22 @@ class AskTest(CliBase):
 
 
 class LocalServiceTest(ServiceBase):
+    async def test_a_request_interrupted_before_its_launch_is_launched_next_round(self):
+        self.start({'mode': 'hang'})
+        self.ask('Fix x', 'a/one')
+        real = self.store.enqueue
+
+        def flaky(kind, *a, **k):
+            if kind == 'launch':
+                raise sqlite3.OperationalError('database is locked')
+            return real(kind, *a, **k)
+        with mock.patch.object(self.store, 'enqueue', flaky):
+            await self.svc.poll_once()
+        await self.round()
+        await until(lambda: self.pi.runs and self.pi.runs[0].messages)
+        self.assertEqual(len(self.store.tickets()), 1)
+        self.assertEqual(len(self.effect_keys('launch')), 1)
+
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.one_co, self.two_co = make_clone(self.tmp, 'one'), make_clone(self.tmp, 'two')

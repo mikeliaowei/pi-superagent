@@ -113,11 +113,17 @@ class Ticket:
         return Assignment(**self.assignments[-1]) if self.assignments else None
 
     def to_dict(self):
-        return asdict(self)
+        # Fields added after the first release are left out while unused: the previous version loads Tickets with
+        # Ticket(**data) and would crash on keys it does not know, so a rollback keeps working.
+        return {k: v for k, v in asdict(self).items() if not (k in LATER_FIELDS and v == LATER_FIELDS[k])}
 
     @classmethod
     def from_dict(cls, d):
         return cls(**d)
+
+
+# Ticket fields added after the first release, with the value meaning "not used".
+LATER_FIELDS = {'test_failures': 0, 'test_output': '', 'test_result': '', 'parts': []}
 
 
 def stage(t):

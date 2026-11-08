@@ -251,7 +251,8 @@ class MultiRepoServiceTest(ServiceBase):
             self.assertIn(f'https://github.com/{t.repo}/pull/{t.pr_number}', posted[1])
         self.assertEqual(other.pulls, {})
         self.assertEqual(other.posted(), [])
-        pushes = sorted((argv[-2], next(a for a in argv if a.startswith('--git-dir='))) for argv, _ in self.git.pushes)
+        pushes = sorted((argv[-2], re.sub(r'\.git\.\w+$', '.git', next(a for a in argv if a.startswith('--git-dir='))))
+                        for argv, _ in self.git.pushes)
         self.assertEqual(pushes, [('https://github.com/a/one.git', f"--git-dir={self.state}/push/a__one.git"),
                                   ('https://github.com/b/two.git', f"--git-dir={self.state}/push/b__two.git")])
 
@@ -443,6 +444,17 @@ class EnforcedTestsTest(ServiceBase):
 
 
 class TicketCompatibilityTest(unittest.TestCase):
+    def test_a_ticket_without_new_features_saves_only_fields_the_previous_version_knows(self):
+        # Rollback: the previous version loads Tickets with Ticket(**data), so unknown keys would crash it.
+        old = {'id', 'name', 'title', 'thread_key', 'repo', 'number', 'mandate', 'created_at', 'state', 'outcome',
+               'branch', 'worktree', 'pr_number', 'token', 'assignments', 'last_human_at', 'delivery_error'}
+        t = Ticket(id='tk-1', name='n', title='t', thread_key='github:o/r#1', repo='o/r', number=1, mandate={},
+                   created_at='2026-11-08T12:00:00+00:00')
+        self.assertEqual(set(t.to_dict()), old)
+        self.assertEqual(Ticket.from_dict(t.to_dict()), t)
+        t.test_failures = 1
+        self.assertEqual(t.to_dict()['test_failures'], 1)  # used features are still stored
+
     def test_a_ticket_saved_by_the_previous_version_loads_with_defaults(self):
         old = {'id': 'tk-old', 'name': 'fix-it', 'title': 'Fix it', 'thread_key': 'github:o/r#1', 'repo': 'o/r',
                'number': 1, 'mandate': {'actor': 'alice'}, 'created_at': '2026-11-08T12:00:00+00:00',

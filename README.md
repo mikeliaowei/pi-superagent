@@ -235,6 +235,9 @@ record the same requests as `superagent stop|retry` (Answer and New request as `
   against `allowed`.
 - A Ticket can span several configured repositories only when the request names them; a later comment cannot
   add a repo to a running Ticket.
+- Rolling back to an earlier version: the database stays readable and writable by it, and Tickets that never used
+  test retries, cross-repo parts or local requests load there unchanged. Tickets that did use them only load in
+  this version or later.
 
 ## License
 

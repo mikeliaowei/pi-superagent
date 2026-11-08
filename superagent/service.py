@@ -203,10 +203,15 @@ class Service:
         self.store.save_ticket(t)
         log.info('[%s] new ticket for #%s from %s%s', t.name, t.number, trig.actor,
                  f' across {", ".join(repos)}' if t.parts else '')
+        self._queue_start(t)
+        return t
+
+    def _queue_start(self, t):
+        """Queue a new Ticket's ack and first launch. Both effects are keyed, so queuing them again never doubles."""
+        a = t.current
         self.reply(t, f'{t.id}-ack', f"On it: I'll work on this as `{t.name}` and report back here.")
         self.store.enqueue('launch', f'{t.id}:{a.id}', {'ticket_id': t.id, 'assignment_id': a.id, 'mode': 'first'},
                            now=self.clock())
-        return t
 
     async def _context(self, tid, trig):
         self.store.add_input(tid, trig.kind, trig.text, trig.id)
@@ -242,11 +247,15 @@ class Service:
 
     def _take_ask(self, r):
         """Open the Ticket of a local request: the local operator's explicit mandate. Idempotent: a request whose
-        Ticket exists (the service stopped before marking it done) opens nothing."""
+        Ticket exists (the service stopped before marking it done) opens no second Ticket, but gets its start queued
+        again, since the stop may have come before the ack and launch were queued."""
         thread = f"{LOCAL}{r['id']}"
         existing = self.store.tickets(thread_key=thread)
         if existing:
-            self.store.local_request_done(r['id'], existing[0].id)
+            t = existing[0]
+            if t.state == 'open' and t.current and t.current.state == 'pending':
+                self._queue_start(t)
+            self.store.local_request_done(r['id'], t.id)
             return
         trig = Trigger(id=f"local|{r['id']}", thread_key=thread, actor=r['actor'], human=True, addressed=True,
                        at=r['at'], text=r['text'], kind='local')
