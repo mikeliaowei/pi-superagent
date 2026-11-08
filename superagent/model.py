@@ -21,6 +21,20 @@ def new_id(prefix):
     return f'{prefix}-{uuid.uuid4().hex[:12]}'
 
 
+TITLE_MAX = 80
+
+
+def ticket_title(text, limit=TITLE_MAX):
+    """One line of at most `limit` characters; a longer one ends at its last whole word, marked with an ellipsis."""
+    title = ' '.join(text.split()) or 'Request'
+    if len(title) <= limit:
+        return title
+    cut = title[:limit - 1]
+    if ' ' in cut:
+        cut = cut[:cut.rindex(' ')]
+    return cut.rstrip(' ,;:.-') + '…'
+
+
 def short_name(title, taken=()):
     """1-4 kebab-case words, at most 32 characters, unique among `taken` (the Ticket's branch is agent/<name>)."""
     words = re.findall(r'[a-z0-9]+', title.lower())[:4] or ['task']

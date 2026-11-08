@@ -22,7 +22,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 
 from . import executor, github, policy
-from .model import Assignment, Ticket, Trigger, named_repos, new_id, new_part, short_name
+from .model import Assignment, Ticket, Trigger, named_repos, new_id, new_part, short_name, ticket_title
 from .pi_rpc import PiRpc, RunResult
 from .report import NotRunning
 
@@ -31,7 +31,6 @@ log = logging.getLogger('superagent.service')
 RUN_TIMEOUT = 2 * 3600  # one worker run, seconds
 DELIVER_ATTEMPTS = 5
 REPLY_WORDS = 100
-TITLE_MAX = 80
 LOCAL = 'local:'  # thread key prefix of local Tickets
 
 
@@ -181,7 +180,7 @@ class Service:
         else:
             first = next((line for line in trig.text.splitlines() if line.strip()), '')
             title = re.sub(rf'@{re.escape(self.cfg.agent_login)}\b[,:]?', '', first, flags=re.I)
-        title = ' '.join(title.split())[:TITLE_MAX].strip() or 'Request'
+        title = ticket_title(title)
         repo = trig.thread_key.removeprefix('github:').rsplit('#', 1)[0]
         repos = [repo]
         if not self.cfg.legacy:  # a request may name other configured repos: one Ticket for all of them (S14)
@@ -272,7 +271,7 @@ class Service:
             return
         self.store.add_trigger(trig, 'accept', 'local request')
         first = next((line for line in r['text'].splitlines() if line.strip()), '')
-        title = ' '.join(first.split())[:TITLE_MAX].strip() or 'Request'
+        title = ticket_title(first)
         t = self.open_ticket(trig, title, repos, 0)
         self.store.local_request_done(r['id'], t.id)
 

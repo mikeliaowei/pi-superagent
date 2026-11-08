@@ -275,3 +275,22 @@ class StoreHistoryTest(unittest.TestCase):
         s.add_input('tk-1', 'trigger', 'second')
         s.mark_delivered([s.pending_inputs('tk-1')[0]['seq']])
         self.assertEqual([(i['text'], i['delivered']) for i in s.inputs('tk-1')], [('first', 1), ('second', 0)])
+
+
+class TicketTitleTest(unittest.TestCase):
+    def test_short_titles_are_kept_with_spaces_collapsed(self):
+        from superagent.model import ticket_title
+        self.assertEqual(ticket_title('  Fix   the\tlogin bug '), 'Fix the login bug')
+        self.assertEqual(ticket_title(''), 'Request')
+
+    def test_long_titles_end_at_a_whole_word_with_an_ellipsis(self):
+        from superagent.model import ticket_title
+        text = 'add a Troubleshooting section to the README of mikeliaowei/hot-repos about the GitHub token'
+        title = ticket_title(text)
+        self.assertEqual(title, 'add a Troubleshooting section to the README of mikeliaowei/hot-repos about the…')
+        self.assertLessEqual(len(title), 80)
+
+    def test_one_long_word_is_cut_hard(self):
+        from superagent.model import ticket_title
+        title = ticket_title('x' * 200)
+        self.assertEqual((len(title), title[-1]), (80, '…'))
