@@ -20,9 +20,9 @@ Branch: main (new repo, no commits yet). Delivery: ask-on-risk. Runner: `.venv/b
 
 | ID | Specs | Route | Status | Evidence |
 |---|---|---|---|---|
-| T1 | S1 S4 S9 | inline | open | core model, store, policy, config |
-| T2 | S2 S3 S8 | delegated (parallel unit, disjoint surface) | open | `superagent/github.py` |
-| T3 | S5 S6 S7 | delegated (parallel unit, disjoint surface) | open | `superagent/pi_rpc.py`, `superagent/executor.py`, `superagent/report.py`, worker skill |
+| T1 | S1 S4 S9 | inline | done | 13 tests GREEN; commit 3db9106 |
+| T2 | S2 S3 S8 | delegated (parallel unit, disjoint surface) | done | 36 tests GREEN; commit 54843d1; Risk: item 2 (token handling) |
+| T3 | S5 S6 S7 | delegated (parallel unit, disjoint surface) | done | 27 tests GREEN; commit 84ec9c0; Risk: item 2 (secret stripping, report auth) |
 | T4 | S8 S9 S10 | delegated after T2/T3 (context backstop) | open | `superagent/service.py`, `superagent/cli.py`, README, end-to-end test with fakes |
 | T5 | all | inline | open | live run once an Anthropic API key or extra usage is available |
 
