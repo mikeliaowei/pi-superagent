@@ -25,7 +25,7 @@ Branch: main (new repo, no commits yet). Delivery: ask-on-risk. Runner: `.venv/b
 | T2 | S2 S3 S8 | delegated (parallel unit, disjoint surface) | done | 36 tests GREEN; commit 54843d1; Risk: item 2 (token handling) |
 | T3 | S5 S6 S7 | delegated (parallel unit, disjoint surface) | done | 27 tests GREEN; commit 84ec9c0; Risk: item 2 (secret stripping, report auth) |
 | T4 | S8 S9 S10 | delegated after T2/T3 (context backstop) | done | commit 3c5ae32; verified; fixes c1d41e8, f814963; 121 tests GREEN; Risk: items 2 and 4 |
-| T6 | S11 | delegated (context backstop) | done | 12 tests GREEN (tests/test_panel.py), full suite 133 OK, real launch health `ok`; commit pending |
+| T6 | S11 | delegated (context backstop) | done | 12 tests GREEN (tests/test_panel.py), full suite 133 OK, real launch health `ok`; commit 3a46d49 |
 | T5 | all | inline | open | live run once an Anthropic API key or extra usage is available |
 
 Route evidence: T2 and T3 are independent units of behavior with disjoint edit surfaces, each several hundred lines (Writer trigger, parallelism); T4 is delegated by the long-session context backstop.
