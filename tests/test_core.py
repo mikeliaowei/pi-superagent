@@ -188,23 +188,78 @@ if __name__ == '__main__':
     unittest.main()
 
 
-class StoreMigrationTest(unittest.TestCase):
-    def test_a_database_from_before_reasons_is_upgraded_in_place(self):
-        import sqlite3
+OLD_TRIGGER_JSON = ('{"id": "old", "thread_key": "github:o/r#1", "actor": "alice", "human": true, "addressed": true, '
+                    '"at": "a", "text": "x"}')
+
+
+class StoreCompatibilityTest(unittest.TestCase):
+    def tmpdir(self):
         tmp = tempfile.mkdtemp()
-        self.addCleanup(__import__('shutil').rmtree, tmp, ignore_errors=True)
-        path = os.path.join(tmp, 'old.sqlite')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        return tmp
+
+    def test_an_older_version_can_still_record_triggers_after_an_upgrade(self):
+        import sqlite3
+        path = os.path.join(self.tmpdir(), 's.sqlite')
+        Store(path).add_trigger(trig(tid='new'), 'ignore', 'bot')
+        db = sqlite3.connect(path)  # the statement released versions run
+        db.execute('INSERT OR IGNORE INTO triggers VALUES (?, ?, ?, ?)', ('old', 'github:o/r#1', 'accept', '{}'))
+        db.commit()
+        db.close()
+
+    def test_processes_opening_an_old_database_together_do_not_crash(self):
+        import sqlite3
+        import subprocess
+        import sys
+        import time
+        tmp = self.tmpdir()
+        for i in range(10):
+            path = os.path.join(tmp, f'{i}.sqlite')
+            db = sqlite3.connect(path)
+            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('CREATE TABLE triggers (id TEXT PRIMARY KEY, thread_key TEXT, decision TEXT, data TEXT)')
+            db.commit()
+            db.close()
+            go = time.time() + 1
+            code = ('import sys,time\nfrom superagent.store import Store\n'
+                    'while time.time()<float(sys.argv[2]): pass\nStore(sys.argv[1])')
+            ps = [subprocess.Popen([sys.executable, '-c', code, path, str(go)], stderr=subprocess.PIPE)
+                  for _ in range(2)]
+            for p in ps:
+                _, err = p.communicate()
+                self.assertEqual(p.returncode, 0, err.decode())
+
+    def test_a_database_from_before_reasons_keeps_working(self):
+        import sqlite3
+        path = os.path.join(self.tmpdir(), 'old.sqlite')
         db = sqlite3.connect(path)
         db.execute('CREATE TABLE triggers (id TEXT PRIMARY KEY, thread_key TEXT, decision TEXT, data TEXT)')
-        db.execute('INSERT INTO triggers VALUES (?, ?, ?, ?)', ('old', 'github:o/r#1', 'accept', '{"id": "old", '
-                   '"thread_key": "github:o/r#1", "actor": "alice", "human": true, "addressed": true, "at": "a", "text": "x"}'))
+        db.execute('INSERT INTO triggers VALUES (?, ?, ?, ?)', ('old', 'github:o/r#1', 'accept', OLD_TRIGGER_JSON))
         db.commit()
         db.close()
         s = Store(path)
         s.add_trigger(trig(tid='new'), 'ignore', 'not addressed by a listed person')
         rows = {t.id: (d, r) for t, d, r in s.recent_triggers()}
         self.assertEqual(rows, {'old': ('accept', ''), 'new': ('ignore', 'not addressed by a listed person')})
-        Store(path)  # opening an upgraded database again is a no-op
+        columns = [r[1] for r in sqlite3.connect(path).execute('PRAGMA table_info(triggers)')]
+        self.assertEqual(columns, ['id', 'thread_key', 'decision', 'data'])  # never altered
+
+    def test_a_database_upgraded_with_a_reason_column_keeps_working(self):
+        import sqlite3
+        path = os.path.join(self.tmpdir(), 'upgraded.sqlite')
+        db = sqlite3.connect(path)  # what 48f2ba4's in-place upgrade left behind
+        db.execute("CREATE TABLE triggers (id TEXT PRIMARY KEY, thread_key TEXT, decision TEXT, data TEXT, "
+                   "reason TEXT DEFAULT '')")
+        db.execute('INSERT INTO triggers VALUES (?, ?, ?, ?, ?)',
+                   ('old', 'github:o/r#1', 'accept', OLD_TRIGGER_JSON, 'stored in the column'))
+        db.commit()
+        db.close()
+        s = Store(path)
+        self.assertTrue(s.add_trigger(trig(tid='new'), 'ignore', 'bot'))
+        self.assertFalse(s.add_trigger(trig(tid='new'), 'accept', 'again'))
+        rows = {t.id: (d, r) for t, d, r in s.recent_triggers()}
+        self.assertEqual(rows, {'old': ('accept', 'stored in the column'), 'new': ('ignore', 'bot')})
+        Store(path)  # opening it again copies nothing twice
 
 
 class StoreHistoryTest(unittest.TestCase):

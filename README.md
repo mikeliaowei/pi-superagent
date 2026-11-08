@@ -1,6 +1,6 @@
 # pi-superagent
 
-A coding agent for one GitHub repository. Mention its bot account on an issue or pull request, and it opens a
+A coding agent for one or more GitHub repositories. Mention its bot account on an issue or pull request, and it opens a
 Ticket, runs a [Pi](https://github.com/earendil-works/pi) worker in its own git worktree, asks you when it needs a
 decision, and delivers a pull request.
 
@@ -36,8 +36,16 @@ policy, the effect queue and the "confirm once, then stay quiet" reply style com
   progress|waiting|ready|blocked|failed|dropped`.
 - **Replies.** The agent acknowledges once. After that it speaks only to ask a question (`waiting`), link a pull
   request (`ready`), or say honestly that it is blocked, failed, or dropped the request. `progress` posts nothing.
-- **Delivery.** On `ready`, the service (not the worker) pushes `agent/<name>` with its token and opens or reuses
-  a PR. It first fetches the worktree's HEAD into its own bare repo `<state_dir>/push.git` and pushes from there; the body says `Closes #<n>` when the request came from an issue. No commits means a "no changes" reply
+- **Tests.** When the Ticket's repo has a `test_command`, a `ready` report first runs it in the worktree
+  (`sh -c`, with the worker's environment: no token, no `secret_env`, no git credential helpers; its own process
+  group; killed after `test_timeout`). A failure opens no PR: the command, its exit code (or the timeout) and the
+  last 3,000 characters of output go back to the same Pi session, which fixes and reports ready again. After
+  `max_test_retries` failed fixes the Ticket is reported blocked ("tests still failing: <command>").
+- **Delivery.** On `ready` (and passing tests), the service (not the worker) pushes `agent/<name>` with its token
+  and opens or reuses a PR. It first fetches the worktree's HEAD into its own bare repo and pushes from there
+  (`<state_dir>/push.git` in the single-repo form, `<state_dir>/push/<owner>__<name>.git` with `[[repos]]`). The
+  body states the tests (``Tests: `<command>` passed in <N>s`` or `Tests: no test command configured for
+  <repo>.`) and says `Closes #<n>` when the request came from an issue. No commits means a "no changes" reply
   and no PR. The Ticket ends when the PR is merged or closed, or when someone stops it.
 - **Durability.** Every side effect is written to the SQLite effect queue before it runs, retried with backoff
   (5 s doubling to 300 s), and replies carry a hidden marker so a retry never posts twice. After a restart,
@@ -65,7 +73,13 @@ venv. Workers find `superagent-report` because the service puts its own `bin` di
 3. **Local clone.** `git clone https://github.com/<owner>/<repo>.git ~/src/<repo>`; worktrees are created from
    it, starting at `origin/<base_branch>`.
 4. **Config.** `mkdir -p ~/.config/pi-superagent && cp config.example.toml ~/.config/pi-superagent/config.toml`
-   and edit it. Every field is commented there.
+   and edit it. Every field is commented there. For several repositories, replace `repo` and `checkout` with one
+   `[[repos]]` table per repository (`name`, `checkout`, optional `base_branch`, `test_command`, `test_timeout`);
+   the one token must cover all of them. Mixing the two forms, a duplicate name, or an empty list is refused.
+   With `[[repos]]`, new worktrees live in `<work_dir>/<owner>__<name>/<ticket>`, and polling cursors and issue
+   Trigger ids name the repo. Moving an existing single-repo config to `[[repos]]` keeps working on the same
+   database: the original repo reads its old cursors, handled issues are not reopened, and existing Tickets keep
+   their worktrees. Ticket names are unique across all repos.
 5. **Model access.** Workers run with the explicit `provider`/`model` from the config. For Anthropic, set
    `ANTHROPIC_API_KEY` in the service's environment, or sign Pi in with a claude.ai account that has extra usage
    turned on. Pi's subscription sign-in alone is refused for third-party use ("Third-party apps now draw from your
@@ -77,7 +91,7 @@ Then check everything:
 .venv/bin/superagent check
 ```
 
-It verifies the config loads, the token variable is set, the checkout is a git clone with `origin`, `pi
+It verifies the config loads, the token variable is set, every repo's checkout is a git clone with `origin`, `pi
 --version` runs, and the report port is free, and prints a fix for each problem.
 
 ## Run
@@ -106,8 +120,8 @@ Ticket's name; the token is never logged.
 |---|---|
 | `superagent check` | Preflight; exit 2 if the config or token is missing, 1 if another check fails. |
 | `superagent run` | Run the service. |
-| `superagent status` | JSON: repo, agent login, whether the token is set, open Tickets by stage, failing effects, last poll time. |
-| `superagent tickets [--all] [--json]` | Tickets with id, name, stage, issue number, PR and last report. |
+| `superagent status` | JSON: repo (`repos` with `[[repos]]`), agent login, whether the token is set, open Tickets by stage, failing effects, last poll time. |
+| `superagent tickets [--all] [--json]` | Tickets with id, name, repo (with `[[repos]]`), stage, issue number, PR and last report. |
 | `superagent stop <ticket>` | Stop a Ticket (id or name). |
 | `superagent retry <ticket>` | Relaunch a Ticket whose last run ended, or retry a failed delivery. |
 | `superagent panel [--port 8742]` | Local web panel (see below); needs the `panel` extra. |
@@ -148,7 +162,7 @@ record the same requests as `superagent stop|retry`, which the running service a
 - Worktrees share `.git/config` and hooks with the checkout, so a worker can plant hooks or URL rewrites there.
   Every git command the service runs therefore has hooks off (`-c core.hooksPath=/dev/null`), no system or global
   git config, and no token or `secret_env` variable in its environment. The token is used only by the final
-  `git push` from `<state_dir>/push.git`, whose environment holds nothing but `PATH`, `HOME` and the auth header.
+  `git push` from the service's own bare push repo, whose environment holds nothing but `PATH`, `HOME` and the auth header.
   Because global git config is off, `git fetch origin` in the checkout cannot use a credential helper configured
   there; use an SSH remote or a public repository for `checkout`.
 - Workers get git credential helpers and prompts turned off (`credential.helper=`, `GIT_TERMINAL_PROMPT=0`,
@@ -164,7 +178,7 @@ record the same requests as `superagent stop|retry`, which the running service a
 - No LLM router; the policy gate is deterministic.
 - The web panel is read-only apart from Stop and Retry; no login, so keep it on localhost.
 - GitHub only; other sources (Slack, email, ...) are not ported.
-- One repository per service.
+- Several repositories per service, but one Ticket works in one repository.
 
 ## License
 

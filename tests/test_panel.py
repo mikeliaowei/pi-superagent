@@ -199,6 +199,28 @@ class PanelAppTest(unittest.TestCase):
         self.assertEqual(dict(zip(settings['setting'], settings['value']))['token set (SA_PANEL_TOKEN)'], 'no')
 
 
+    def test_with_several_repos_tickets_show_their_repo_and_link_to_it(self):
+        with open(self.config, 'w') as f:
+            f.write(f'[github]\nagent_login = "bot"\ntoken_env = "SA_PANEL_TOKEN"\n[policy]\nallowed = ["alice"]\n'
+                    f'[service]\nstate_dir = "{self.tmp}/state"\nreport_port = 0\n'
+                    f'[[repos]]\nname = "a/one"\ncheckout = "{self.tmp}/one"\n'
+                    f'[[repos]]\nname = "b/two"\ncheckout = "{self.tmp}/two"\ntest_command = "make check"\n')
+        store = self.store()
+        t = self.ticket(store, 'tk-1', 'fix-it', 4, report='ready', summary='Opened a PR')
+        t.repo, t.thread_key, t.pr_number = 'b/two', 'github:b/two#4', 9
+        store.save_ticket(t)
+        at = self.app()
+        text = rendered_text(at)
+        self.assertIn('https://github.com/b/two/issues/4', text)
+        self.assertIn('https://github.com/b/two/pull/9', text)
+        self.assertNotIn('https://github.com/o/r/', text)
+        self.assertEqual(list(at.tabs[1].dataframe[0].value['repo']), ['b/two'])
+        settings = at.tabs[3].dataframe[0].value
+        values = dict(zip(settings['setting'], settings['value']))
+        self.assertEqual(values['repos'], 'a/one, b/two')
+        self.assertEqual(values['test command (b/two)'], 'make check')
+        self.assertEqual(values['checkout (a/one)'], f'{self.tmp}/one')
+
 class PanelCommandTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='superagent-panel-cli-')

@@ -2,8 +2,11 @@
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 
 from .github import GIT_HARDEN, git_env as _git_env
 from .pi_rpc import PiRpc, RpcError
@@ -12,6 +15,8 @@ PACKAGE = os.path.dirname(os.path.abspath(__file__))
 SKILL_DIR = os.path.join(PACKAGE, 'skills', 'superagent-worker')
 PROMPT_PATH = os.path.join(PACKAGE, 'prompts', 'worker.md')
 REQUEST_CAP, FOLLOWUP_CAP, MAX_FOLLOWUPS = 1500, 600, 20
+TEST_OUTPUT_CAP = 64 * 1024  # bytes of a test command's output kept (the tail)
+TEST_TAIL = 3000  # characters of that output sent back to the worker
 
 
 class PrepareError(Exception):
@@ -23,9 +28,18 @@ def git_env(cfg):
     return _git_env({cfg.token_env, *cfg.secret_env}, [cfg.token])
 
 
+def worktree_path(cfg, ticket):
+    """The Ticket's stored worktree, else where a new one goes: <work_dir>/<owner>__<name>/<ticket name>
+    (<work_dir>/<ticket name> in the single-repo form)."""
+    return ticket.worktree or os.path.join(cfg.worktree_root(cfg.repo_config(ticket.repo)), ticket.name)
+
+
 def prepare_worktree(cfg, ticket, run=subprocess.run):
-    """Create (or reuse) <work_dir>/<name> on branch agent/<name> from origin/<base_branch>. Returns (path, branch)."""
-    path = os.path.join(cfg.work_dir, ticket.name)
+    """Create (or reuse) the Ticket's worktree on branch agent/<name> from origin/<base_branch> of its repo.
+
+    Returns (path, branch)."""
+    repo = cfg.repo_config(ticket.repo)
+    path = worktree_path(cfg, ticket)
     branch = f'agent/{ticket.name}'
     if os.path.exists(os.path.join(path, '.git')):
         return path, branch
@@ -34,18 +48,18 @@ def prepare_worktree(cfg, ticket, run=subprocess.run):
 
     def git(*args, check=True):
         # The checkout shares config and hooks with every worker's worktree: hooks off, no secrets in env.
-        p = run(['git', *GIT_HARDEN, *args], cwd=cfg.checkout, env=env, capture_output=True, text=True)
+        p = run(['git', *GIT_HARDEN, *args], cwd=repo.checkout, env=env, capture_output=True, text=True)
         if check and p.returncode != 0:
             raise PrepareError(f'git {args[0]} failed: {(p.stderr or p.stdout).strip()}')
         return p
 
-    os.makedirs(cfg.work_dir, exist_ok=True)
-    git('fetch', 'origin', cfg.base_branch)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    git('fetch', 'origin', repo.base_branch)
     # The branch survives a removed worktree (or a crash between the two steps): check it out instead of recreating.
     if git('rev-parse', '--verify', '--quiet', f'refs/heads/{branch}', check=False).returncode == 0:
         git('worktree', 'add', path, branch)
     else:
-        git('worktree', 'add', '-b', branch, path, f'origin/{cfg.base_branch}')
+        git('worktree', 'add', '-b', branch, path, f'origin/{repo.base_branch}')
     return path, branch
 
 
@@ -75,14 +89,64 @@ def _no_git_credentials(env):
     env.update(GIT_TERMINAL_PROMPT='0', GIT_ASKPASS='/usr/bin/false', SSH_ASKPASS='/usr/bin/false')
 
 
-def worker_env(cfg, ticket, report_url):
+def test_env(cfg):
+    """The environment a test command runs with: a worker's, without the report variables.
+
+    The command is worker-authored code, so it never gets the service's environment: no GitHub token, no configured
+    secrets, no git credential helpers."""
     env = cfg.worker_env()
     _no_git_credentials(env)
+    return env
+
+
+def worker_env(cfg, ticket, report_url):
+    env = test_env(cfg)
     env.update(SUPERAGENT_URL=report_url, SUPERAGENT_TICKET_ID=ticket.id, SUPERAGENT_TICKET_TOKEN=ticket.token,
                PI_SKIP_VERSION_CHECK='1')
     # superagent-report lives next to the interpreter running the service (the venv's bin).
     env['PATH'] = os.path.dirname(sys.executable) + os.pathsep + env.get('PATH', '')
     return env
+
+
+class TestRun:
+    """One run of a repo's test command: `sh -c <command>` in the worktree, in its own process group.
+
+    Output (stdout and stderr together) goes to a temporary file, so a chatty or stuck command never blocks a pipe;
+    the last TEST_OUTPUT_CAP bytes are kept. `wait` blocks (run it in a thread); `kill` ends the whole group.
+    """
+
+    def __init__(self, command, cwd, env, timeout):
+        self.command, self.cwd, self.env, self.timeout = command, cwd, env, timeout
+        self.proc = None
+
+    def wait(self):
+        """Returns {'passed', 'code', 'timed_out', 'seconds', 'output'}."""
+        began = time.monotonic()
+        with tempfile.TemporaryFile() as out:
+            self.proc = subprocess.Popen(['sh', '-c', self.command], cwd=self.cwd, env=self.env,
+                                         stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                         start_new_session=True)
+            timed_out = False
+            try:
+                code = self.proc.wait(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                self.kill()
+                code = self.proc.wait()
+            self.kill()  # whatever the command left running in the background
+            size = out.seek(0, os.SEEK_END)
+            out.seek(max(0, size - TEST_OUTPUT_CAP))
+            output = out.read().decode(errors='replace')
+        return {'passed': code == 0 and not timed_out, 'code': code, 'timed_out': timed_out,
+                'seconds': round(time.monotonic() - began), 'output': output.rstrip()}
+
+    def kill(self):
+        if self.proc is None:
+            return
+        try:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 class Worker:
@@ -94,7 +158,7 @@ class Worker:
         self.queued = []
 
     async def start(self, cfg, ticket, report_url, spawn=PiRpc):
-        cwd = ticket.worktree or os.path.join(cfg.work_dir, ticket.name)
+        cwd = worktree_path(cfg, ticket)
         self.rpc = spawn()
         await self.rpc.start(pi_argv(cfg, ticket), cwd, worker_env(cfg, ticket, report_url))
 
@@ -139,14 +203,30 @@ def _texts(inputs):
     return [_cap(i['text'] if isinstance(i, dict) else i, FOLLOWUP_CAP) for i in inputs][-MAX_FOLLOWUPS:]
 
 
-def first_message(ticket, trigger_text, inputs=()):
+def first_message(ticket, trigger_text, inputs=(), test_command=''):
     card = {'ticket': ticket.id, 'title': ticket.title, 'repo': ticket.repo, 'number': ticket.number,
             'branch': f'agent/{ticket.name}', 'request': _cap(trigger_text, REQUEST_CAP)}
     followups = _texts(inputs)
     if followups:
         card['followups'] = followups
-    return ('New assignment. Work it in this directory, then report with `superagent-report`.\n'
+    if test_command:
+        card['test_command'] = test_command
+    text = ('New assignment. Work it in this directory, then report with `superagent-report`.\n'
             + json.dumps(card, indent=2, ensure_ascii=False))
+    if test_command:
+        text += (f'\n\nBefore any pull request the service runs `{test_command}` in this directory. '
+                 'Run it yourself before you report ready; if it fails, the output comes back to you.')
+    return text
+
+
+def test_failure_message(command, result, timeout, attempt, max_attempts):
+    """Sent to the same session when its repo's test command failed after a `ready` report."""
+    how = f'timed out after {timeout}s' if result['timed_out'] else f'failed with exit code {result["code"]}'
+    tail = (result['output'] or '')[-TEST_TAIL:]
+    return (f'You reported ready, but the test command `{command}` {how}, so no pull request was opened. '
+            f'Fix the cause, run `{command}` again, commit, and report ready again '
+            f'(fix attempt {attempt} of {max_attempts}; then the Ticket is reported blocked).\n'
+            f'Last output:\n```\n{tail}\n```')
 
 
 def followup_message(inputs):

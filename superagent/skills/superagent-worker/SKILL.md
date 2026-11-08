@@ -8,7 +8,9 @@ description: How to work and report on a superagent Ticket. Use whenever you wer
 You are working one GitHub Ticket in this git worktree, on branch `agent/<name>`.
 
 1. Read the request. Check the directory and `git log` before you start; earlier work on this branch is yours.
-2. Do the work. Run the project's tests. Commit on this branch.
+2. Do the work. Run the project's tests. Commit on this branch. When the assignment names a `test_command`,
+   the service runs it in this directory before any pull request: run it yourself before reporting `ready`. If it
+   fails, its output comes back to you; fix the cause, rerun it, commit, and report `ready` again.
 3. Never push, open pull requests, or call GitHub. You have no GitHub credentials; the service delivers your branch.
 4. Report with `superagent-report --status <status> --summary "<text>" [--question "<text>"]`:
    - `progress`: sparingly, only for a milestone worth telling a human about.

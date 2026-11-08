@@ -37,12 +37,12 @@ def parse_time(s):
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def issue_url(cfg, n):
-    return f'https://github.com/{cfg.repo}/issues/{n}'
+def issue_url(t):
+    return f'https://github.com/{t.repo}/issues/{t.number}'
 
 
-def pr_url(cfg, n):
-    return f'https://github.com/{cfg.repo}/pull/{n}' if n else None
+def pr_url(t):
+    return f'https://github.com/{t.repo}/pull/{t.pr_number}' if t.pr_number else None
 
 
 def updated_at(t):
@@ -83,8 +83,8 @@ def overview(cfg, store, tickets):
     for t in people:
         a = t.current
         with st.container(border=True):
-            st.markdown(f'**{t.name}** · `{stage(t)}` · [#{t.number}]({issue_url(cfg, t.number)})'
-                        + (f' · [PR #{t.pr_number}]({pr_url(cfg, t.pr_number)})' if t.pr_number else ''))
+            st.markdown(f'**{t.name}** · `{stage(t)}` · [#{t.number}]({issue_url(t)})'
+                        + (f' · [PR #{t.pr_number}]({pr_url(t)})' if t.pr_number else ''))
             if t.delivery_error:
                 st.markdown(f'Delivery failed: {t.delivery_error}')
             if a and a.question:
@@ -133,8 +133,8 @@ def tickets_tab(cfg, store, tickets):
     if not shown:
         st.info('No tickets match.')
         return
-    rows = [{'id': t.id, 'name': t.name, 'stage': stage(t), 'issue': issue_url(cfg, t.number),
-             'pr': pr_url(cfg, t.pr_number), 'last report': t.current.report if t.current else None,
+    rows = [{'id': t.id, 'name': t.name, 'repo': t.repo, 'stage': stage(t), 'issue': issue_url(t),
+             'pr': pr_url(t), 'last report': t.current.report if t.current else None,
              'updated': updated_at(t)} for t in shown]
     st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch', column_config={
         'issue': st.column_config.LinkColumn('#', display_text=r'issues/(\d+)$'),
@@ -145,8 +145,8 @@ def tickets_tab(cfg, store, tickets):
                        key='ticket-detail')
     t = by_id[tid]
     m = t.mandate
-    st.markdown(f"**{t.name}**: {t.title} · `{stage(t)}` · [#{t.number}]({issue_url(cfg, t.number)})"
-                + (f' · [PR #{t.pr_number}]({pr_url(cfg, t.pr_number)})' if t.pr_number else ''))
+    st.markdown(f"**{t.name}**: {t.title} · `{stage(t)}` · [#{t.number}]({issue_url(t)})"
+                + (f' · [PR #{t.pr_number}]({pr_url(t)})' if t.pr_number else ''))
     st.markdown(f"Asked by **{m.get('actor', '?')}** at {m.get('at') or t.created_at}"
                 f" ({m.get('strength', 'explicit')} mandate)")
     st.markdown(f'Branch `{t.branch or "-"}` · worktree `{t.worktree or "-"}`'
@@ -189,10 +189,19 @@ def triggers_tab(cfg, store):
 
 def settings_tab(cfg):
     st.caption('Read-only. Edit the config file and restart `superagent run` to change it.')
-    rows = [('config file', config_path()), ('repo', cfg.repo), ('agent_login', cfg.agent_login),
+    if cfg.legacy:
+        repos = [('repo', cfg.repo)]
+    else:
+        repos = [('repos', ', '.join(cfg.repo_names))]
+        for r in cfg.repos:
+            repos += [(f'checkout ({r.name})', r.checkout), (f'base branch ({r.name})', r.base_branch),
+                      (f'test command ({r.name})', r.test_command or '-'),
+                      (f'test timeout ({r.name})', f'{r.test_timeout} s')]
+    rows = [('config file', config_path()), *repos, ('agent_login', cfg.agent_login),
             ('allowed', ', '.join(cfg.allowed)), ('provider', cfg.provider), ('model', cfg.model),
             ('thinking', cfg.thinking), ('tools', cfg.tools), ('max_workers', cfg.max_workers),
-            ('poll_seconds', cfg.poll_seconds), ('checkout', cfg.checkout), ('work_dir', cfg.work_dir),
+            ('poll_seconds', cfg.poll_seconds), *([('checkout', cfg.checkout)] if cfg.legacy else []),
+            ('max_test_retries', cfg.max_test_retries), ('work_dir', cfg.work_dir),
             ('state_dir', cfg.state_dir), (f'token set ({cfg.token_env})', 'yes' if cfg.token else 'no')]
     st.dataframe(pd.DataFrame([{'setting': k, 'value': str(v)} for k, v in rows]), hide_index=True, width='stretch')
 
@@ -243,7 +252,7 @@ def main():
     except cli.ConfigError as e:
         st.error(str(e))
         return
-    st.caption(f'{cfg.repo} as @{cfg.agent_login}')
+    st.caption(f'{", ".join(cfg.repo_names)} as @{cfg.agent_login}')
     body(cfg)
 
 

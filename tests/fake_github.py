@@ -139,3 +139,34 @@ class FakeGitHub:
         if m := re.fullmatch(r'/pulls/(\d+)', rest):
             return self.pulls.get(int(m[1])) if method == 'GET' else None
         return None
+
+
+class FakeGitHubs:
+    """Several FakeGitHub repositories behind one opener, as one bot account sees them.
+
+    `/notifications` merges every repository's list; every other request goes to the repository its path names.
+    `calls` records each request (method, path, query) in order, across repositories.
+    """
+
+    def __init__(self, *fakes):
+        self.fakes = {f.repo: f for f in fakes}
+        self.calls = []
+        ids = iter(range(1000, 10**9))  # comment ids are unique across GitHub, not per repository
+        for f in fakes:
+            f._ids = ids
+
+    def __getitem__(self, repo):
+        return self.fakes[repo]
+
+    def __call__(self, req):
+        parts = urlsplit(req.full_url)
+        self.calls.append(SimpleNamespace(method=req.get_method(), path=parts.path, query=parse_qs(parts.query)))
+        if parts.path == '/notifications':
+            merged = []
+            for f in self.fakes.values():
+                merged += json.loads(f(req).read())
+            return Resp(merged)
+        for repo, f in self.fakes.items():
+            if parts.path.startswith(f'/repos/{repo}/'):
+                return f(req)
+        raise http_error(req.full_url, 404, 'Not Found')

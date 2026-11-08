@@ -77,6 +77,10 @@ class Ticket:
     assignments: list = field(default_factory=list)
     last_human_at: str | None = None
     delivery_error: str = ''
+    # The repo's test command (S13). New fields have defaults, so Tickets stored by earlier versions still load.
+    test_failures: int = 0  # failed runs since the last pass
+    test_output: str = ''  # the tail of the last failing run's output
+    test_result: str = ''  # the PR body line of the last passing run
 
     @property
     def current(self):

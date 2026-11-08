@@ -52,6 +52,12 @@ class GitHub:
         self.opener = opener or (lambda req: urllib.request.urlopen(req, timeout=TIMEOUT))
         self.api = api.rstrip('/')
 
+    def for_repo(self, repo):
+        """A client for another repository with the same token, opener and API host."""
+        if repo.lower() == self.repo.lower():
+            return self
+        return GitHub(self._token, repo, opener=self.opener, api=self.api)
+
     def get(self, path, **params):
         return self._request('GET', path, params=params)[0]
 
@@ -131,10 +137,11 @@ def _is_human(u):
     return (u or {}).get('type') == 'User' and not login.endswith('[bot]')
 
 
-def issue_trigger(repo, issue, agent_login):
+def issue_trigger(repo, issue, agent_login, qualified=False):
+    """`qualified` ids name the repo (`github-issue|owner/name#<n>`): issue numbers repeat across repos."""
     n, u = issue['number'], issue.get('user') or {}
     text = f"{issue.get('title') or ''}\n\n{issue.get('body') or ''}"
-    return Trigger(id=f'github-issue|{n}', thread_key=f'github:{repo}#{n}', actor=u.get('login', ''),
+    return Trigger(id=f'github-issue|{repo}#{n}' if qualified else f'github-issue|{n}', thread_key=f'github:{repo}#{n}', actor=u.get('login', ''),
                    human=_is_human(u), addressed=mentions(text, agent_login), at=issue.get('created_at', ''),
                    text=text, url=issue.get('html_url', ''), kind='issue',
                    meta={'number': n, 'is_pr': 'pull_request' in issue})
@@ -154,14 +161,17 @@ def comment_trigger(repo, number, is_pr, c, agent_login, kind='comment'):
 
 # Polling
 
-def _notified_numbers(gh, store, repo):
-    found = []
+def _notified_numbers(gh, store, repos):
+    """{repo: [number]} for one notifications call, keeping only `repos` (matched case-insensitively)."""
+    names = {r.lower(): r for r in repos}
+    found = {r: [] for r in repos}
     for n in gh.get_all('/notifications', all='true', per_page=50, since=store.get('github-since')):
-        if (n.get('repository') or {}).get('full_name', '').lower() != repo.lower():
+        repo = names.get((n.get('repository') or {}).get('full_name', '').lower())
+        if repo is None:
             continue
         m = re.search(r'/(?:issues|pulls)/(\d+)$', (n.get('subject') or {}).get('url') or '')
         if m:
-            found.append(int(m.group(1)))
+            found[repo].append(int(m.group(1)))
     return found
 
 
@@ -173,8 +183,11 @@ def _before(stamp, floor):
         return False
 
 
-def _read_item(gh, repo, n, cursor, agent_login, floor=None):
-    """`floor` is the service's first start: an item seen for the first time yields nothing older than it."""
+def _read_item(gh, repo, n, cursor, agent_login, floor=None, qualified=False, old_issue_id=None):
+    """`floor` is the service's first start: an item seen for the first time yields nothing older than it.
+
+    `old_issue_id` is this issue's Trigger id from before ids named the repo; when stored, the issue was handled.
+    """
     own = agent_login.lower()
     issue = gh.get(f'/repos/{repo}/issues/{n}')
     if issue is None:
@@ -182,8 +195,9 @@ def _read_item(gh, repo, n, cursor, agent_login, floor=None):
     is_pr = 'pull_request' in issue
     out = []
     old_issue = floor and _before(issue.get('created_at'), floor)
-    if cursor is None and not old_issue and (issue.get('user') or {}).get('login', '').lower() != own:
-        out.append(issue_trigger(repo, issue, agent_login))
+    if cursor is None and not old_issue and (issue.get('user') or {}).get('login', '').lower() != own \
+            and not old_issue_id:
+        out.append(issue_trigger(repo, issue, agent_login, qualified))
     sources = [('comment', f'/repos/{repo}/issues/{n}/comments')]
     if is_pr:
         sources.append(('review', f'/repos/{repo}/pulls/{n}/comments'))
@@ -197,9 +211,64 @@ def _read_item(gh, repo, n, cursor, agent_login, floor=None):
     return out
 
 
-def poll(gh, store, repo, agent_login, subscribed_numbers, now=None):
-    """One polling round. Returns Triggers; storing them and deciding policy belong to the service.
+class _Keys:
+    """The kv keys and Trigger ids for one repository's polling state.
 
+    The single-repo form keeps the original unqualified keys (`github-cursor:<n>`, `github-retry`, `github-issue|<n>`).
+    With [[repos]], keys name the repo; the repo that owned the unqualified keys (`heir`) reads them while its own
+    are missing, so moving a config to [[repos]] neither re-reads old comments nor reopens handled issues.
+    """
+
+    def __init__(self, store, repo, legacy, heir):
+        self.store, self.repo, self.legacy, self.heir = store, repo, legacy, heir
+
+    def cursor_key(self, n):
+        return f'github-cursor:{n}' if self.legacy else f'github-cursor:{self.repo}#{n}'
+
+    def cursor(self, n):
+        c = self.store.get(self.cursor_key(n))
+        if c is None and self.heir:
+            c = self.store.get(f'github-cursor:{n}')
+        return c
+
+    @property
+    def retry_key(self):
+        return 'github-retry' if self.legacy else f'github-retry:{self.repo}'
+
+    def retry(self):
+        r = self.store.get(self.retry_key)
+        if r is None and self.heir:
+            r = self.store.get('github-retry')
+        return dict(r or {})
+
+    def old_issue_id(self, n):
+        """The unqualified Trigger id of this repo's issue `n`, when one is stored (from before [[repos]])."""
+        if self.legacy:
+            return None
+        old = self.store.trigger(f'github-issue|{n}')
+        return old.id if old and old.thread_key.lower() == f'github:{self.repo}#{n}'.lower() else None
+
+
+def _legacy_owner(store, repos):
+    """The repo the unqualified kv keys belong to: the repo of the oldest stored Trigger (the single-repo era came
+    first), else the only configured repo."""
+    oldest = store.oldest_trigger()
+    if oldest and oldest.thread_key.startswith('github:'):
+        owner = oldest.thread_key[len('github:'):].rsplit('#', 1)[0]
+        return next((r for r in repos if r.lower() == owner.lower()), None)
+    return repos[0] if len(repos) == 1 else None
+
+
+def poll(gh, store, repo, agent_login, subscribed_numbers, now=None):
+    """One polling round of the single-repo form (unqualified kv keys and issue ids)."""
+    return poll_repos(gh, store, [repo], agent_login, {repo: subscribed_numbers}, now, legacy=True)
+
+
+def poll_repos(gh, store, repos, agent_login, subscribed, now=None, legacy=False):
+    """One polling round over `repos` (owner/name list): one notifications call, then each item per repo.
+
+    `subscribed` maps a repo to item numbers to read whatever the notifications say. Returns Triggers; storing them
+    and deciding policy belong to the service. `legacy` is the single-repo form: exactly one repo, unqualified keys.
     A RateLimited error aborts the round with nothing advanced; the next round repeats it.
     The very first round only records the start time: requests written before the service ever ran are not work.
     """
@@ -210,27 +279,34 @@ def poll(gh, store, repo, agent_login, subscribed_numbers, now=None):
         return []
     floor = store.get('github-start')
     stepped = _iso(now - STEP_BACK)
-    retry = dict(store.get('github-retry') or {})
-    numbers = sorted({*_notified_numbers(gh, store, repo), *map(int, subscribed_numbers), *map(int, retry)})
-    triggers, cursors = [], {}
-    for n in numbers:
-        try:
-            triggers.extend(_read_item(gh, repo, n, store.get(f'github-cursor:{n}'), agent_login, floor))
-        except RateLimited:
-            raise
-        except Gone:
+    owner = None if legacy else _legacy_owner(store, repos)
+    subscribed = {k.lower(): v for k, v in (subscribed or {}).items()}
+    notified = _notified_numbers(gh, store, repos)
+    triggers, writes = [], []
+    for repo in repos:
+        keys = _Keys(store, repo, legacy, repo == owner)
+        retry = keys.retry()
+        numbers = sorted({*notified[repo], *map(int, subscribed.get(repo.lower(), ())), *map(int, retry)})
+        cursors = {}
+        for n in numbers:
+            try:
+                triggers.extend(_read_item(gh, repo, n, keys.cursor(n), agent_login, floor, not legacy,
+                                           keys.old_issue_id(n)))
+            except RateLimited:
+                raise
+            except Gone:
+                retry.pop(str(n), None)
+                continue
+            except GitHubError:
+                first = retry.setdefault(str(n), _iso(now))
+                if now - datetime.fromisoformat(first) > RETRY_FOR:
+                    retry.pop(str(n))
+                continue
             retry.pop(str(n), None)
-            continue
-        except GitHubError:
-            first = retry.setdefault(str(n), _iso(now))
-            if now - datetime.fromisoformat(first) > RETRY_FOR:
-                retry.pop(str(n))
-            continue
-        retry.pop(str(n), None)
-        cursors[n] = stepped
-    for n, c in cursors.items():
-        store.put(f'github-cursor:{n}', c)
-    store.put('github-retry', retry)
+            cursors[n] = stepped
+        writes += [(keys.cursor_key(n), c) for n, c in cursors.items()] + [(keys.retry_key, retry)]
+    for k, v in writes:
+        store.put(k, v)
     store.put('github-since', stepped)
     return triggers
 

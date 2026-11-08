@@ -2,7 +2,8 @@
 # Secrets never go in this file: only the names of the environment variables that hold them.
 
 [github]
-# The one repository the agent works in, as owner/name.
+# The repository the agent works in, as owner/name. For several repositories, remove `repo` here and `checkout`
+# below and add one [[repos]] table per repository (see the end of this file).
 repo = "your-org/your-repo"
 # The bot account the agent comments and opens pull requests as. People mention it as @<agent_login>.
 agent_login = "your-bot"
@@ -30,6 +31,9 @@ model = "claude-sonnet-5-5"
 thinking = "medium"
 # Tools Pi may use (comma-separated allow-list).
 tools = "read,grep,find,ls,edit,write,bash"
+# When a repo has a test_command and it fails, the worker gets this many fix attempts before the Ticket is
+# reported blocked.
+max_test_retries = 2
 # At most this many workers run at once (1-16). Further launches wait in the queue.
 max_workers = 2
 # Extra environment variables removed from the workers' environment, on top of token_env.
@@ -42,3 +46,16 @@ poll_seconds = 60
 state_dir = "~/.local/share/pi-superagent"
 # Localhost port workers report to with `superagent-report`.
 report_port = 8741
+
+# Several repositories: one table per repository, instead of [github] repo and [executor] checkout.
+# Every name must be covered by the one token in token_env.
+# [[repos]]
+# name = "your-org/your-repo"
+# checkout = "~/src/your-repo"
+# base_branch = "main"            # default: [executor] base_branch
+# test_command = "make test"      # run with `sh -c` in the worktree before any pull request; default: none
+# test_timeout = 900              # seconds
+#
+# [[repos]]
+# name = "your-org/other-repo"
+# checkout = "~/src/other-repo"

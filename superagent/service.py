@@ -57,6 +57,8 @@ class Service:
         self.report_url, self.run_timeout = report_url, run_timeout
         self.workers = {}  # ticket id -> executor.Worker, only while its process is alive
         self.tasks = {}  # ticket id -> the asyncio.Task running that worker
+        self.test_tasks = {}  # ticket id -> the asyncio.Task running its repo's test command
+        self.test_runs = {}  # ticket id -> executor.TestRun, only while the command runs
         self.loop = None
         self.closing = False
         self.paused_until, self.pause = None, None
@@ -76,18 +78,25 @@ class Service:
     def _set_current(self, t, a):
         t.assignments[-1] = asdict(a)
 
+    def _gh(self, repo):
+        """The GitHub client for `repo` (one token for every configured repo)."""
+        return self.gh.for_repo(repo) if repo else self.gh
+
     def reply(self, t, msg_id, body):
         trig = self._request(t)
         review_root = (trig.meta.get('review_root') if trig else None)
-        self.store.enqueue('reply', msg_id, {'ticket_id': t.id, 'number': t.number, 'body': cap_words(body),
-                                             'review_root': review_root}, now=self.clock())
+        self.store.enqueue('reply', msg_id, {'ticket_id': t.id, 'repo': t.repo, 'number': t.number,
+                                             'body': cap_words(body), 'review_root': review_root}, now=self.clock())
 
-    def _new_assignment(self, t, mode):
+    def _new_assignment(self, t, mode, message=''):
+        """`message`, when given, is what the relaunched worker is told (before any new thread messages)."""
         a = Assignment(id=new_id('as'))
         t.assignments.append(asdict(a))
         self.store.save_ticket(t)
-        self.store.enqueue('launch', f'{t.id}:{a.id}', {'ticket_id': t.id, 'assignment_id': a.id, 'mode': mode},
-                           now=self.clock())
+        data = {'ticket_id': t.id, 'assignment_id': a.id, 'mode': mode}
+        if message:
+            data['message'] = message
+        self.store.enqueue('launch', f'{t.id}:{a.id}', data, now=self.clock())
         return a
 
     # Report server hooks (called on its thread)
@@ -110,10 +119,12 @@ class Service:
         now = self.clock()
         if self.paused_until and now < self.paused_until:
             return
-        numbers = sorted({t.number for t in self.store.tickets(state='open')})
+        subscribed = {}
+        for t in self.store.tickets(state='open'):
+            subscribed.setdefault(t.repo, set()).add(t.number)
         try:
-            triggers = await asyncio.to_thread(github.poll, self.gh, self.store, self.cfg.repo, self.cfg.agent_login,
-                                               numbers, now)
+            triggers = await asyncio.to_thread(github.poll_repos, self.gh, self.store, self.cfg.repo_names,
+                                               self.cfg.agent_login, subscribed, now, self.cfg.legacy)
         except github.RateLimited as e:
             self.pause = min(self.pause * 2, RATE_PAUSE_MAX) if self.pause else RATE_PAUSE_START
             self.paused_until = now + self.pause
@@ -161,10 +172,11 @@ class Service:
             first = next((line for line in trig.text.splitlines() if line.strip()), '')
             title = re.sub(rf'@{re.escape(self.cfg.agent_login)}\b[,:]?', '', first, flags=re.I)
         title = ' '.join(title.split())[:TITLE_MAX].strip() or 'Request'
-        taken = {t.name for t in self.store.tickets()}
+        taken = {t.name for t in self.store.tickets()}  # unique across every repo
+        repo = trig.thread_key.removeprefix('github:').rsplit('#', 1)[0]
         a = Assignment(id=new_id('as'))
         t = Ticket(id=new_id('tk'), name=short_name(title, taken), title=title, thread_key=trig.thread_key,
-                   repo=self.cfg.repo, number=int(trig.meta['number']),
+                   repo=repo, number=int(trig.meta['number']),
                    mandate={'actor': trig.actor, 'strength': 'explicit', 'trigger_id': trig.id, 'at': trig.at},
                    created_at=self.now_iso(), token=secrets.token_urlsafe(24), assignments=[asdict(a)],
                    last_human_at=trig.at)
@@ -214,6 +226,7 @@ class Service:
                                {'ticket_id': t.id, 'assignment_id': a.id}, now=self.clock())
             log.info('[%s] operator retry: delivering again', t.name)
         elif a is None or (a.state == 'ended' and tid not in self.workers):
+            t.test_failures = 0  # the operator grants fresh fix attempts
             self._new_assignment(t, 'retry')
             log.info('[%s] operator retry: relaunching', t.name)
         else:
@@ -266,7 +279,11 @@ class Service:
 
     async def _effect_reply(self, e):
         d = e['data']
-        result = await asyncio.to_thread(github.post_comment, self.gh, d['number'], d['body'], e['key'],
+        repo = d.get('repo')
+        if not repo:  # queued by a version before replies named their repo
+            t = self.store.ticket(d.get('ticket_id', ''))
+            repo = t.repo if t else None
+        result = await asyncio.to_thread(github.post_comment, self._gh(repo), d['number'], d['body'], e['key'],
                                          d.get('review_root'))
         self.store.effect_done(e['id'])
         log.info('[%s] reply %s on #%s: %s', self._name(d.get('ticket_id', '')), e['key'], d['number'], result)
@@ -287,7 +304,7 @@ class Service:
         t.worktree, t.branch = path, branch
         fresh = not any(x.get('started_at') for x in t.assignments[:-1])
         inputs = self.store.pending_inputs(t.id)
-        message = self._message(t, d['mode'], fresh, inputs)
+        message = self._message(t, d['mode'], fresh, inputs, d.get('message', ''))
         a.state, a.started_at = 'running', self.now_iso()
         self._set_current(t, a)
         self.store.save_ticket(t)
@@ -306,11 +323,14 @@ class Service:
         self.tasks[t.id] = asyncio.create_task(self._run_worker(t.id, a.id, worker, message))
         log.info('[%s] worker launched (%s) in %s', t.name, d['mode'], path)
 
-    def _message(self, t, mode, fresh, inputs):
+    def _message(self, t, mode, fresh, inputs, note=''):
         if fresh:
             trig = self._request(t)
-            return executor.first_message(t, trig.text if trig else t.title, inputs)
+            return executor.first_message(t, trig.text if trig else t.title, inputs,
+                                          self.cfg.repo_config(t.repo).test_command)
         followups = executor.followup_message(inputs) if inputs else ''
+        if note:
+            return note + ('\n\n' + followups if followups else '')
         if mode == 'restart':
             return executor.recovery_note() + ('\n\n' + followups if followups else '')
         if followups:
@@ -379,14 +399,84 @@ class Service:
         if status == 'waiting':
             self.reply(t, msg_id, f'Question: {a.question}')
         elif status == 'ready':
-            self.store.enqueue('deliver', f'{t.id}:{a.id}', {'ticket_id': t.id, 'assignment_id': a.id},
-                               now=self.clock())
+            if self.cfg.repo_config(t.repo).test_command:
+                self.store.enqueue('test', f'{t.id}:{a.id}:test-{t.test_failures + 1}',
+                                   {'ticket_id': t.id, 'assignment_id': a.id}, now=self.clock())
+            else:
+                self.store.enqueue('deliver', f'{t.id}:{a.id}', {'ticket_id': t.id, 'assignment_id': a.id},
+                                   now=self.clock())
         elif status == 'blocked':
             self.reply(t, msg_id, f'I am blocked: {a.summary}')
         elif status == 'failed':
             self.reply(t, msg_id, f'I could not finish this: {a.summary}')
         elif status == 'dropped':
             self.reply(t, msg_id, f'I am not taking this on: {a.summary}')
+
+    # Tests: the repo's test command runs after a `ready` report, before any pull request.
+    async def _effect_test(self, e):
+        d = e['data']
+        t = self.store.ticket(d['ticket_id'])
+        a = t.current if t else None
+        if not t or t.state == 'ended' or not a or a.id != d['assignment_id']:
+            self.store.effect_done(e['id'])  # stale: the Ticket moved on
+            return
+        running = self.test_tasks.get(t.id)
+        if t.id in self.workers or (running and not running.done()):
+            return  # stays queued until the worker's run has ended
+        self.test_tasks[t.id] = asyncio.create_task(self._run_tests(e, t.id, a.id))
+
+    async def _run_tests(self, e, tid, aid):
+        t = self.store.ticket(tid)
+        try:
+            repo = self.cfg.repo_config(t.repo)
+            run = self.test_runs[tid] = executor.TestRun(repo.test_command, t.worktree, executor.test_env(self.cfg),
+                                                         repo.test_timeout)
+            log.info('[%s] running tests: %s', t.name, repo.test_command)
+            result = await asyncio.to_thread(run.wait)
+        except Exception as ex:
+            self._effect_failed(e, ex)
+            return
+        finally:
+            self.test_runs.pop(tid, None)
+        if self.closing:
+            return  # the effect stays queued: the next start runs the tests again
+        try:
+            self._tests_done(e, tid, aid, repo, result)
+        except Exception as ex:
+            self._effect_failed(e, ex)
+
+    def _tests_done(self, e, tid, aid, repo, result):
+        t = self.store.ticket(tid)
+        if not t or t.state == 'ended' or not t.current or t.current.id != aid:
+            self.store.effect_done(e['id'])
+            return
+        a, command = t.current, repo.test_command
+        if result['passed']:
+            t.test_failures, t.test_result = 0, f'Tests: `{command}` passed in {result["seconds"]}s'
+            self.store.save_ticket(t)
+            self.store.enqueue('deliver', f'{t.id}:{a.id}', {'ticket_id': t.id, 'assignment_id': a.id},
+                               now=self.clock())
+            self.store.effect_done(e['id'])
+            log.info('[%s] tests passed in %ss', t.name, result['seconds'])
+            return
+        t.test_failures += 1
+        t.test_output = result['output'][-executor.TEST_TAIL:]
+        how = (f'timed out after {repo.test_timeout}s' if result['timed_out']
+               else f'exit code {result["code"]}')
+        log.warning('[%s] tests failed (%s), failure %d', t.name, how, t.test_failures)
+        if t.test_failures > self.cfg.max_test_retries:
+            a.report, a.summary, a.question = 'blocked', f'tests still failing: {command}'[:500], ''
+            self._set_current(t, a)
+            self.store.save_ticket(t)
+            fixes = self.cfg.max_test_retries
+            self.reply(t, f'{t.id}-{a.id}-tests-blocked',
+                       f'I am blocked: tests still failing: `{command}` ({how}) after {fixes} '
+                       f'fix attempt{"" if fixes == 1 else "s"}, so I opened no pull request.')
+        else:
+            self.store.save_ticket(t)
+            self._new_assignment(t, 'tests', executor.test_failure_message(
+                command, result, repo.test_timeout, t.test_failures, self.cfg.max_test_retries))
+        self.store.effect_done(e['id'])
 
     async def _effect_deliver(self, e):
         d = e['data']
@@ -395,25 +485,33 @@ class Service:
             self.store.effect_done(e['id'])
             return
         a = next((Assignment(**x) for x in t.assignments if x['id'] == d['assignment_id']), t.current)
-        base = f'origin/{self.cfg.base_branch}'
+        repo = self.cfg.repo_config(t.repo)
+        base = f'origin/{repo.base_branch}'
         env = executor.git_env(self.cfg)
         if not await asyncio.to_thread(github.has_new_commits, t.worktree, base, self.run_git, env):
             self.store.effect_done(e['id'])
             self.reply(t, f'{t.id}-{a.id}-nochange', 'I finished, but there were no changes to propose.')
             log.info('[%s] ready without commits: no PR', t.name)
             return
-        await asyncio.to_thread(github.push_branch, t.worktree, t.branch, self.cfg.token, self.cfg.repo,
-                                os.path.join(self.cfg.state_dir, 'push.git'), self.run_git, env)
+        push_dir = self.cfg.push_dir(repo)
+        os.makedirs(os.path.dirname(push_dir), exist_ok=True)
+        await asyncio.to_thread(github.push_branch, t.worktree, t.branch, self.cfg.token, repo.name, push_dir,
+                                self.run_git, env)
         trig = self._request(t)
-        body = a.summary or t.title
+        if not repo.test_command:
+            tests = f'Tests: no test command configured for {repo.name}.'
+        else:
+            tests = t.test_result or f'Tests: `{repo.test_command}` was not run for this delivery.'
+        body = f'{a.summary or t.title}\n\n{tests}'
         if not (trig and trig.meta.get('is_pr')):
             body += f'\n\nCloses #{t.number}'
-        number = await asyncio.to_thread(github.open_pull, self.gh, t.branch, self.cfg.base_branch, t.title, body)
+        number = await asyncio.to_thread(github.open_pull, self._gh(repo.name), t.branch, repo.base_branch, t.title,
+                                         body)
         t = self.store.ticket(t.id)
         t.pr_number = number
         self.store.save_ticket(t)
         self.store.effect_done(e['id'])
-        self.reply(t, f'{t.id}-pr-{number}', f'Opened a pull request: https://github.com/{self.cfg.repo}/pull/{number}')
+        self.reply(t, f'{t.id}-pr-{number}', f'Opened a pull request: https://github.com/{repo.name}/pull/{number}')
         log.info('[%s] delivered PR #%s', t.name, number)
 
     # Pull requests
@@ -422,7 +520,7 @@ class Service:
             if not t.pr_number:
                 continue
             try:
-                state = await asyncio.to_thread(github.pull_state, self.gh, t.pr_number)
+                state = await asyncio.to_thread(github.pull_state, self._gh(t.repo), t.pr_number)
             except github.RateLimited:
                 return
             except github.GitHubError as e:
@@ -478,6 +576,8 @@ class Service:
         workers, self.workers = list(self.workers.values()), {}
         for w in workers:
             await w.stop()
-        tasks = [t for t in self.tasks.values() if not t.done()]
+        for run in list(self.test_runs.values()):
+            run.kill()
+        tasks = [t for t in [*self.tasks.values(), *self.test_tasks.values()] if not t.done()]
         if tasks:
             await asyncio.wait(tasks, timeout=10)

@@ -15,7 +15,8 @@ from datetime import datetime, timedelta, timezone
 from .model import Ticket, Trigger, now_iso
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS triggers (id TEXT PRIMARY KEY, thread_key TEXT, decision TEXT, data TEXT, reason TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS triggers (id TEXT PRIMARY KEY, thread_key TEXT, decision TEXT, data TEXT);
+CREATE TABLE IF NOT EXISTS trigger_reasons (id TEXT PRIMARY KEY, reason TEXT);
 CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, thread_key TEXT, state TEXT, data TEXT);
 CREATE TABLE IF NOT EXISTS inputs (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id TEXT, kind TEXT, text TEXT, trigger_id TEXT,
@@ -51,32 +52,47 @@ class Store:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.lock = threading.RLock()
         with self.lock:
-            self.db = sqlite3.connect(path, check_same_thread=False)
+            # Concurrent first opens (service plus `status` or the panel) wait for each other instead of failing.
+            self.db = sqlite3.connect(path, timeout=30, check_same_thread=False)
             self.db.row_factory = sqlite3.Row
             self.db.execute('PRAGMA journal_mode=WAL')
             self.db.executescript(SCHEMA)
-            self._upgrade()
+            self._keep_column_reasons()
 
-    def _upgrade(self):
-        """Bring a database from an older version up to SCHEMA. Only adds columns; never rewrites rows."""
-        columns = {r['name'] for r in self.db.execute('PRAGMA table_info(triggers)')}
-        if 'reason' not in columns:
-            self.db.execute("ALTER TABLE triggers ADD COLUMN reason TEXT DEFAULT ''")
+    def _keep_column_reasons(self):
+        """Tables are never altered, so older versions keep working on this database.
+
+        One build (48f2ba4) stored reasons in a fifth `triggers` column. Such a database keeps that column; its
+        reasons are copied into `trigger_reasons` (idempotent, so concurrent opens are safe).
+        """
+        if 'reason' in {r['name'] for r in self.db.execute('PRAGMA table_info(triggers)')}:
+            self.db.execute("INSERT OR IGNORE INTO trigger_reasons SELECT id, reason FROM triggers "
+                            "WHERE reason IS NOT NULL AND reason != ''")
             self.db.commit()
 
     # Triggers: the same id twice is a no-op.
     @_locked
     def add_trigger(self, t: Trigger, decision, reason=''):
-        cur = self.db.execute('INSERT OR IGNORE INTO triggers (id, thread_key, decision, data, reason) '
-                              'VALUES (?, ?, ?, ?, ?)', (t.id, t.thread_key, decision, json.dumps(t.__dict__), reason))
+        # Named columns: a database upgraded by 48f2ba4 has an extra `reason` column, which keeps its default.
+        cur = self.db.execute('INSERT OR IGNORE INTO triggers (id, thread_key, decision, data) VALUES (?, ?, ?, ?)',
+                              (t.id, t.thread_key, decision, json.dumps(t.__dict__)))
+        added = cur.rowcount == 1
+        if added:
+            self.db.execute('INSERT OR REPLACE INTO trigger_reasons VALUES (?, ?)', (t.id, reason))
         self.db.commit()
-        return cur.rowcount == 1
+        return added
 
     @_locked
     def recent_triggers(self, limit=300):
         """[(Trigger, decision, reason)], most recently received first."""
-        rows = self.db.execute('SELECT data, decision, reason FROM triggers ORDER BY rowid DESC LIMIT ?', (limit,))
-        return [(Trigger(**json.loads(r['data'])), r['decision'], r['reason'] or '') for r in rows.fetchall()]
+        rows = self.db.execute('SELECT t.data, t.decision, COALESCE(r.reason, \'\') AS reason FROM triggers t '
+                               'LEFT JOIN trigger_reasons r ON r.id = t.id ORDER BY t.rowid DESC LIMIT ?', (limit,))
+        return [(Trigger(**json.loads(r['data'])), r['decision'], r['reason']) for r in rows.fetchall()]
+
+    @_locked
+    def oldest_trigger(self):
+        row = self.db.execute('SELECT data FROM triggers ORDER BY rowid LIMIT 1').fetchone()
+        return Trigger(**json.loads(row['data'])) if row else None
 
     @_locked
     def has_trigger(self, trigger_id):

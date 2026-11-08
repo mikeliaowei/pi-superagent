@@ -67,7 +67,7 @@ def cmd_run(cfg, args):
     from .service import Service
 
     store = open_store(cfg)
-    gh = GitHub(cfg.token, cfg.repo)
+    gh = GitHub(cfg.token, cfg.repos[0].name)  # one token for every repo; the service picks the repo per call
 
     async def main():
         stop = asyncio.Event()
@@ -84,7 +84,8 @@ def cmd_run(cfg, args):
         except OSError as e:
             raise RuntimeError(f'cannot listen on 127.0.0.1:{cfg.report_port}: {e.strerror or e}') from None
         svc = holder['svc'] = Service(cfg, store, gh, report_url=server.url)
-        log.info('superagent watching %s as %s; reports on %s', cfg.repo, cfg.agent_login, server.url)
+        log.info('superagent watching %s as %s; reports on %s', ', '.join(cfg.repo_names), cfg.agent_login,
+                 server.url)
         try:
             await svc.run_forever(stop)
         finally:
@@ -100,7 +101,9 @@ def status_data(cfg, store):
     stages = Counter(stage(t) for t in store.tickets(state='open'))
     failing = [{'kind': e['kind'], 'key': e['key'], 'attempts': e['attempts'], 'error': e['last_error']}
                for e in store.failing_effects()]
-    return {'repo': cfg.repo, 'agent_login': cfg.agent_login, 'token': 'yes' if cfg.token else 'no',
+    # The single-repo form keeps its original output; [[repos]] lists every repo.
+    where = {'repo': cfg.repo} if cfg.legacy else {'repos': cfg.repo_names}
+    return {**where, 'agent_login': cfg.agent_login, 'token': 'yes' if cfg.token else 'no',
             'open_tickets': dict(stages), 'failing_effects': failing, 'last_poll': store.get('last-poll')}
 
 
@@ -109,24 +112,28 @@ def cmd_status(cfg, args):
     return 0
 
 
-def _row(t):
+def _row(t, cfg=None):
+    """One Ticket as `tickets` shows it; with [[repos]] (cfg not in the single-repo form) it names the repo."""
     a = t.current
-    return {'id': t.id, 'name': t.name, 'stage': stage(t), 'number': t.number, 'pr': t.pr_number,
+    row = {'id': t.id, 'name': t.name}
+    if cfg is not None and not cfg.legacy:
+        row['repo'] = t.repo
+    return {**row, 'stage': stage(t), 'number': t.number, 'pr': t.pr_number,
             'state': t.state, 'outcome': t.outcome, 'last_report': a.report if a else None,
             'summary': a.summary if a else ''}
 
 
 def cmd_tickets(cfg, args):
     store = open_store(cfg)
-    rows = [_row(t) for t in store.tickets(state=None if args.all else 'open')]
+    rows = [_row(t, cfg) for t in store.tickets(state=None if args.all else 'open')]
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
     if not rows:
         print('no tickets' if args.all else 'no open tickets (use --all to include ended ones)')
         return 0
-    cols = [('id', 'ID'), ('name', 'NAME'), ('stage', 'STAGE'), ('number', '#'), ('pr', 'PR'),
-            ('last_report', 'LAST REPORT')]
+    cols = [('id', 'ID'), ('name', 'NAME'), *([] if cfg.legacy else [('repo', 'REPO')]), ('stage', 'STAGE'),
+            ('number', '#'), ('pr', 'PR'), ('last_report', 'LAST REPORT')]
     cells = [[str(r[k] if r[k] is not None else '-') for k, _ in cols] for r in rows]
     widths = [max(len(h), *(len(c[i]) for c in cells)) for i, (_, h) in enumerate(cols)]
     for line in [[h for _, h in cols], *cells]:
@@ -187,22 +194,23 @@ def cmd_check(cfg, args):
         if not ok:
             problems.append(bad)
 
-    print(f'ok    config loads: {cfg.repo} as {cfg.agent_login}')
+    print(f'ok    config loads: {", ".join(cfg.repo_names)} as {cfg.agent_login}')
     token = bool(cfg.token)
     check(token, f'token: {cfg.token_env} is set',
           f'token: environment variable {cfg.token_env} is not set; export the bot account\'s fine-grained token')
     git = shutil.which('git')
-    origin = None
-    if git and os.path.isdir(cfg.checkout):
-        from .executor import git_env
-        from .github import GIT_HARDEN
-        # The checkout's config and hooks are worker-writable: same hardening as the service's own git commands.
-        r = subprocess.run(['git', *GIT_HARDEN, '-C', cfg.checkout, 'remote', 'get-url', 'origin'],
-                           env=git_env(cfg), capture_output=True, text=True)
-        origin = r.stdout.strip() if r.returncode == 0 else None
-    check(bool(origin), f'checkout: {cfg.checkout} is a git repo with origin {origin}',
-          f'checkout: {cfg.checkout} is not a git clone with an origin remote; '
-          f'run `git clone https://github.com/{cfg.repo}.git {cfg.checkout}`')
+    for repo in cfg.repos:
+        origin = None
+        if git and os.path.isdir(repo.checkout):
+            from .executor import git_env
+            from .github import GIT_HARDEN
+            # The checkout's config and hooks are worker-writable: same hardening as the service's own git commands.
+            r = subprocess.run(['git', *GIT_HARDEN, '-C', repo.checkout, 'remote', 'get-url', 'origin'],
+                               env=git_env(cfg), capture_output=True, text=True)
+            origin = r.stdout.strip() if r.returncode == 0 else None
+        check(bool(origin), f'checkout: {repo.checkout} is a git repo with origin {origin}',
+              f'checkout: {repo.checkout} is not a git clone with an origin remote; '
+              f'run `git clone https://github.com/{repo.name}.git {repo.checkout}`')
     version = None
     if os.path.isfile(cfg.pi) and os.access(cfg.pi, os.X_OK):
         try:
@@ -232,7 +240,7 @@ COMMANDS = {'run': cmd_run, 'status': cmd_status, 'tickets': cmd_tickets, 'stop'
 
 
 def parser():
-    p = argparse.ArgumentParser(prog='superagent', description='A coding agent for one GitHub repository, '
+    p = argparse.ArgumentParser(prog='superagent', description='A coding agent for GitHub repositories, '
                                                                'running Pi workers.')
     p.add_argument('--config', default=DEFAULT_CONFIG, help=f'config file (default {DEFAULT_CONFIG})')
     p.add_argument('-v', '--verbose', action='store_true', help='debug logging')
