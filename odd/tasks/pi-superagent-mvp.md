@@ -32,7 +32,7 @@ Branch: main (new repo, no commits yet). Delivery: ask-on-risk. Runner: `.venv/b
 | T4 | S8 S9 S10 | delegated after T2/T3 (context backstop) | done | commit 3c5ae32; verified; fixes c1d41e8, f814963; 121 tests GREEN; Risk: items 2 and 4 |
 | T6 | S11 | delegated (context backstop) | done | 12 tests GREEN (tests/test_panel.py), full suite 133 OK, real launch health `ok`; commit 3a46d49 |
 | T7 | S11 | inline (each fix < 100 lines) | done | 136 tests GREEN; real DB upgrade kept 7/7 rows; `kill` leaves no streamlit; commit 48f2ba4; Risk: item 1 (triggers table gains a column) |
-| T8 | S12 S13 | delegated (context backstop; shared core files, so sequential) | open | multi-repo config/poll/tickets + enforced tests |
+| T8 | S12 S13 | delegated (context backstop; sequential) | done | 156 tests GREEN; differential CLI check identical for single-repo; store reason-table fix included; commit a810e12; Risk: items 1, 2, 3 |
 | T9 | S14 | delegated after T8 (sequential, same files) | open | cross-repo tickets |
 | T10 | S15 | delegated after T9 (sequential) | open | local source + Pi skill/template |
 | T11 | S12-S15 | independent verifier | open | items 1 (ticket/config format), 2 (token, test command env), 3 (config compatibility) |
