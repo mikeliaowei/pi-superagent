@@ -1,0 +1,44 @@
+# pi-superagent configuration. Copy to ~/.config/pi-superagent/config.toml and edit.
+# Secrets never go in this file: only the names of the environment variables that hold them.
+
+[github]
+# The one repository the agent works in, as owner/name.
+repo = "your-org/your-repo"
+# The bot account the agent comments and opens pull requests as. People mention it as @<agent_login>.
+agent_login = "your-bot"
+# Environment variable holding the bot's fine-grained token (contents, issues, pull requests: read and write).
+token_env = "SUPERAGENT_GITHUB_TOKEN"
+
+[policy]
+# GitHub logins allowed to ask for work by mentioning the bot. Anyone else's comments on a live
+# Ticket's thread are passed to the worker as context only, never as new requests.
+allowed = ["your-login"]
+
+[executor]
+# Local clone of the repository (with an `origin` remote). Worktrees are created from it.
+checkout = "~/src/your-repo"
+# Where per-Ticket worktrees live. Default: <state_dir>/work
+# work_dir = "~/.local/share/pi-superagent/work"
+# Branch pull requests target, and the worktrees start from (origin/<base_branch>).
+base_branch = "main"
+# The Pi binary.
+pi = "~/.pi/agent/bin/pi"
+# Model for workers. Always explicit: the user's Pi defaults are never used.
+provider = "anthropic"
+model = "claude-sonnet-5-5"
+# Pi thinking level.
+thinking = "medium"
+# Tools Pi may use (comma-separated allow-list).
+tools = "read,grep,find,ls,edit,write,bash"
+# At most this many workers run at once (1-16). Further launches wait in the queue.
+max_workers = 2
+# Extra environment variables removed from the workers' environment, on top of token_env.
+secret_env = ["GITHUB_TOKEN", "GH_TOKEN"]
+
+[service]
+# Seconds between GitHub polls (60-3600).
+poll_seconds = 60
+# SQLite database, Pi sessions and (by default) worktrees live here.
+state_dir = "~/.local/share/pi-superagent"
+# Localhost port workers report to with `superagent-report`.
+report_port = 8741

@@ -1,0 +1,461 @@
+"""The service: polls GitHub into Triggers, runs one Pi worker per Ticket, and delivers replies and PRs.
+
+Every side effect goes through the store's effect queue (reply, launch, deliver), so a crash between deciding and
+acting replays the action instead of losing it. The philosophy follows dsh-superagent: confirm once, then stay
+quiet until there is a question, a result, or an honest failure.
+
+Operator actions from the CLI reach a running service through kv keys `operator:stop:<ticket>` and
+`operator:retry:<ticket>`; the service applies them at the start of each poll round (or at the next start).
+"""
+
+import asyncio
+import hashlib
+import json
+import logging
+import re
+import secrets
+import subprocess
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
+
+from . import executor, github, policy
+from .model import Assignment, Ticket, Trigger, new_id, short_name
+from .pi_rpc import PiRpc, RunResult
+
+log = logging.getLogger('superagent.service')
+
+RUN_TIMEOUT = 2 * 3600  # one worker run, seconds
+DELIVER_ATTEMPTS = 5
+REPLY_WORDS = 100
+TITLE_MAX = 80
+RATE_PAUSE_START, RATE_PAUSE_MAX = timedelta(minutes=5), timedelta(hours=1)
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def _iso(dt):
+    return dt.astimezone(timezone.utc).isoformat(timespec='seconds')
+
+
+def cap_words(text, n=REPLY_WORDS):
+    words = (text or '').split()
+    return ' '.join(words) if len(words) <= n else ' '.join(words[:n]) + '…'
+
+
+def _digest(*parts):
+    return hashlib.sha1('\0'.join(parts).encode()).hexdigest()[:10]
+
+
+class Service:
+    def __init__(self, cfg, store, gh, *, spawn=PiRpc, run_git=subprocess.run, clock=utcnow, report_url='',
+                 run_timeout=RUN_TIMEOUT):
+        self.cfg, self.store, self.gh = cfg, store, gh
+        self.spawn, self.run_git, self.clock = spawn, run_git, clock
+        self.report_url, self.run_timeout = report_url, run_timeout
+        self.workers = {}  # ticket id -> executor.Worker, only while its process is alive
+        self.tasks = {}  # ticket id -> the asyncio.Task running that worker
+        self.loop = None
+        self.closing = False
+        self.paused_until, self.pause = None, None
+
+    # Helpers
+    def now_iso(self):
+        return _iso(self.clock())
+
+    def _name(self, ticket_id):
+        t = self.store.ticket(ticket_id)
+        return t.name if t else ticket_id
+
+    def _request(self, t):
+        """The Trigger that opened the Ticket, as a dict (text, meta)."""
+        row = self.store.db.execute('SELECT data FROM triggers WHERE id = ?', (t.mandate.get('trigger_id'),)).fetchone()
+        return Trigger(**json.loads(row['data'])) if row else None
+
+    def _set_current(self, t, a):
+        t.assignments[-1] = asdict(a)
+
+    def reply(self, t, msg_id, body):
+        trig = self._request(t)
+        review_root = (trig.meta.get('review_root') if trig else None)
+        self.store.enqueue('reply', msg_id, {'ticket_id': t.id, 'number': t.number, 'body': cap_words(body),
+                                             'review_root': review_root}, now=self.clock())
+
+    def _new_assignment(self, t, mode):
+        a = Assignment(id=new_id('as'))
+        t.assignments.append(asdict(a))
+        self.store.save_ticket(t)
+        self.store.enqueue('launch', f'{t.id}:{a.id}', {'ticket_id': t.id, 'assignment_id': a.id, 'mode': mode},
+                           now=self.clock())
+        return a
+
+    # Report server hooks (called on its thread)
+    def lookup(self, token):
+        t = self.store.ticket_by_token(token)
+        return t.id if t else None
+
+    def on_report(self, ticket_id, report):
+        if self.loop is None:
+            raise RuntimeError('service is not running')
+        self.loop.call_soon_threadsafe(self.handle_report, ticket_id, report)
+
+    # Polling
+    async def poll_once(self):
+        self.loop = asyncio.get_running_loop()
+        await self.apply_operator_requests()
+        now = self.clock()
+        if self.paused_until and now < self.paused_until:
+            return
+        numbers = sorted({t.number for t in self.store.tickets(state='open')})
+        try:
+            triggers = await asyncio.to_thread(github.poll, self.gh, self.store, self.cfg.repo, self.cfg.agent_login,
+                                               numbers, now)
+        except github.RateLimited as e:
+            self.pause = min(self.pause * 2, RATE_PAUSE_MAX) if self.pause else RATE_PAUSE_START
+            self.paused_until = now + self.pause
+            log.warning('GitHub rate limit hit; pausing polls until %s (%s)', _iso(self.paused_until), e)
+            return
+        except github.GitHubError as e:
+            log.warning('poll failed: %s', e)
+            return
+        self.paused_until, self.pause = None, None
+        self.store.put('last-poll', _iso(now))
+        for trig in triggers:
+            await self.take(trig)
+
+    async def take(self, trig):
+        live = [t.id for t in self.store.tickets(state='open', thread_key=trig.thread_key)]
+        d = policy.gate(trig, self.cfg.agent_login, self.cfg.allowed, live)
+        if not self.store.add_trigger(trig, d.kind):
+            return
+        log.info('trigger %s from %s on %s: %s (%s)', trig.id, trig.actor, trig.thread_key, d.kind, d.reason)
+        if d.kind == 'accept':
+            self._accept(trig)
+        elif d.kind == 'stop':
+            for tid in d.ticket_ids:
+                if await self.end_ticket(tid, 'stopped'):
+                    self.reply(self.store.ticket(tid), f'{tid}-stopped', f'Stopped, as {trig.actor} asked.')
+        elif d.kind == 'context':
+            for tid in d.ticket_ids:
+                await self._context(tid, trig)
+
+    def _accept(self, trig):
+        if trig.kind == 'issue':
+            title = trig.text.split('\n', 1)[0]
+        else:
+            first = next((line for line in trig.text.splitlines() if line.strip()), '')
+            title = re.sub(rf'@{re.escape(self.cfg.agent_login)}\b[,:]?', '', first, flags=re.I)
+        title = ' '.join(title.split())[:TITLE_MAX].strip() or 'Request'
+        taken = {t.name for t in self.store.tickets()}
+        a = Assignment(id=new_id('as'))
+        t = Ticket(id=new_id('tk'), name=short_name(title, taken), title=title, thread_key=trig.thread_key,
+                   repo=self.cfg.repo, number=int(trig.meta['number']),
+                   mandate={'actor': trig.actor, 'strength': 'explicit', 'trigger_id': trig.id, 'at': trig.at},
+                   created_at=self.now_iso(), token=secrets.token_urlsafe(24), assignments=[asdict(a)],
+                   last_human_at=trig.at)
+        self.store.save_ticket(t)
+        log.info('[%s] new ticket for #%s from %s', t.name, t.number, trig.actor)
+        self.reply(t, f'{t.id}-ack', f"On it: I'll work on this as `{t.name}` and report back here.")
+        self.store.enqueue('launch', f'{t.id}:{a.id}', {'ticket_id': t.id, 'assignment_id': a.id, 'mode': 'first'},
+                           now=self.clock())
+
+    async def _context(self, tid, trig):
+        self.store.add_input(tid, trig.kind, trig.text, trig.id)
+        t = self.store.ticket(tid)
+        if trig.human:
+            t.last_human_at = trig.at
+            self.store.save_ticket(t)
+        worker = self.workers.get(tid)
+        if worker and worker.running:
+            inputs = self.store.pending_inputs(tid)
+            how = await worker.send(executor.followup_message(inputs))
+            self.store.mark_delivered([i['seq'] for i in inputs])
+            log.info('[%s] follow-up from %s %s', t.name, trig.actor, how)
+            return
+        a = t.current
+        if t.state == 'open' and a and a.state == 'ended' and tid not in self.workers:
+            self._new_assignment(t, 'resume')
+            log.info('[%s] follow-up from %s resumes the session', t.name, trig.actor)
+
+    # Operator requests
+    async def apply_operator_requests(self):
+        for t in self.store.tickets(state='open'):
+            if self.store.get(f'operator:stop:{t.id}'):
+                self.store.put(f'operator:stop:{t.id}', None)
+                if await self.end_ticket(t.id, 'stopped'):
+                    self.reply(self.store.ticket(t.id), f'{t.id}-stopped', 'Stopped by the operator.')
+                continue
+            if self.store.get(f'operator:retry:{t.id}'):
+                self.store.put(f'operator:retry:{t.id}', None)
+                self.retry(t.id)
+
+    def retry(self, tid):
+        t = self.store.ticket(tid)
+        a = t.current
+        if t.delivery_error and a:
+            t.delivery_error = ''
+            self.store.save_ticket(t)
+            self.store.enqueue('deliver', f'{t.id}:{a.id}:retry-{self.now_iso()}',
+                               {'ticket_id': t.id, 'assignment_id': a.id}, now=self.clock())
+            log.info('[%s] operator retry: delivering again', t.name)
+        elif a is None or (a.state == 'ended' and tid not in self.workers):
+            self._new_assignment(t, 'retry')
+            log.info('[%s] operator retry: relaunching', t.name)
+        else:
+            log.info('[%s] operator retry ignored: the ticket is %s', t.name, a.state)
+
+    # Ending
+    async def end_ticket(self, tid, outcome):
+        """End an open Ticket and stop its worker. Returns False when it had already ended."""
+        t = self.store.ticket(tid)
+        if not t or t.state == 'ended':
+            return False
+        t.state, t.outcome = 'ended', outcome
+        a = t.current
+        if a and a.state != 'ended':
+            a.state, a.ended_at, a.end_reason = 'ended', self.now_iso(), outcome
+            self._set_current(t, a)
+        self.store.save_ticket(t)
+        log.info('[%s] ended: %s', t.name, outcome)
+        worker = self.workers.pop(tid, None)
+        if worker:
+            await worker.stop()
+        return True
+
+    # Effects
+    async def run_effects(self):
+        """Run every due effect once, including those the pass itself queues (a delivery's link reply)."""
+        self.loop = asyncio.get_running_loop()
+        seen = set()
+        while due := [e for e in self.store.due_effects(now=self.clock()) if e['id'] not in seen]:
+            for e in due:
+                seen.add(e['id'])
+                if e['kind'] == 'launch' and len(self.workers) >= self.cfg.max_workers:
+                    continue  # stays queued: capacity is not a failure
+                try:
+                    await getattr(self, f'_effect_{e["kind"]}')(e)
+                except Exception as ex:
+                    self._effect_failed(e, ex)
+
+    def _effect_failed(self, e, ex):
+        d = e['data']
+        if e['kind'] == 'deliver' and e['attempts'] + 1 >= DELIVER_ATTEMPTS:
+            t = self.store.ticket(d['ticket_id'])
+            t.delivery_error = str(ex)[:500]
+            self.store.save_ticket(t)
+            self.store.effect_done(e['id'])
+            log.error('[%s] delivery gave up after %d attempts: %s', t.name, DELIVER_ATTEMPTS, ex)
+            return
+        delay = self.store.effect_failed(e['id'], ex, now=self.clock())
+        log.warning('[%s] %s failed (retry in %ss): %s', self._name(d.get('ticket_id', '')), e['kind'], delay, ex)
+
+    async def _effect_reply(self, e):
+        d = e['data']
+        result = await asyncio.to_thread(github.post_comment, self.gh, d['number'], d['body'], e['key'],
+                                         d.get('review_root'))
+        self.store.effect_done(e['id'])
+        log.info('[%s] reply %s on #%s: %s', self._name(d.get('ticket_id', '')), e['key'], d['number'], result)
+
+    async def _effect_launch(self, e):
+        d = e['data']
+        t = self.store.ticket(d['ticket_id'])
+        a = t.current if t else None
+        if not t or t.state == 'ended' or not a or a.id != d['assignment_id'] or a.state != 'pending':
+            self.store.effect_done(e['id'])  # stale: the Ticket moved on
+            return
+        try:
+            path, branch = await asyncio.to_thread(executor.prepare_worktree, self.cfg, t, self.run_git)
+        except Exception as ex:  # no automatic retry: a broken checkout needs a person
+            self.store.effect_done(e['id'])
+            self._fail_assignment(t, a, f'could not prepare the worktree: {ex}', 'prepare failed')
+            return
+        t.worktree, t.branch = path, branch
+        fresh = not any(x.get('started_at') for x in t.assignments[:-1])
+        inputs = self.store.pending_inputs(t.id)
+        message = self._message(t, d['mode'], fresh, inputs)
+        a.state, a.started_at = 'running', self.now_iso()
+        self._set_current(t, a)
+        self.store.save_ticket(t)
+        worker = executor.Worker()
+        self.workers[t.id] = worker
+        try:
+            await worker.start(self.cfg, t, self.report_url, spawn=self.spawn)
+        except Exception as ex:
+            self.workers.pop(t.id, None)
+            self.store.effect_done(e['id'])
+            await worker.stop()
+            self._fail_assignment(self.store.ticket(t.id), a, f'could not start pi: {ex}', 'start failed')
+            return
+        self.store.mark_delivered([i['seq'] for i in inputs])
+        self.store.effect_done(e['id'])
+        self.tasks[t.id] = asyncio.create_task(self._run_worker(t.id, a.id, worker, message))
+        log.info('[%s] worker launched (%s) in %s', t.name, d['mode'], path)
+
+    def _message(self, t, mode, fresh, inputs):
+        if fresh:
+            trig = self._request(t)
+            return executor.first_message(t, trig.text if trig else t.title, inputs)
+        followups = executor.followup_message(inputs) if inputs else ''
+        if mode == 'restart':
+            return executor.recovery_note() + ('\n\n' + followups if followups else '')
+        if followups:
+            return followups
+        return ('The operator asked you to try this Ticket again. Check your directory and git log, '
+                'then continue and report.')
+
+    async def _run_worker(self, tid, aid, worker, message):
+        try:
+            result = await worker.run(message, self.run_timeout)
+        except Exception as ex:
+            result = RunResult(error=str(ex) or type(ex).__name__)
+        finally:
+            await worker.stop()
+            if self.workers.get(tid) is worker:
+                del self.workers[tid]
+        if self.closing:
+            return  # the assignment stays running; recover() relaunches it at the next start
+        self._finish(tid, aid, result)
+
+    def _finish(self, tid, aid, result):
+        t = self.store.ticket(tid)
+        if not t or t.state == 'ended' or not t.current or t.current.id != aid:
+            return
+        a = t.current
+        if a.report in (None, 'progress'):
+            reason = result.error or 'no report'
+            self._fail_assignment(t, a, reason, reason)
+            return
+        a.state, a.ended_at, a.end_reason = 'ended', self.now_iso(), 'settled'
+        self._set_current(t, a)
+        self.store.save_ticket(t)
+        log.info('[%s] run settled after report %s', t.name, a.report)
+
+    def _fail_assignment(self, t, a, summary, end_reason):
+        a.state, a.report, a.ended_at, a.end_reason = 'ended', 'failed', self.now_iso(), end_reason[:300]
+        a.summary = summary[:500]
+        self._set_current(t, a)
+        self.store.save_ticket(t)
+        log.warning('[%s] assignment failed: %s', t.name, end_reason[:200])
+        if end_reason == 'no report':
+            body = 'The worker stopped without reporting a result, so I am not sure this is done.'
+        else:
+            body = f'I could not finish this: {summary[:300]}'
+        self.reply(t, f'{t.id}-{a.id}-failed', body)
+
+    # Reports
+    def handle_report(self, ticket_id, report):
+        t = self.store.ticket(ticket_id)
+        if not t or t.state == 'ended' or not t.current:
+            return
+        a = t.current
+        status = report['status']
+        a.report, a.summary, a.question = status, report['summary'], report.get('question', '')
+        self._set_current(t, a)
+        self.store.save_ticket(t)
+        log.info('[%s] report %s', t.name, status)
+        msg_id = f'{t.id}-{a.id}-{status}-{_digest(a.summary, a.question)}'
+        if status == 'waiting':
+            self.reply(t, msg_id, f'Question: {a.question}')
+        elif status == 'ready':
+            self.store.enqueue('deliver', f'{t.id}:{a.id}', {'ticket_id': t.id, 'assignment_id': a.id},
+                               now=self.clock())
+        elif status == 'blocked':
+            self.reply(t, msg_id, f'I am blocked: {a.summary}')
+        elif status == 'failed':
+            self.reply(t, msg_id, f'I could not finish this: {a.summary}')
+        elif status == 'dropped':
+            self.reply(t, msg_id, f'I am not taking this on: {a.summary}')
+
+    async def _effect_deliver(self, e):
+        d = e['data']
+        t = self.store.ticket(d['ticket_id'])
+        if not t or t.state == 'ended':
+            self.store.effect_done(e['id'])
+            return
+        a = next((Assignment(**x) for x in t.assignments if x['id'] == d['assignment_id']), t.current)
+        base = f'origin/{self.cfg.base_branch}'
+        if not await asyncio.to_thread(github.has_new_commits, t.worktree, base, self.run_git):
+            self.store.effect_done(e['id'])
+            self.reply(t, f'{t.id}-{a.id}-nochange', 'I finished, but there were no changes to propose.')
+            log.info('[%s] ready without commits: no PR', t.name)
+            return
+        await asyncio.to_thread(github.push_branch, t.worktree, t.branch, self.cfg.token, self.cfg.repo,
+                                self.run_git)
+        trig = self._request(t)
+        body = a.summary or t.title
+        if not (trig and trig.meta.get('is_pr')):
+            body += f'\n\nCloses #{t.number}'
+        number = await asyncio.to_thread(github.open_pull, self.gh, t.branch, self.cfg.base_branch, t.title, body)
+        t = self.store.ticket(t.id)
+        t.pr_number = number
+        self.store.save_ticket(t)
+        self.store.effect_done(e['id'])
+        self.reply(t, f'{t.id}-pr-{number}', f'Opened a pull request: https://github.com/{self.cfg.repo}/pull/{number}')
+        log.info('[%s] delivered PR #%s', t.name, number)
+
+    # Pull requests
+    async def check_pulls(self):
+        for t in self.store.tickets(state='open'):
+            if not t.pr_number:
+                continue
+            try:
+                state = await asyncio.to_thread(github.pull_state, self.gh, t.pr_number)
+            except github.RateLimited:
+                return
+            except github.GitHubError as e:
+                log.warning('[%s] cannot read PR #%s: %s', t.name, t.pr_number, e)
+                continue
+            if state in ('merged', 'closed'):
+                await self.end_ticket(t.id, state)
+
+    # Durability
+    def recover(self):
+        """After a restart: running assignments end as 'host restarted'; unfinished ones relaunch with a note."""
+        for t in self.store.tickets(state='open'):
+            a = t.current
+            if not a or a.state != 'running':
+                continue
+            a.state, a.ended_at, a.end_reason = 'ended', self.now_iso(), 'host restarted'
+            self._set_current(t, a)
+            self.store.save_ticket(t)
+            if a.report in (None, 'progress'):
+                self._new_assignment(t, 'restart')
+                log.info('[%s] host restarted: relaunching with a recovery note', t.name)
+            else:
+                log.info('[%s] host restarted after report %s', t.name, a.report)
+
+    # Main loop
+    async def run_forever(self, stop_event, tick=1.0):
+        self.loop = asyncio.get_running_loop()
+        self.recover()
+        next_poll = 0.0
+        try:
+            while not stop_event.is_set():
+                if self.loop.time() >= next_poll:
+                    next_poll = self.loop.time() + self.cfg.poll_seconds
+                    for step in (self.poll_once, self.check_pulls):
+                        try:
+                            await step()
+                        except Exception:
+                            log.exception('%s failed', step.__name__)
+                try:
+                    await self.run_effects()
+                except Exception:
+                    log.exception('run_effects failed')
+                try:
+                    await asyncio.wait_for(stop_event.wait(), tick)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            await self.close()
+
+    async def close(self):
+        """Stop every worker. Their assignments stay running, so the next start recovers them."""
+        self.closing = True
+        workers, self.workers = list(self.workers.values()), {}
+        for w in workers:
+            await w.stop()
+        tasks = [t for t in self.tasks.values() if not t.done()]
+        if tasks:
+            await asyncio.wait(tasks, timeout=10)
