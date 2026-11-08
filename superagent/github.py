@@ -23,6 +23,10 @@ RETRY_FOR = timedelta(hours=24)
 TIMEOUT = 30  # seconds for one API call
 # Every git command the service runs: no hooks and no fsmonitor, whatever the (worker-writable) repo config says.
 GIT_HARDEN = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false']
+# A worker runs as the same user and could edit push.git/config, so the token-bearing push pins its network
+# settings on the command line. URL-specific keys are pinned too: they win over the plain ones.
+PUSH_PINS = ['-c', 'http.proxy=', '-c', 'http.sslVerify=true',
+             '-c', 'http.https://github.com/.proxy=', '-c', 'http.https://github.com/.sslVerify=true']
 NETWORK_ERRORS = (urllib.error.URLError, ConnectionError, TimeoutError, http.client.HTTPException)
 
 
@@ -298,7 +302,7 @@ def push_branch(worktree, branch, token, repo, push_dir, run=subprocess.run, env
     push_env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0',
                     GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',
                     GIT_CONFIG_VALUE_0=f'AUTHORIZATION: basic {auth}')
-    git('push', [*in_push_repo, 'push', '--no-verify', f'https://github.com/{repo}.git',
+    git('push', [*in_push_repo, *PUSH_PINS, 'push', '--no-verify', f'https://github.com/{repo}.git',
                  f'+refs/heads/{branch}:refs/heads/{branch}'], push_env)
 
 

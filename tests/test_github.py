@@ -399,7 +399,11 @@ class GitTest(unittest.TestCase):
         self.assertEqual(init, ['git', *HARDEN, 'init', '--bare', '-q', self.push_dir])
         self.assertEqual(fetch, ['git', f'--git-dir={self.push_dir}', *HARDEN, 'fetch', '--no-tags', '/w/t',
                                  '+HEAD:refs/heads/agent/fix'])
-        self.assertEqual(push, ['git', f'--git-dir={self.push_dir}', *HARDEN, 'push', '--no-verify',
+        # The push repo's config is worker-reachable on disk, so the network settings that carry the token are pinned.
+        self.assertEqual(push, ['git', f'--git-dir={self.push_dir}', *HARDEN,
+                                '-c', 'http.proxy=', '-c', 'http.sslVerify=true',
+                                '-c', 'http.https://github.com/.proxy=', '-c', 'http.https://github.com/.sslVerify=true',
+                                'push', '--no-verify',
                                 'https://github.com/o/r.git', '+refs/heads/agent/fix:refs/heads/agent/fix'])
         for argv, kw in run.calls:
             self.assertNotIn(TOKEN, ' '.join(argv))
@@ -421,7 +425,8 @@ class GitTest(unittest.TestCase):
         open(os.path.join(self.push_dir, 'HEAD'), 'w').close()
         run = FakeRun()
         gh_mod.push_branch('/w/t', 'agent/fix', TOKEN, REPO, self.push_dir, run=run)
-        self.assertEqual([argv[len(HARDEN) + 2] for argv, _ in run.calls], ['fetch', 'push'])
+        self.assertEqual([next(a for a in argv if a in ('init', 'fetch', 'push')) for argv, _ in run.calls],
+                         ['fetch', 'push'])
 
     def test_push_failure_raises_with_redacted_stderr(self):
         run = FakeRun(1, stderr=f'fatal: denied for {TOKEN} {AUTH}')
