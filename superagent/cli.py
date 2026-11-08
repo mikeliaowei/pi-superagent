@@ -46,9 +46,14 @@ def load_config(path):
         raise ConfigError(f'config file {path}: {e}') from None
 
 
+_opened = []  # stores opened by the running command, closed when it returns
+
+
 def open_store(cfg):
     from .store import Store
-    return Store(cfg.db_path)
+    store = Store(cfg.db_path)
+    _opened.append(store)
+    return store
 
 
 def find_ticket(store, ref):
@@ -511,6 +516,10 @@ def main(argv=None):
             log.exception('failed')
         print(f'superagent: {e}', file=sys.stderr)
         return 1
+    finally:
+        # Closing here, not at garbage collection, keeps "unclosed database" warnings out of the output.
+        while _opened:
+            _opened.pop().close()
 
 
 if __name__ == '__main__':

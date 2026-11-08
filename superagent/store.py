@@ -260,3 +260,7 @@ class Store:
     def put(self, k, v):
         self.db.execute('INSERT OR REPLACE INTO kv VALUES (?, ?)', (k, json.dumps(v)))
         self.db.commit()
+
+    @_locked
+    def close(self):
+        self.db.close()

@@ -466,3 +466,28 @@ class PiInstallTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CliCloseTest(unittest.TestCase):
+    def test_cli_commands_close_their_database(self):
+        # An unclosed sqlite connection makes Python print a ResourceWarning at garbage collection, into stderr.
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        config = os.path.join(tmp, 'config.toml')
+        with open(config, 'w') as f:
+            f.write(f'[github]\nrepo = "o/r"\nagent_login = "bot"\n[policy]\nallowed = ["alice"]\n'
+                    f'[executor]\ncheckout = "{tmp}/co"\n[service]\nstate_dir = "{tmp}/state"\n')
+        opened = []
+        real = cli.open_store
+
+        def spy(cfg):
+            store = real(cfg)
+            opened.append(store)
+            return store
+        with mock.patch.object(cli, 'open_store', spy), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            cli.main(['--config', config, 'tickets', '--all'])
+            cli.main(['--config', config, 'ask', 'fix it'])
+        self.assertTrue(opened)
+        for store in opened:
+            with self.assertRaises(sqlite3.ProgrammingError):  # closed
+                store.db.execute('SELECT 1')
