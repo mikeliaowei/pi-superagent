@@ -410,6 +410,10 @@ def open_pull(gh, branch, base, title, body):
         raise
 
 
+def update_pull_body(gh, number, body):
+    gh.patch(f'/repos/{gh.repo}/pulls/{number}', {'body': body})
+
+
 def pull_state(gh, number):
     pr = gh.get(f'/repos/{gh.repo}/pulls/{number}')
     if pr is None:

@@ -221,6 +221,27 @@ class PanelAppTest(unittest.TestCase):
         self.assertEqual(values['test command (b/two)'], 'make check')
         self.assertEqual(values['checkout (a/one)'], f'{self.tmp}/one')
 
+    def test_a_cross_repo_ticket_shows_every_repo_and_pr_link(self):
+        with open(self.config, 'w') as f:
+            f.write(f'[github]\nagent_login = "bot"\ntoken_env = "SA_PANEL_TOKEN"\n[policy]\nallowed = ["alice"]\n'
+                    f'[service]\nstate_dir = "{self.tmp}/state"\nreport_port = 0\n'
+                    f'[[repos]]\nname = "a/one"\ncheckout = "{self.tmp}/one"\n'
+                    f'[[repos]]\nname = "b/two"\ncheckout = "{self.tmp}/two"\n')
+        store = self.store()
+        t = self.ticket(store, 'tk-1', 'fix-it', 4, report='ready', summary='Opened PRs')
+        t.repo, t.thread_key, t.worktree = 'a/one', 'github:a/one#4', f'{self.tmp}/work/tickets/fix-it'
+        t.parts = [{'repo': 'a/one', 'worktree': f'{t.worktree}/a__one', 'pr_number': 5, 'test_result': '',
+                    'pushed': 'as-tk-1'},
+                   {'repo': 'b/two', 'worktree': f'{t.worktree}/b__two', 'pr_number': 2, 'test_result': '',
+                    'pushed': 'as-tk-1'}]
+        store.save_ticket(t)
+        at = self.app()
+        text = rendered_text(at)
+        for url in ('https://github.com/a/one/pull/5', 'https://github.com/b/two/pull/2'):
+            self.assertIn(url, text)
+        self.assertIn(f'{t.worktree}/b__two', text)
+        self.assertEqual(list(at.tabs[1].dataframe[0].value['repo']), ['a/one, b/two'])
+
 class PanelCommandTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='superagent-panel-cli-')

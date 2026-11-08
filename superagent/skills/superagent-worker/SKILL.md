@@ -11,6 +11,9 @@ You are working one GitHub Ticket in this git worktree, on branch `agent/<name>`
 2. Do the work. Run the project's tests. Commit on this branch. When the assignment names a `test_command`,
    the service runs it in this directory before any pull request: run it yourself before reporting `ready`. If it
    fails, its output comes back to you; fix the cause, rerun it, commit, and report `ready` again.
+   When the assignment lists several `repos`, this directory is a ticket folder: each repo is its own git
+   worktree in a subfolder, on the same branch `agent/<name>`. Commit in each repo you change (the service opens
+   one pull request per changed repo and links them); each repo's `test_command` runs in its own worktree.
 3. Never push, open pull requests, or call GitHub. You have no GitHub credentials; the service delivers your branch.
 4. Report with `superagent-report --status <status> --summary "<text>" [--question "<text>"]`:
    - `progress`: sparingly, only for a milestone worth telling a human about.

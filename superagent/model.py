@@ -32,6 +32,23 @@ def short_name(title, taken=()):
     return name
 
 
+def named_repos(text, configured):
+    """The `configured` repos (owner/name) that `text` names, in order of first mention, matched case-insensitively
+    and word-bounded. Quoted lines (`>`) are someone else's words and name nothing. Returns configured spellings."""
+    own = '\n'.join(line for line in (text or '').splitlines() if not line.lstrip().startswith('>'))
+    found = []
+    for r in configured:
+        m = re.search(rf'(?<![\w./-]){re.escape(r)}(?![\w/-]|\.\w)', own, flags=re.I)
+        if m:
+            found.append((m.start(), r))
+    return [r for _, r in sorted(found)]
+
+
+def new_part(repo):
+    """One repo of a cross-repo Ticket."""
+    return {'repo': repo, 'worktree': '', 'pr_number': None, 'test_result': '', 'pushed': ''}
+
+
 @dataclass
 class Trigger:
     id: str  # deterministic per source event, so receiving it twice is a no-op
@@ -81,6 +98,15 @@ class Ticket:
     test_failures: int = 0  # failed runs since the last pass
     test_output: str = ''  # the tail of the last failing run's output
     test_result: str = ''  # the PR body line of the last passing run
+    # A cross-repo Ticket (S14) works in several repos: one part per repo, the thread's repo first. Each part is
+    # {repo, worktree, pr_number, test_result, pushed}; `worktree` above is then the ticket folder holding them.
+    # Empty for a single-repo Ticket, which keeps using worktree, pr_number and test_result above.
+    parts: list = field(default_factory=list)
+
+    @property
+    def repos(self):
+        """Every repo this Ticket works in, its own first."""
+        return [p['repo'] for p in self.parts] or [self.repo]
 
     @property
     def current(self):

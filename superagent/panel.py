@@ -42,7 +42,22 @@ def issue_url(t):
 
 
 def pr_url(t):
+    """The single PR link; for a cross-repo Ticket the first repo's PR (pr_links has them all)."""
+    if t.parts:
+        return next((u for _, u in pr_links(t)), None)
     return f'https://github.com/{t.repo}/pull/{t.pr_number}' if t.pr_number else None
+
+
+def pr_links(t):
+    """[(label, url)] for every PR of the Ticket: one per repo of a cross-repo Ticket."""
+    if t.parts:
+        return [(f"{p['repo']}#{p['pr_number']}", f"https://github.com/{p['repo']}/pull/{p['pr_number']}")
+                for p in t.parts if p['pr_number']]
+    return [(f'PR #{t.pr_number}', pr_url(t))] if t.pr_number else []
+
+
+def pr_markdown(t):
+    return ''.join(f' · [{label}]({url})' for label, url in pr_links(t))
 
 
 def updated_at(t):
@@ -84,7 +99,7 @@ def overview(cfg, store, tickets):
         a = t.current
         with st.container(border=True):
             st.markdown(f'**{t.name}** · `{stage(t)}` · [#{t.number}]({issue_url(t)})'
-                        + (f' · [PR #{t.pr_number}]({pr_url(t)})' if t.pr_number else ''))
+                        + pr_markdown(t))
             if t.delivery_error:
                 st.markdown(f'Delivery failed: {t.delivery_error}')
             if a and a.question:
@@ -133,7 +148,7 @@ def tickets_tab(cfg, store, tickets):
     if not shown:
         st.info('No tickets match.')
         return
-    rows = [{'id': t.id, 'name': t.name, 'repo': t.repo, 'stage': stage(t), 'issue': issue_url(t),
+    rows = [{'id': t.id, 'name': t.name, 'repo': ', '.join(t.repos), 'stage': stage(t), 'issue': issue_url(t),
              'pr': pr_url(t), 'last report': t.current.report if t.current else None,
              'updated': updated_at(t)} for t in shown]
     st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch', column_config={
@@ -146,11 +161,16 @@ def tickets_tab(cfg, store, tickets):
     t = by_id[tid]
     m = t.mandate
     st.markdown(f"**{t.name}**: {t.title} · `{stage(t)}` · [#{t.number}]({issue_url(t)})"
-                + (f' · [PR #{t.pr_number}]({pr_url(t)})' if t.pr_number else ''))
+                + pr_markdown(t))
     st.markdown(f"Asked by **{m.get('actor', '?')}** at {m.get('at') or t.created_at}"
                 f" ({m.get('strength', 'explicit')} mandate)")
-    st.markdown(f'Branch `{t.branch or "-"}` · worktree `{t.worktree or "-"}`'
+    st.markdown(f'Branch `{t.branch or "-"}` · {"ticket folder" if t.parts else "worktree"} `{t.worktree or "-"}`'
                 + (f' · outcome **{t.outcome}**' if t.outcome else ''))
+    for p in t.parts:
+        st.markdown(f"- {p['repo']}: worktree `{p['worktree'] or '-'}`"
+                    + (f" · [PR #{p['pr_number']}](https://github.com/{p['repo']}/pull/{p['pr_number']})"
+                       if p['pr_number'] else ' · no PR')
+                    + (f" · {p['test_result']}" if p['test_result'] else ''))
     if t.delivery_error:
         st.markdown(f'Delivery error: {t.delivery_error}')
     request = store.trigger(m.get('trigger_id'))

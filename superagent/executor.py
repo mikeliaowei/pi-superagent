@@ -30,20 +30,19 @@ def git_env(cfg):
 
 def worktree_path(cfg, ticket):
     """The Ticket's stored worktree, else where a new one goes: <work_dir>/<owner>__<name>/<ticket name>
-    (<work_dir>/<ticket name> in the single-repo form)."""
-    return ticket.worktree or os.path.join(cfg.worktree_root(cfg.repo_config(ticket.repo)), ticket.name)
+    (<work_dir>/<ticket name> in the single-repo form). For a cross-repo Ticket it is the ticket folder,
+    <work_dir>/tickets/<ticket name>, holding one worktree per repo named <owner>__<name>."""
+    if ticket.worktree:
+        return ticket.worktree
+    if ticket.parts:
+        return os.path.join(cfg.work_dir, 'tickets', ticket.name)
+    return os.path.join(cfg.worktree_root(cfg.repo_config(ticket.repo)), ticket.name)
 
 
-def prepare_worktree(cfg, ticket, run=subprocess.run):
-    """Create (or reuse) the Ticket's worktree on branch agent/<name> from origin/<base_branch> of its repo.
-
-    Returns (path, branch)."""
-    repo = cfg.repo_config(ticket.repo)
-    path = worktree_path(cfg, ticket)
-    branch = f'agent/{ticket.name}'
+def _add_worktree(cfg, repo, path, branch, run):
+    """Create (or reuse) a worktree of `repo` (a RepoConfig) at `path` on `branch` from origin/<base_branch>."""
     if os.path.exists(os.path.join(path, '.git')):
-        return path, branch
-
+        return
     env = git_env(cfg)
 
     def git(*args, check=True):
@@ -60,6 +59,22 @@ def prepare_worktree(cfg, ticket, run=subprocess.run):
         git('worktree', 'add', path, branch)
     else:
         git('worktree', 'add', '-b', branch, path, f'origin/{repo.base_branch}')
+
+
+def prepare_worktree(cfg, ticket, run=subprocess.run):
+    """Create (or reuse) the Ticket's worktree on branch agent/<name> from origin/<base_branch> of its repo.
+
+    A cross-repo Ticket gets one worktree per part inside its ticket folder; their paths are written into
+    `ticket.parts`. Returns (path, branch): the worktree, or the ticket folder."""
+    path = worktree_path(cfg, ticket)
+    branch = f'agent/{ticket.name}'
+    if not ticket.parts:
+        _add_worktree(cfg, cfg.repo_config(ticket.repo), path, branch, run)
+        return path, branch
+    for part in ticket.parts:
+        repo = cfg.repo_config(part['repo'])
+        part['worktree'] = part['worktree'] or os.path.join(path, repo.slug)
+        _add_worktree(cfg, repo, part['worktree'], branch, run)
     return path, branch
 
 
@@ -203,12 +218,22 @@ def _texts(inputs):
     return [_cap(i['text'] if isinstance(i, dict) else i, FOLLOWUP_CAP) for i in inputs][-MAX_FOLLOWUPS:]
 
 
-def first_message(ticket, trigger_text, inputs=(), test_command=''):
+def first_message(ticket, trigger_text, inputs=(), test_command='', repos=()):
+    """`repos`, for a cross-repo Ticket: [{repo, path, base_branch, test_command}], one per worktree."""
     card = {'ticket': ticket.id, 'title': ticket.title, 'repo': ticket.repo, 'number': ticket.number,
             'branch': f'agent/{ticket.name}', 'request': _cap(trigger_text, REQUEST_CAP)}
     followups = _texts(inputs)
     if followups:
         card['followups'] = followups
+    if repos:
+        card['repos'] = [{k: v for k, v in r.items() if v} for r in repos]
+        return ('New assignment spanning several repositories. Each is a git worktree in this directory, on branch '
+                f'`agent/{ticket.name}`; commit in each repo you change (the service opens one pull request per '
+                'changed repo), then report with `superagent-report`.\n'
+                + json.dumps(card, indent=2, ensure_ascii=False)
+                + ('\n\nBefore any pull request the service runs each changed repo\'s `test_command` in its worktree. '
+                   'Run them yourself before you report ready; if one fails, the output comes back to you.'
+                   if any(r.get('test_command') for r in repos) else ''))
     if test_command:
         card['test_command'] = test_command
     text = ('New assignment. Work it in this directory, then report with `superagent-report`.\n'
@@ -227,6 +252,21 @@ def test_failure_message(command, result, timeout, attempt, max_attempts):
             f'Fix the cause, run `{command}` again, commit, and report ready again '
             f'(fix attempt {attempt} of {max_attempts}; then the Ticket is reported blocked).\n'
             f'Last output:\n```\n{tail}\n```')
+
+
+def cross_test_failure_message(failures, timeouts, attempt, max_attempts):
+    """Sent to the same session when test commands of a cross-repo Ticket failed. `failures`: [(repo, command,
+    result)] for the failing repos only; `timeouts`: {repo: seconds}."""
+    tail_each = TEST_TAIL // max(1, len(failures))
+    parts = []
+    for repo, command, result in failures:
+        how = (f'timed out after {timeouts[repo]}s' if result['timed_out']
+               else f'failed with exit code {result["code"]}')
+        parts.append(f'{repo}: `{command}` {how}. Last output:\n```\n{(result["output"] or "")[-tail_each:]}\n```')
+    return ('You reported ready, but tests failed, so no pull request was opened in any repo. '
+            'Fix the cause in each failing repo, rerun its test command, commit, and report ready again '
+            f'(fix attempt {attempt} of {max_attempts}; then the Ticket is reported blocked).\n\n'
+            + '\n\n'.join(parts))
 
 
 def followup_message(inputs):

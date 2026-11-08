@@ -113,12 +113,16 @@ def cmd_status(cfg, args):
 
 
 def _row(t, cfg=None):
-    """One Ticket as `tickets` shows it; with [[repos]] (cfg not in the single-repo form) it names the repo."""
+    """One Ticket as `tickets` shows it; with [[repos]] (cfg not in the single-repo form) it names the repo, or every
+    repo of a cross-repo Ticket."""
     a = t.current
     row = {'id': t.id, 'name': t.name}
     if cfg is not None and not cfg.legacy:
-        row['repo'] = t.repo
-    return {**row, 'stage': stage(t), 'number': t.number, 'pr': t.pr_number,
+        row['repo'] = ', '.join(t.repos)
+    # A cross-repo Ticket has one PR per changed repo: `owner/name#<n>, ...` (None until delivered).
+    pr = (', '.join(f"{p['repo']}#{p['pr_number']}" for p in t.parts if p['pr_number']) or None) if t.parts \
+        else t.pr_number
+    return {**row, 'stage': stage(t), 'number': t.number, 'pr': pr,
             'state': t.state, 'outcome': t.outcome, 'last_report': a.report if a else None,
             'summary': a.summary if a else ''}
 

@@ -137,7 +137,10 @@ class FakeGitHub:
                              'base': body['base'], 'title': body['title'], 'body': body['body']}
             return {'number': n}
         if m := re.fullmatch(r'/pulls/(\d+)', rest):
-            return self.pulls.get(int(m[1])) if method == 'GET' else None
+            pr = self.pulls.get(int(m[1]))
+            if method == 'PATCH' and pr:
+                pr.update({k: v for k, v in body.items() if k in ('title', 'body')})
+            return pr if method in ('GET', 'PATCH') else None
         return None
 
 

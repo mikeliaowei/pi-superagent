@@ -19,7 +19,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 
 from . import executor, github, policy
-from .model import Assignment, Ticket, new_id, short_name
+from .model import Assignment, Ticket, named_repos, new_id, new_part, short_name
 from .pi_rpc import PiRpc, RunResult
 from .report import NotRunning
 
@@ -172,19 +172,31 @@ class Service:
             first = next((line for line in trig.text.splitlines() if line.strip()), '')
             title = re.sub(rf'@{re.escape(self.cfg.agent_login)}\b[,:]?', '', first, flags=re.I)
         title = ' '.join(title.split())[:TITLE_MAX].strip() or 'Request'
-        taken = {t.name for t in self.store.tickets()}  # unique across every repo
         repo = trig.thread_key.removeprefix('github:').rsplit('#', 1)[0]
+        repos = [repo]
+        if not self.cfg.legacy:  # a request may name other configured repos: one Ticket for all of them (S14)
+            repos += [r for r in named_repos(trig.text, self.cfg.repo_names) if r.lower() != repo.lower()]
+        self.open_ticket(trig, title, repos, int(trig.meta['number']))
+
+    def open_ticket(self, trig, title, repos, number):
+        """Open a Ticket for the accepted request `trig` (already stored) and queue its ack and first launch.
+
+        `repos`: configured repo names, the thread's own first; more than one makes a cross-repo Ticket (S14).
+        Replies go to the request thread (`repos[0]`, `number`). Returns the Ticket."""
+        taken = {t.name for t in self.store.tickets()}  # unique across every repo
         a = Assignment(id=new_id('as'))
         t = Ticket(id=new_id('tk'), name=short_name(title, taken), title=title, thread_key=trig.thread_key,
-                   repo=repo, number=int(trig.meta['number']),
+                   repo=repos[0], number=number,
                    mandate={'actor': trig.actor, 'strength': 'explicit', 'trigger_id': trig.id, 'at': trig.at},
                    created_at=self.now_iso(), token=secrets.token_urlsafe(24), assignments=[asdict(a)],
-                   last_human_at=trig.at)
+                   last_human_at=trig.at, parts=[new_part(r) for r in repos] if len(repos) > 1 else [])
         self.store.save_ticket(t)
-        log.info('[%s] new ticket for #%s from %s', t.name, t.number, trig.actor)
+        log.info('[%s] new ticket for #%s from %s%s', t.name, t.number, trig.actor,
+                 f' across {", ".join(repos)}' if t.parts else '')
         self.reply(t, f'{t.id}-ack', f"On it: I'll work on this as `{t.name}` and report back here.")
         self.store.enqueue('launch', f'{t.id}:{a.id}', {'ticket_id': t.id, 'assignment_id': a.id, 'mode': 'first'},
                            now=self.clock())
+        return t
 
     async def _context(self, tid, trig):
         self.store.add_input(tid, trig.kind, trig.text, trig.id)
@@ -326,8 +338,13 @@ class Service:
     def _message(self, t, mode, fresh, inputs, note=''):
         if fresh:
             trig = self._request(t)
-            return executor.first_message(t, trig.text if trig else t.title, inputs,
-                                          self.cfg.repo_config(t.repo).test_command)
+            text = trig.text if trig else t.title
+            if t.parts:
+                repos = [{'repo': p['repo'], 'path': p['worktree'], 'base_branch': rc.base_branch,
+                          'test_command': rc.test_command}
+                         for p in t.parts for rc in [self.cfg.repo_config(p['repo'])]]
+                return executor.first_message(t, text, inputs, repos=repos)
+            return executor.first_message(t, text, inputs, self.cfg.repo_config(t.repo).test_command)
         followups = executor.followup_message(inputs) if inputs else ''
         if note:
             return note + ('\n\n' + followups if followups else '')
@@ -399,7 +416,7 @@ class Service:
         if status == 'waiting':
             self.reply(t, msg_id, f'Question: {a.question}')
         elif status == 'ready':
-            if self.cfg.repo_config(t.repo).test_command:
+            if any(self.cfg.repo_config(r).test_command for r in t.repos):
                 self.store.enqueue('test', f'{t.id}:{a.id}:test-{t.test_failures + 1}',
                                    {'ticket_id': t.id, 'assignment_id': a.id}, now=self.clock())
             else:
@@ -425,14 +442,31 @@ class Service:
             return  # stays queued until the worker's run has ended
         self.test_tasks[t.id] = asyncio.create_task(self._run_tests(e, t.id, a.id))
 
+    def _test_targets(self, t):
+        """[(RepoConfig, worktree)] to test: the Ticket's repo; for a cross-repo Ticket, each changed repo that has a
+        test command (blocking: run it in a thread)."""
+        if not t.parts:
+            return [(self.cfg.repo_config(t.repo), t.worktree)]
+        env = executor.git_env(self.cfg)
+        targets = []
+        for p in t.parts:
+            repo = self.cfg.repo_config(p['repo'])
+            if repo.test_command and github.has_new_commits(p['worktree'], f'origin/{repo.base_branch}',
+                                                            self.run_git, env):
+                targets.append((repo, p['worktree']))
+        return targets
+
     async def _run_tests(self, e, tid, aid):
         t = self.store.ticket(tid)
+        results = []  # [(RepoConfig, result)]
         try:
-            repo = self.cfg.repo_config(t.repo)
-            run = self.test_runs[tid] = executor.TestRun(repo.test_command, t.worktree, executor.test_env(self.cfg),
-                                                         repo.test_timeout)
-            log.info('[%s] running tests: %s', t.name, repo.test_command)
-            result = await asyncio.to_thread(run.wait)
+            for repo, cwd in await asyncio.to_thread(self._test_targets, t):
+                run = self.test_runs[tid] = executor.TestRun(repo.test_command, cwd, executor.test_env(self.cfg),
+                                                             repo.test_timeout)
+                log.info('[%s] running tests: %s', t.name, repo.test_command)
+                results.append((repo, await asyncio.to_thread(run.wait)))
+                if self.closing:
+                    break
         except Exception as ex:
             self._effect_failed(e, ex)
             return
@@ -441,41 +475,67 @@ class Service:
         if self.closing:
             return  # the effect stays queued: the next start runs the tests again
         try:
-            self._tests_done(e, tid, aid, repo, result)
+            self._tests_done(e, tid, aid, results)
         except Exception as ex:
             self._effect_failed(e, ex)
 
-    def _tests_done(self, e, tid, aid, repo, result):
+    def _tests_done(self, e, tid, aid, results):
         t = self.store.ticket(tid)
         if not t or t.state == 'ended' or not t.current or t.current.id != aid:
             self.store.effect_done(e['id'])
             return
-        a, command = t.current, repo.test_command
-        if result['passed']:
-            t.test_failures, t.test_result = 0, f'Tests: `{command}` passed in {result["seconds"]}s'
+        a = t.current
+        failed = [(repo, result) for repo, result in results if not result['passed']]
+        if not failed:
+            lines = {repo.name: f'Tests: `{repo.test_command}` passed in {result["seconds"]}s'
+                     for repo, result in results}
+            t.test_failures = 0
+            if t.parts:
+                for p in t.parts:
+                    p['test_result'] = lines.get(p['repo'], '')
+            else:
+                t.test_result, = lines.values()
             self.store.save_ticket(t)
             self.store.enqueue('deliver', f'{t.id}:{a.id}', {'ticket_id': t.id, 'assignment_id': a.id},
                                now=self.clock())
             self.store.effect_done(e['id'])
-            log.info('[%s] tests passed in %ss', t.name, result['seconds'])
+            log.info('[%s] tests passed in %s', t.name, ', '.join(lines) or 'no changed repo with a test command')
             return
+
+        def how(repo, result):
+            return f'timed out after {repo.test_timeout}s' if result['timed_out'] else f'exit code {result["code"]}'
+
         t.test_failures += 1
-        t.test_output = result['output'][-executor.TEST_TAIL:]
-        how = (f'timed out after {repo.test_timeout}s' if result['timed_out']
-               else f'exit code {result["code"]}')
-        log.warning('[%s] tests failed (%s), failure %d', t.name, how, t.test_failures)
-        if t.test_failures > self.cfg.max_test_retries:
-            a.report, a.summary, a.question = 'blocked', f'tests still failing: {command}'[:500], ''
+        t.test_output = '\n\n'.join((f'{repo.name}:\n' if t.parts else '') + result['output']
+                                     for repo, result in failed)[-executor.TEST_TAIL:]
+        log.warning('[%s] tests failed (%s), failure %d', t.name,
+                    ', '.join(f'{repo.name} {how(repo, result)}' for repo, result in failed), t.test_failures)
+        fixes = self.cfg.max_test_retries
+        if t.test_failures > fixes:
+            if t.parts:
+                what = '; '.join(f'{repo.name}: `{repo.test_command}` ({how(repo, result)})' for repo, result in failed)
+                summary = 'tests still failing in ' + ', '.join(repo.name for repo, _ in failed)
+            else:
+                (repo, result), = failed
+                what = f'`{repo.test_command}` ({how(repo, result)})'
+                summary = f'tests still failing: {repo.test_command}'
+            a.report, a.summary, a.question = 'blocked', summary[:500], ''
             self._set_current(t, a)
             self.store.save_ticket(t)
-            fixes = self.cfg.max_test_retries
             self.reply(t, f'{t.id}-{a.id}-tests-blocked',
-                       f'I am blocked: tests still failing: `{command}` ({how}) after {fixes} '
+                       f'I am blocked: tests still failing: {what} after {fixes} '
                        f'fix attempt{"" if fixes == 1 else "s"}, so I opened no pull request.')
         else:
             self.store.save_ticket(t)
-            self._new_assignment(t, 'tests', executor.test_failure_message(
-                command, result, repo.test_timeout, t.test_failures, self.cfg.max_test_retries))
+            if t.parts:
+                message = executor.cross_test_failure_message(
+                    [(repo.name, repo.test_command, result) for repo, result in failed],
+                    {repo.name: repo.test_timeout for repo, _ in failed}, t.test_failures, fixes)
+            else:
+                (repo, result), = failed
+                message = executor.test_failure_message(repo.test_command, result, repo.test_timeout,
+                                                        t.test_failures, fixes)
+            self._new_assignment(t, 'tests', message)
         self.store.effect_done(e['id'])
 
     async def _effect_deliver(self, e):
@@ -485,6 +545,9 @@ class Service:
             self.store.effect_done(e['id'])
             return
         a = next((Assignment(**x) for x in t.assignments if x['id'] == d['assignment_id']), t.current)
+        if t.parts:
+            await self._deliver_parts(e, t, a)
+            return
         repo = self.cfg.repo_config(t.repo)
         base = f'origin/{repo.base_branch}'
         env = executor.git_env(self.cfg)
@@ -514,9 +577,98 @@ class Service:
         self.reply(t, f'{t.id}-pr-{number}', f'Opened a pull request: https://github.com/{repo.name}/pull/{number}')
         log.info('[%s] delivered PR #%s', t.name, number)
 
+    def _pr_body(self, t, a, repo, test_result):
+        trig = self._request(t)
+        if not repo.test_command:
+            tests = f'Tests: no test command configured for {repo.name}.'
+        else:
+            tests = test_result or f'Tests: `{repo.test_command}` was not run for this delivery.'
+        body = f'{a.summary or t.title}\n\n{tests}'
+        if repo.name.lower() != t.repo.lower():
+            body += f'\n\nRequested in https://github.com/{t.repo}/issues/{t.number}'
+        elif not (trig and trig.meta.get('is_pr')):
+            body += f'\n\nCloses #{t.number}'
+        return body
+
+    async def _deliver_parts(self, e, t, a):
+        """Deliver a cross-repo Ticket: push and open one PR per changed repo, cross-link them, reply once.
+
+        Tests already passed for every changed repo. Each part records the assignment it was pushed for, so a
+        retried delivery pushes nothing twice; open_pull reuses the open PR of the branch."""
+        env = executor.git_env(self.cfg)
+        changed = []
+        for p in t.parts:
+            repo = self.cfg.repo_config(p['repo'])
+            if await asyncio.to_thread(github.has_new_commits, p['worktree'], f'origin/{repo.base_branch}',
+                                       self.run_git, env):
+                changed.append(p)
+        if not changed:
+            self.store.effect_done(e['id'])
+            self.reply(t, f'{t.id}-{a.id}-nochange', 'I finished, but there were no changes to propose.')
+            log.info('[%s] ready without commits in any repo: no PR', t.name)
+            return
+        numbers = {}  # repo -> PR number
+        for p in changed:
+            repo = self.cfg.repo_config(p['repo'])
+            if p.get('pushed') != a.id:
+                push_dir = self.cfg.push_dir(repo)
+                os.makedirs(os.path.dirname(push_dir), exist_ok=True)
+                await asyncio.to_thread(github.push_branch, p['worktree'], t.branch, self.cfg.token, repo.name,
+                                        push_dir, self.run_git, env)
+                self._update_part(t.id, repo.name, pushed=a.id)
+            numbers[repo.name] = await asyncio.to_thread(github.open_pull, self._gh(repo.name), t.branch,
+                                                         repo.base_branch, t.title,
+                                                         self._pr_body(t, a, repo, p['test_result']))
+        urls = {r: f'https://github.com/{r}/pull/{n}' for r, n in numbers.items()}
+        if len(urls) > 1:
+            for p in changed:
+                repo = self.cfg.repo_config(p['repo'])
+                links = '\n'.join(f'- {u}' for r, u in urls.items() if r != repo.name)
+                body = f'{self._pr_body(t, a, repo, p["test_result"])}\n\nPart of a cross-repo change:\n{links}'
+                await asyncio.to_thread(github.update_pull_body, self._gh(repo.name), numbers[repo.name], body)
+        for r, n in numbers.items():
+            t = self._update_part(t.id, r, pr_number=n)
+        self.store.effect_done(e['id'])
+        lines = [f'- {p["repo"]}: {urls[p["repo"]]}' if p['repo'] in urls else f'- {p["repo"]}: no changes'
+                 for p in t.parts]
+        self.reply(t, f'{t.id}-prs-{_digest(*sorted(urls.values()))}',
+                   'Opened pull requests:\n' + '\n'.join(lines))
+        log.info('[%s] delivered %s', t.name, ', '.join(f'{r}#{n}' for r, n in numbers.items()))
+
+    def _update_part(self, tid, repo, **fields):
+        """Set fields of one part on the stored Ticket (re-read: other handlers may have saved it meanwhile)."""
+        t = self.store.ticket(tid)
+        next(p for p in t.parts if p['repo'] == repo).update(fields)
+        self.store.save_ticket(t)
+        return t
+
+    async def _cross_state(self, t):
+        """'merged' or 'closed' once no PR of a cross-repo Ticket is open, else None (also when one cannot be read)."""
+        states = []
+        for p in t.parts:
+            if p['pr_number']:
+                try:
+                    states.append(await asyncio.to_thread(github.pull_state, self._gh(p['repo']), p['pr_number']))
+                except github.RateLimited:
+                    raise
+                except github.GitHubError as e:
+                    log.warning('[%s] cannot read %s PR #%s: %s', t.name, p['repo'], p['pr_number'], e)
+                    return None
+        if not states or 'open' in states:
+            return None
+        return 'merged' if all(s == 'merged' for s in states) else 'closed'
+
     # Pull requests
     async def check_pulls(self):
         for t in self.store.tickets(state='open'):
+            if t.parts:
+                try:
+                    state = await self._cross_state(t)
+                except github.RateLimited:
+                    return
+                if state:
+                    await self.end_ticket(t.id, state)
+                continue
             if not t.pr_number:
                 continue
             try:

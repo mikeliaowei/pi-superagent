@@ -47,6 +47,16 @@ policy, the effect queue and the "confirm once, then stay quiet" reply style com
   body states the tests (``Tests: `<command>` passed in <N>s`` or `Tests: no test command configured for
   <repo>.`) and says `Closes #<n>` when the request came from an issue. No commits means a "no changes" reply
   and no PR. The Ticket ends when the PR is merged or closed, or when someone stops it.
+- **Cross-repo Tickets.** With `[[repos]]`, a request that names other configured repos as `owner/name` (not in
+  quoted lines; unconfigured repos are ignored) gets one Ticket for all of them. Its ticket folder
+  `<work_dir>/tickets/<ticket>/` holds one worktree per repo (`<owner>__<name>`, each on `agent/<ticket>` from
+  that repo's base branch); the worker runs in the folder and its first message lists each repo, path, base
+  branch and test command. On `ready`, every repo with new commits runs its `test_command`; any failure opens no
+  PR at all and sends the failing repos' output back to the same session (retries count per Ticket). When all
+  pass, each changed repo is pushed from its own push repo and gets its own PR; each PR body lists the others
+  under "Part of a cross-repo change:", and one reply on the request thread lists every PR (repos without
+  commits as "no changes"). Only the request's own repo PR says `Closes #<n>`. The Ticket ends when none of its
+  PRs is open: `merged` if all merged, else `closed`. Stop and retry act on the whole Ticket.
 - **Durability.** Every side effect is written to the SQLite effect queue before it runs, retried with backoff
   (5 s doubling to 300 s), and replies carry a hidden marker so a retry never posts twice. After a restart,
   running Assignments end as "host restarted" and relaunch with a recovery note.
@@ -113,6 +123,8 @@ Ticket's name; the token is never logged.
 - Comments while it is working are passed to the running worker as context.
 - When it is done it comments a link to its pull request. Merge or close the PR to end the Ticket.
 - `@your-bot stop` ends the Ticket on that thread and stops its worker.
+- With several repos configured, name the others in the request to change them together, e.g. `@your-bot rename
+  the endpoint here and update the client in acme/web-client`: one Ticket, one PR per changed repo.
 
 ## Operator commands
 
@@ -121,7 +133,7 @@ Ticket's name; the token is never logged.
 | `superagent check` | Preflight; exit 2 if the config or token is missing, 1 if another check fails. |
 | `superagent run` | Run the service. |
 | `superagent status` | JSON: repo (`repos` with `[[repos]]`), agent login, whether the token is set, open Tickets by stage, failing effects, last poll time. |
-| `superagent tickets [--all] [--json]` | Tickets with id, name, repo (with `[[repos]]`), stage, issue number, PR and last report. |
+| `superagent tickets [--all] [--json]` | Tickets with id, name, repo (with `[[repos]]`; every repo of a cross-repo Ticket), stage, issue number, PR (`owner/name#<n>, ...` for a cross-repo Ticket) and last report. |
 | `superagent stop <ticket>` | Stop a Ticket (id or name). |
 | `superagent retry <ticket>` | Relaunch a Ticket whose last run ended, or retry a failed delivery. |
 | `superagent panel [--port 8742]` | Local web panel (see below); needs the `panel` extra. |
@@ -178,7 +190,8 @@ record the same requests as `superagent stop|retry`, which the running service a
 - No LLM router; the policy gate is deterministic.
 - The web panel is read-only apart from Stop and Retry; no login, so keep it on localhost.
 - GitHub only; other sources (Slack, email, ...) are not ported.
-- Several repositories per service, but one Ticket works in one repository.
+- A Ticket can span several configured repositories only when the request names them; a later comment cannot
+  add a repo to a running Ticket.
 
 ## License
 
