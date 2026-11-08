@@ -10,8 +10,8 @@ Operator actions from the CLI reach a running service through kv keys `operator:
 
 import asyncio
 import hashlib
-import json
 import logging
+import os
 import re
 import secrets
 import subprocess
@@ -19,8 +19,9 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 
 from . import executor, github, policy
-from .model import Assignment, Ticket, Trigger, new_id, short_name
+from .model import Assignment, Ticket, new_id, short_name
 from .pi_rpc import PiRpc, RunResult
+from .report import NotRunning
 
 log = logging.getLogger('superagent.service')
 
@@ -70,8 +71,7 @@ class Service:
 
     def _request(self, t):
         """The Trigger that opened the Ticket, as a dict (text, meta)."""
-        row = self.store.db.execute('SELECT data FROM triggers WHERE id = ?', (t.mandate.get('trigger_id'),)).fetchone()
-        return Trigger(**json.loads(row['data'])) if row else None
+        return self.store.trigger(t.mandate.get('trigger_id'))
 
     def _set_current(self, t, a):
         t.assignments[-1] = asdict(a)
@@ -98,6 +98,9 @@ class Service:
     def on_report(self, ticket_id, report):
         if self.loop is None:
             raise RuntimeError('service is not running')
+        t = self.store.ticket(ticket_id)
+        if not t or t.state == 'ended' or not t.current or t.current.state != 'running':
+            raise NotRunning('this Ticket has no running assignment; the report was not recorded')
         self.loop.call_soon_threadsafe(self.handle_report, ticket_id, report)
 
     # Polling
@@ -127,6 +130,10 @@ class Service:
     async def take(self, trig):
         live = [t.id for t in self.store.tickets(state='open', thread_key=trig.thread_key)]
         d = policy.gate(trig, self.cfg.agent_login, self.cfg.allowed, live)
+        if d.kind in ('accept', 'stop') and self._edit_of_handled(trig):
+            # Editing a comment re-reads it, but its authority was used once: never a second Ticket or stop.
+            d = (policy.Decision('context', 'edit of a handled request', tuple(live)) if live
+                 else policy.Decision('ignore', 'edit of a handled request'))
         if not self.store.add_trigger(trig, d.kind):
             return
         log.info('trigger %s from %s on %s: %s (%s)', trig.id, trig.actor, trig.thread_key, d.kind, d.reason)
@@ -139,6 +146,13 @@ class Service:
         elif d.kind == 'context':
             for tid in d.ticket_ids:
                 await self._context(tid, trig)
+
+    def _edit_of_handled(self, trig):
+        """True when `trig` is an edit of a comment that already opened a Ticket or stopped one."""
+        if not trig.id.startswith(('github-comment|', 'github-review|')):
+            return False
+        prefix = trig.id.rsplit('|', 1)[0] + '|'  # github-comment|<id>|
+        return any(d in ('accept', 'stop') for tid, d in self.store.trigger_decisions(prefix).items() if tid != trig.id)
 
     def _accept(self, trig):
         if trig.kind == 'issue':
@@ -326,10 +340,17 @@ class Service:
             reason = result.error or 'no report'
             self._fail_assignment(t, a, reason, reason)
             return
-        a.state, a.ended_at, a.end_reason = 'ended', self.now_iso(), 'settled'
+        a.state, a.ended_at, a.end_reason = 'ended', self.now_iso(), (result.error or 'settled')[:300]
         self._set_current(t, a)
         self.store.save_ticket(t)
-        log.info('[%s] run settled after report %s', t.name, a.report)
+        if not result.error:
+            log.info('[%s] run settled after report %s', t.name, a.report)
+            return
+        log.warning('[%s] run ended with an error after report %s: %s', t.name, a.report, result.error[:200])
+        if a.report == 'ready':
+            # The worker reported committed, checked work, so its delivery stands; say the session did not end cleanly.
+            self.reply(t, f'{t.id}-{a.id}-error-after-ready',
+                       f'Note: my session ended with an error after I reported this ready: {result.error[:300]}')
 
     def _fail_assignment(self, t, a, summary, end_reason):
         a.state, a.report, a.ended_at, a.end_reason = 'ended', 'failed', self.now_iso(), end_reason[:300]
@@ -346,7 +367,7 @@ class Service:
     # Reports
     def handle_report(self, ticket_id, report):
         t = self.store.ticket(ticket_id)
-        if not t or t.state == 'ended' or not t.current:
+        if not t or t.state == 'ended' or not t.current or t.current.state != 'running':
             return
         a = t.current
         status = report['status']
@@ -375,13 +396,14 @@ class Service:
             return
         a = next((Assignment(**x) for x in t.assignments if x['id'] == d['assignment_id']), t.current)
         base = f'origin/{self.cfg.base_branch}'
-        if not await asyncio.to_thread(github.has_new_commits, t.worktree, base, self.run_git):
+        env = executor.git_env(self.cfg)
+        if not await asyncio.to_thread(github.has_new_commits, t.worktree, base, self.run_git, env):
             self.store.effect_done(e['id'])
             self.reply(t, f'{t.id}-{a.id}-nochange', 'I finished, but there were no changes to propose.')
             log.info('[%s] ready without commits: no PR', t.name)
             return
         await asyncio.to_thread(github.push_branch, t.worktree, t.branch, self.cfg.token, self.cfg.repo,
-                                self.run_git)
+                                os.path.join(self.cfg.state_dir, 'push.git'), self.run_git, env)
         trig = self._request(t)
         body = a.summary or t.title
         if not (trig and trig.meta.get('is_pr')):

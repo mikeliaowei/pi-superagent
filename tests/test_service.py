@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -58,6 +59,8 @@ class ScriptedRpc(PiRpc):
 
     async def run(self, message, timeout):
         self.messages.append(message)
+        if before := self.step.get('before'):
+            before(self.cwd, self.env)  # runs as the worker would: in its worktree, with its environment
         if self.step.get('commit'):
             with open(os.path.join(self.cwd, 'fix.txt'), 'w') as f:
                 f.write('fixed\n')
@@ -122,6 +125,7 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         self.cfg = Config(repo='o/r', agent_login='bot', allowed=['alice'], checkout=checkout,
                           state_dir=os.path.join(self.tmp, 'state'), pi='/nonexistent/pi')
         self.store = Store(self.cfg.db_path)
+        self.store.put('github-start', '2000-01-01T00:00:00+00:00')  # as if the service first ran long ago
         self.gh, self.git = FakeGitHub(), Git()
         self.now = datetime.now(timezone.utc)
         self.server = ReportServer(lambda tok: self.svc.lookup(tok), lambda tid, r: self.svc.on_report(tid, r))
@@ -179,7 +183,9 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((pr['head'], pr['base'], pr['title']), ('agent/fix-the-login-bug', 'main', 'Fix the login bug'))
         self.assertIn('Fixed the login bug.', pr['body'])
         self.assertIn(f'Closes #{n}', pr['body'])
-        self.assertEqual(self.git.pushes[0][0][-1], 'HEAD:refs/heads/agent/fix-the-login-bug')
+        self.assertEqual(self.git.pushes[0][0][-2:], ['https://github.com/o/r.git',
+                                                      '+refs/heads/agent/fix-the-login-bug:refs/heads/agent/fix-the-login-bug'])
+        self.assertIn(f"--git-dir={os.path.join(self.cfg.state_dir, 'push.git')}", self.git.pushes[0][0])
         self.assertEqual(t.pr_number, pr['number'])
         self.assertEqual(stage(t), 'person/review')
         posted = self.gh.posted(n)
@@ -290,6 +296,70 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((a.state, a.report, a.end_reason), ('ended', 'failed', 'provider exploded'))
         self.assertEqual(stage(t), 'person/failed')
         self.assertIn('provider exploded', self.gh.posted(n)[-1])
+
+    async def test_run_error_after_a_ready_report_is_not_recorded_as_settled(self):
+        n = self.gh.add_issue('Fix it', '@bot fix')
+        self.service(Pi({'mode': 'error', 'commit': True, 'report': {'status': 'ready', 'summary': 'Fixed.'}}))
+        await self.round()
+        await self.settle()
+        await self.svc.run_effects()
+        t = self.only_ticket()
+        a = t.current
+        self.assertEqual((a.state, a.report), ('ended', 'ready'))
+        self.assertEqual(a.end_reason, 'provider exploded')
+        self.assertEqual(len(self.gh.pulls), 1)  # the reported, committed work is still delivered
+        notes = [b for b in self.gh.posted(n) if 'ended with an error' in b]
+        self.assertEqual(len(notes), 1)
+        self.assertIn('provider exploded', notes[0])
+
+    async def test_report_after_the_run_ended_is_refused_with_409_and_changes_nothing(self):
+        self.gh.add_issue('Fix it', '@bot fix')
+        pi = Pi({'mode': 'ok'})
+        self.service(pi)
+        await self.round()
+        await self.settle()
+        before = self.only_ticket()
+        self.assertEqual(before.current.report, 'failed')
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            await asyncio.to_thread(post_report, pi.runs[0].env, {'status': 'ready', 'summary': 'Late.'})
+        self.assertEqual(cm.exception.code, 409)
+        await asyncio.sleep(0.05)
+        await self.svc.run_effects()
+        self.assertEqual(self.only_ticket().to_dict(), before.to_dict())
+        self.assertEqual(self.gh.pulls, {})
+
+    async def test_editing_a_handled_request_after_its_ticket_ended_opens_nothing(self):
+        n = self.gh.add_issue('Login', 'The login page is broken.')
+        c = self.gh.add_comment(n, '@bot please fix the login page')
+        self.service(Pi())
+        await self.round()
+        await self.settle()
+        t = self.only_ticket()
+        await self.svc.end_ticket(t.id, 'merged')
+        c.update(body='@bot please fix the login page (typo fixed)', updated_at=self.gh._stamp())
+        await self.round()
+        await self.settle()
+        self.assertEqual(len(self.store.tickets()), 1)
+        self.assertEqual(len([b for b in self.gh.posted(n) if b.startswith('On it')]), 1)
+        self.assertEqual(self.decisions()[f"github-comment|{c['id']}|{c['updated_at']}"], 'ignore')
+
+    async def test_re_edited_old_stop_does_not_stop_a_newer_ticket(self):
+        n = self.gh.add_issue('Refactor', 'Some context.')
+        self.gh.add_comment(n, '@bot refactor the parser')
+        self.service(Pi({'mode': 'hang'}, {'mode': 'hang'}))
+        await self.round()
+        first = self.only_ticket()
+        stop = self.gh.add_comment(n, '@bot stop')
+        await self.round()
+        self.assertEqual(self.store.ticket(first.id).outcome, 'stopped')
+        self.gh.add_comment(n, '@bot refactor the lexer instead')
+        await self.round()
+        second = next(t for t in self.store.tickets() if t.id != first.id)
+        self.assertEqual(second.state, 'open')
+        stop.update(body='@bot stop (edited)', updated_at=self.gh._stamp())
+        await self.round()
+        self.assertEqual(self.store.ticket(second.id).state, 'open')
+        self.assertEqual(self.decisions()[f"github-comment|{stop['id']}|{stop['updated_at']}"], 'context')
 
     async def test_run_without_a_report_is_failed_as_no_report(self):
         n = self.gh.add_issue('Fix it', '@bot fix')

@@ -4,6 +4,7 @@ Only this module holds the token. It never appears in argv, messages or exceptio
 """
 
 import base64
+import http.client
 import json
 import os
 import re
@@ -19,6 +20,10 @@ from .policy import mentions
 MAX_PAGES = 10
 STEP_BACK = timedelta(seconds=5)  # late writes land slightly before the time we read
 RETRY_FOR = timedelta(hours=24)
+TIMEOUT = 30  # seconds for one API call
+# Every git command the service runs: no hooks and no fsmonitor, whatever the (worker-writable) repo config says.
+GIT_HARDEN = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false']
+NETWORK_ERRORS = (urllib.error.URLError, ConnectionError, TimeoutError, http.client.HTTPException)
 
 
 class GitHubError(Exception):
@@ -37,10 +42,10 @@ class Gone(GitHubError):
 
 
 class GitHub:
-    def __init__(self, token, repo, opener=urllib.request.urlopen, api='https://api.github.com'):
+    def __init__(self, token, repo, opener=None, api='https://api.github.com'):
         self._token = token
         self.repo = repo
-        self.opener = opener
+        self.opener = opener or (lambda req: urllib.request.urlopen(req, timeout=TIMEOUT))
         self.api = api.rstrip('/')
 
     def get(self, path, **params):
@@ -84,8 +89,9 @@ class GitHub:
             if e.code == 404 and method == 'GET':
                 return None, {}
             raise self._error(method, path, e) from None
-        except urllib.error.URLError as e:
-            raise GitHubError(self._redact(f'{method} {path}: {e.reason}')) from None
+        except NETWORK_ERRORS as e:  # HTTPError is a URLError, but is handled above
+            reason = getattr(e, 'reason', None) or e or type(e).__name__
+            raise GitHubError(self._redact(f'{method} {path}: {type(e).__name__}: {reason}')) from None
 
     def _error(self, method, path, e):
         try:
@@ -155,20 +161,33 @@ def _notified_numbers(gh, store, repo):
     return found
 
 
-def _read_item(gh, repo, n, cursor, agent_login):
+def _before(stamp, floor):
+    """True when GitHub time `stamp` is earlier than `floor` (an ISO time); unknown stamps are not dropped."""
+    try:
+        return datetime.fromisoformat(stamp) < datetime.fromisoformat(floor)
+    except (TypeError, ValueError):
+        return False
+
+
+def _read_item(gh, repo, n, cursor, agent_login, floor=None):
+    """`floor` is the service's first start: an item seen for the first time yields nothing older than it."""
     own = agent_login.lower()
     issue = gh.get(f'/repos/{repo}/issues/{n}')
     if issue is None:
         raise Gone(f'GitHub 404 on GET /repos/{repo}/issues/{n}', 404)
     is_pr = 'pull_request' in issue
     out = []
-    if cursor is None and (issue.get('user') or {}).get('login', '').lower() != own:
+    old_issue = floor and _before(issue.get('created_at'), floor)
+    if cursor is None and not old_issue and (issue.get('user') or {}).get('login', '').lower() != own:
         out.append(issue_trigger(repo, issue, agent_login))
     sources = [('comment', f'/repos/{repo}/issues/{n}/comments')]
     if is_pr:
         sources.append(('review', f'/repos/{repo}/pulls/{n}/comments'))
+    since = cursor or floor
     for kind, path in sources:
-        for c in gh.get_all(path, since=cursor, per_page=100):
+        for c in gh.get_all(path, since=since, per_page=100):
+            if cursor is None and floor and _before(c.get('updated_at'), floor):
+                continue
             if (c.get('user') or {}).get('login', '').lower() != own:
                 out.append(comment_trigger(repo, n, is_pr, c, agent_login, kind))
     return out
@@ -178,15 +197,21 @@ def poll(gh, store, repo, agent_login, subscribed_numbers, now=None):
     """One polling round. Returns Triggers; storing them and deciding policy belong to the service.
 
     A RateLimited error aborts the round with nothing advanced; the next round repeats it.
+    The very first round only records the start time: requests written before the service ever ran are not work.
     """
     now = now or datetime.now(timezone.utc)
+    if store.get('github-start') is None and store.get('github-since') is None:
+        store.put('github-start', _iso(now))
+        store.put('github-since', _iso(now))
+        return []
+    floor = store.get('github-start')
     stepped = _iso(now - STEP_BACK)
     retry = dict(store.get('github-retry') or {})
     numbers = sorted({*_notified_numbers(gh, store, repo), *map(int, subscribed_numbers), *map(int, retry)})
     triggers, cursors = [], {}
     for n in numbers:
         try:
-            triggers.extend(_read_item(gh, repo, n, store.get(f'github-cursor:{n}'), agent_login))
+            triggers.extend(_read_item(gh, repo, n, store.get(f'github-cursor:{n}'), agent_login, floor))
         except RateLimited:
             raise
         except Gone:
@@ -233,21 +258,53 @@ def post_comment(gh, number, body, msg_id, review_root=None):
     return 'sent'
 
 
-def push_branch(worktree, branch, token, repo, run=subprocess.run):
-    """Push HEAD to <branch>. The token travels only in the environment, as an extra HTTP header."""
+def git_env(hidden=(), secrets=(), base=None):
+    """The environment for git commands the service runs in repositories a worker can write.
+
+    Worktrees share `.git/config` and hooks with the checkout, so a worker controls that config. These commands
+    therefore never carry a secret: `hidden` names and any variable holding one of `secrets` are dropped, inherited
+    `GIT_CONFIG_*` is dropped, and system and global config are off. Hooks are off through GIT_HARDEN in argv.
+    """
+    secrets = [x for x in secrets if x]
+    env = {k: v for k, v in (os.environ if base is None else base).items()
+           if k not in hidden and not k.startswith('GIT_CONFIG') and not any(x in v for x in secrets)}
+    env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0')
+    return env
+
+
+def push_branch(worktree, branch, token, repo, push_dir, run=subprocess.run, env=None):
+    """Push the worktree's HEAD to <branch> on GitHub.
+
+    The worker can write its worktree's git config and hooks, so the token never runs there. HEAD is first fetched,
+    without the token, into `push_dir`, a bare repo only the service uses; the push runs from that repo with hooks
+    off and an environment holding nothing but the token's extra HTTP header (never argv) and the basics.
+    """
     auth = base64.b64encode(f'x-access-token:{token}'.encode()).decode()
-    env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GIT_CONFIG_COUNT': '1',
-           'GIT_CONFIG_KEY_0': 'http.https://github.com/.extraheader',
-           'GIT_CONFIG_VALUE_0': f'AUTHORIZATION: basic {auth}'}
-    argv = ['git', '-C', worktree, 'push', f'https://github.com/{repo}.git', f'HEAD:refs/heads/{branch}']
-    r = run(argv, env=env, capture_output=True, text=True)
-    if r.returncode != 0:
-        err = (r.stderr or '').replace(token, '***').replace(auth, '***') if token else (r.stderr or '')
-        raise GitHubError(f'git push {branch} failed: {err.strip()}')
+    env = git_env(secrets=[token, auth]) if env is None else env
+
+    def git(step, argv, step_env):
+        r = run(argv, env=step_env, capture_output=True, text=True)
+        if r.returncode != 0:
+            err = r.stderr or ''
+            for secret in (token, auth):
+                err = err.replace(secret, '***') if secret else err
+            raise GitHubError(f'git push {branch} failed ({step}): {err.strip()}')
+
+    if not os.path.exists(os.path.join(push_dir, 'HEAD')):
+        git('init', ['git', *GIT_HARDEN, 'init', '--bare', '-q', push_dir], env)
+    in_push_repo = ['git', f'--git-dir={push_dir}', *GIT_HARDEN]
+    git('fetch', [*in_push_repo, 'fetch', '--no-tags', worktree, f'+HEAD:refs/heads/{branch}'], env)
+    push_env = {k: os.environ[k] for k in ('PATH', 'HOME') if k in os.environ}
+    push_env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0',
+                    GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',
+                    GIT_CONFIG_VALUE_0=f'AUTHORIZATION: basic {auth}')
+    git('push', [*in_push_repo, 'push', '--no-verify', f'https://github.com/{repo}.git',
+                 f'+refs/heads/{branch}:refs/heads/{branch}'], push_env)
 
 
-def has_new_commits(worktree, base_ref, run=subprocess.run):
-    r = run(['git', '-C', worktree, 'rev-list', '--count', f'{base_ref}..HEAD'], capture_output=True, text=True)
+def has_new_commits(worktree, base_ref, run=subprocess.run, env=None):
+    r = run(['git', *GIT_HARDEN, '-C', worktree, 'rev-list', '--count', f'{base_ref}..HEAD'],
+            env=git_env() if env is None else env, capture_output=True, text=True)
     if r.returncode != 0:
         raise GitHubError(f'git rev-list {base_ref}..HEAD failed: {(r.stderr or "").strip()}')
     return int(r.stdout.strip() or 0) > 0

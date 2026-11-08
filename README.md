@@ -23,18 +23,21 @@ policy, the effect queue and the "confirm once, then stay quiet" reply style com
 ```
 
 - **Triggers.** Each poll reads notifications plus the issues the service already follows. Every issue, comment
-  and review comment becomes a Trigger with a deterministic id, so seeing it twice does nothing.
+  and review comment becomes a Trigger with a deterministic id, so seeing it twice does nothing. The very first
+  poll only records the start time (kv `github-start` and `github-since`): issues and comments written before the
+  service first ran never become work, even when a later comment brings their thread back.
 - **Policy.** A login on `allowed` who mentions `@<agent_login>` opens a Ticket (an explicit mandate).
   `@<agent_login> stop` from an allowed login stops the Ticket on that thread. Any other human comment on a
   thread with a live Ticket reaches its worker as context, never as new authority. Bots and the agent itself are
-  ignored.
+  ignored. Quoted lines (`> ...`) never count as a mention or a stop. Editing a comment that already opened or
+  stopped a Ticket does not do it again: the edit is context for a live Ticket on that thread, otherwise ignored.
 - **Workers.** One Pi process per running Assignment, with the Ticket's id as its session id, so a later launch
   resumes the same conversation. The worker reports with `superagent-report --status
   progress|waiting|ready|blocked|failed|dropped`.
 - **Replies.** The agent acknowledges once. After that it speaks only to ask a question (`waiting`), link a pull
   request (`ready`), or say honestly that it is blocked, failed, or dropped the request. `progress` posts nothing.
 - **Delivery.** On `ready`, the service (not the worker) pushes `agent/<name>` with its token and opens or reuses
-  a PR; the body says `Closes #<n>` when the request came from an issue. No commits means a "no changes" reply
+  a PR. It first fetches the worktree's HEAD into its own bare repo `<state_dir>/push.git` and pushes from there; the body says `Closes #<n>` when the request came from an issue. No commits means a "no changes" reply
   and no PR. The Ticket ends when the PR is merged or closed, or when someone stops it.
 - **Durability.** Every side effect is written to the SQLite effect queue before it runs, retried with backoff
   (5 s doubling to 300 s), and replies carry a hidden marker so a retry never posts twice. After a restart,
@@ -120,7 +123,18 @@ debug logging. Exit codes: 0 ok, 1 runtime error, 2 configuration error.
   environment. Only the service pushes and opens pull requests.
 - Workers run with explicit provider and model, and without your Pi extensions, skills, prompt templates or
   context files (`-ne -ns -np -nc`), except the agent's own worker skill.
-- Workers report over localhost with a per-Ticket token.
+- Workers report over localhost with a per-Ticket token. A report is accepted only while that Ticket's current
+  run is going; a late one gets 409 and changes nothing.
+- Worktrees share `.git/config` and hooks with the checkout, so a worker can plant hooks or URL rewrites there.
+  Every git command the service runs therefore has hooks off (`-c core.hooksPath=/dev/null`), no system or global
+  git config, and no token or `secret_env` variable in its environment. The token is used only by the final
+  `git push` from `<state_dir>/push.git`, whose environment holds nothing but `PATH`, `HOME` and the auth header.
+  Because global git config is off, `git fetch origin` in the checkout cannot use a credential helper configured
+  there; use an SSH remote or a public repository for `checkout`.
+- Workers get git credential helpers and prompts turned off (`credential.helper=`, `GIT_TERMINAL_PROMPT=0`,
+  `GIT_ASKPASS=/usr/bin/false`, `SSH_ASKPASS=/usr/bin/false`), so their `git push` cannot fall back on your
+  keychain. This only raises the bar: a worker with `bash` runs as your user and can still read any file you can
+  read, including `<state_dir>`. Container isolation is the real fix.
 - **Pi does not ask before running tools.** A worker can run any shell command its `bash` tool allows, as your
   user. Use a test repository and a machine you do not mind it touching. Container isolation is not built yet.
 

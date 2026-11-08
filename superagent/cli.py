@@ -161,7 +161,11 @@ def cmd_check(cfg, args):
     git = shutil.which('git')
     origin = None
     if git and os.path.isdir(cfg.checkout):
-        r = subprocess.run(['git', '-C', cfg.checkout, 'remote', 'get-url', 'origin'], capture_output=True, text=True)
+        from .executor import git_env
+        from .github import GIT_HARDEN
+        # The checkout's config and hooks are worker-writable: same hardening as the service's own git commands.
+        r = subprocess.run(['git', *GIT_HARDEN, '-C', cfg.checkout, 'remote', 'get-url', 'origin'],
+                           env=git_env(cfg), capture_output=True, text=True)
         origin = r.stdout.strip() if r.returncode == 0 else None
     check(bool(origin), f'checkout: {cfg.checkout} is a git repo with origin {origin}',
           f'checkout: {cfg.checkout} is not a git clone with an origin remote; '

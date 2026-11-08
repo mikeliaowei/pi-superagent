@@ -34,9 +34,18 @@ def gate(trigger: Trigger, agent_login, allowed, live_ticket_ids):
     return Decision('ignore', 'not addressed by a listed person')
 
 
+def _unquoted(text):
+    """The text without quoted lines (`> ...`): quoting someone's request or stop is not making one."""
+    return '\n'.join(line for line in (text or '').splitlines() if not line.lstrip().startswith('>'))
+
+
+def _mention(agent_login):
+    return rf'(^|[^\w-])@{re.escape(agent_login)}(?![\w-])'
+
+
 def is_stop(text, agent_login):
-    return re.search(rf'@{re.escape(agent_login)}\s+stop\b', text, re.I) is not None
+    return re.search(_mention(agent_login) + r'\s+stop\b', _unquoted(text), re.I | re.M) is not None
 
 
 def mentions(text, agent_login):
-    return re.search(rf'(^|[^\w-])@{re.escape(agent_login)}(?![\w-])', text, re.I) is not None
+    return re.search(_mention(agent_login), _unquoted(text), re.I | re.M) is not None

@@ -1,4 +1,5 @@
 import asyncio
+import http.client
 import io
 import json
 import os
@@ -13,6 +14,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from superagent import executor, report
+from superagent.github import GIT_HARDEN
 from superagent.config import Config
 from superagent.model import Ticket
 from superagent.pi_rpc import PiRpc, RpcError
@@ -208,16 +210,52 @@ class ArgvEnvTest(unittest.TestCase):
         self.assertEqual(env['PI_SKIP_VERSION_CHECK'], '1')
         self.assertEqual(env['PATH'], os.path.dirname(sys.executable) + os.pathsep + '/usr/bin')
 
+    def test_worker_env_turns_off_git_credential_helpers_and_prompts(self):
+        base = {'PATH': '/usr/bin', 'GIT_CONFIG_COUNT': '2', 'GIT_CONFIG_KEY_0': 'user.name',
+                'GIT_CONFIG_VALUE_0': 'w', 'GIT_CONFIG_KEY_1': 'user.email', 'GIT_CONFIG_VALUE_1': 'w@x'}
+        with mock.patch.dict(os.environ, base, clear=True):
+            env = executor.worker_env(self.cfg, ticket(), 'http://127.0.0.1:9')
+        self.assertEqual(env['GIT_CONFIG_COUNT'], '3')
+        self.assertEqual((env['GIT_CONFIG_KEY_0'], env['GIT_CONFIG_KEY_1']), ('user.name', 'user.email'))
+        self.assertEqual((env['GIT_CONFIG_KEY_2'], env['GIT_CONFIG_VALUE_2']), ('credential.helper', ''))
+        self.assertEqual((env['GIT_TERMINAL_PROMPT'], env['GIT_ASKPASS'], env['SSH_ASKPASS']),
+                         ('0', '/usr/bin/false', '/usr/bin/false'))
+        with mock.patch.dict(os.environ, {'PATH': '/usr/bin'}, clear=True):
+            env = executor.worker_env(self.cfg, ticket(), 'http://127.0.0.1:9')
+        self.assertEqual((env['GIT_CONFIG_COUNT'], env['GIT_CONFIG_KEY_0'], env['GIT_CONFIG_VALUE_0']),
+                         ('1', 'credential.helper', ''))
+
+    def test_worker_cannot_push_with_the_users_credential_helper(self):
+        tmp = self.tmp
+        helper = os.path.join(tmp, 'helper.sh')
+        log = os.path.join(tmp, 'helper.log')
+        with open(helper, 'w') as f:
+            f.write(f'#!/bin/sh\necho called >> {log}\necho username=u; echo password=p\n')
+        os.chmod(helper, 0o755)
+        gitconfig = os.path.join(tmp, 'gitconfig')
+        with open(gitconfig, 'w') as f:
+            f.write(f'[credential]\n\thelper = {helper}\n')
+        with mock.patch.dict(os.environ, {'PATH': os.environ['PATH'], 'GIT_CONFIG_GLOBAL': gitconfig,
+                                          'GIT_CONFIG_NOSYSTEM': '1'}, clear=True):
+            env = executor.worker_env(self.cfg, ticket(), 'http://127.0.0.1:9')
+        r = subprocess.run(['git', 'credential', 'fill'], input='protocol=https\nhost=example.com\n\n', env=env,
+                           capture_output=True, text=True, timeout=10)
+        self.assertFalse(os.path.exists(log))
+        self.assertNotIn('password=p', r.stdout)
+
 
 class PrepareWorktreeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.cfg = cfg(self.tmp, base_branch='dev')
-        self.calls = []
+        self.calls, self.envs = [], []
 
     def run_ok(self, branch_exists=False, fail=None):
         def run(cmd, **kw):
+            self.assertEqual(cmd[1:1 + len(GIT_HARDEN)], GIT_HARDEN)
+            self.envs.append(kw.get('env'))
+            cmd = [cmd[0], *cmd[1 + len(GIT_HARDEN):]]
             self.calls.append((cmd, kw.get('cwd')))
             code = 0
             if cmd[1:3] == ['rev-parse', '--verify']:
@@ -234,6 +272,19 @@ class PrepareWorktreeTest(unittest.TestCase):
         self.assertEqual(cmds[0], ['git', 'fetch', 'origin', 'dev'])
         self.assertEqual(cmds[-1], ['git', 'worktree', 'add', '-b', 'agent/fix-bug', path, 'origin/dev'])
         self.assertTrue(all(cwd == self.cfg.checkout for _, cwd in self.calls))
+
+    def test_git_runs_without_secrets_hooks_or_inherited_config(self):
+        with mock.patch.dict(os.environ, {'SUPERAGENT_GITHUB_TOKEN': 'tok-x', 'GH_TOKEN': 'gh-y',
+                                          'GIT_CONFIG_PARAMETERS': "'core.hooksPath'='/evil'"}):
+            executor.prepare_worktree(self.cfg, ticket(), run=self.run_ok())
+        self.assertTrue(self.envs)
+        for env in self.envs:
+            self.assertNotIn('SUPERAGENT_GITHUB_TOKEN', env)
+            self.assertNotIn('GH_TOKEN', env)
+            self.assertNotIn('GIT_CONFIG_PARAMETERS', env)
+            self.assertFalse(any('tok-x' in v for v in env.values()))
+            self.assertEqual((env['GIT_CONFIG_NOSYSTEM'], env['GIT_CONFIG_GLOBAL'], env['GIT_TERMINAL_PROMPT']),
+                             ('1', os.devnull, '0'))
 
     def test_existing_worktree_is_reused(self):
         path = os.path.join(self.cfg.work_dir, 'fix-bug')
@@ -345,6 +396,30 @@ class ReportServerTest(unittest.TestCase):
                      {'status': 'ready', 'summary': 'x' * 4001}, {'status': 'waiting', 'summary': 'x'}):
             self.assertEqual(self.post(body)[0], 400, body)
         self.assertEqual(self.seen, [])
+
+    def raw_post(self, length, body=b'{}'):
+        conn = http.client.HTTPConnection('127.0.0.1', self.srv.httpd.server_address[1], timeout=3)
+        try:
+            conn.putrequest('POST', '/report')
+            conn.putheader('Authorization', 'Bearer good')
+            conn.putheader('Content-Length', length)
+            conn.endheaders()
+            conn.send(body)
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    def test_bad_content_length_is_400_before_reading(self):
+        for length in ('abc', '-1'):
+            self.assertEqual(self.raw_post(length), 400, length)
+        self.assertEqual(self.seen, [])
+
+    def test_report_for_an_assignment_that_is_not_running_is_409(self):
+        def refuse(tid, rep):
+            raise report.NotRunning(f'{tid} is not running')
+        self.srv.on_report = refuse
+        code, body = self.post({'status': 'ready', 'summary': 'late'})
+        self.assertEqual((code, body['ok']), (409, False))
 
     def test_good_report_calls_on_report(self):
         code, body = self.post({'status': 'waiting', 'summary': 'stuck', 'question': 'Which API?'})

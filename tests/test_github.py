@@ -1,10 +1,15 @@
 import base64
+import http.client
 import io
 import json
+import os
+import shutil
+import tempfile
 import unittest
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from superagent import github as gh_mod
@@ -151,6 +156,21 @@ class ClientTest(unittest.TestCase):
         self.assertIn('Validation Failed', text)
         self.assertNotIn(TOKEN, text)
 
+    def test_default_opener_has_a_timeout(self):
+        with mock.patch('urllib.request.urlopen', return_value=Resp({'ok': 1})) as urlopen:
+            self.assertEqual(GitHub(TOKEN, REPO).get('/x'), {'ok': 1})
+        self.assertEqual(urlopen.call_args.kwargs.get('timeout'), gh_mod.TIMEOUT)
+        self.assertEqual(gh_mod.TIMEOUT, 30)
+
+    def test_network_errors_become_github_errors_without_the_token(self):
+        for exc in (ConnectionResetError(f'reset {TOKEN}'), TimeoutError('timed out'),
+                    http.client.RemoteDisconnected('closed'), urllib.error.URLError(f'no route {TOKEN}')):
+            gh, _ = client({('GET', '/x'): exc})
+            with self.assertRaises(GitHubError, msg=repr(exc)) as cm:
+                gh.get('/x')
+            self.assertNotIn(TOKEN, str(cm.exception))
+            self.assertIn('GET /x', str(cm.exception))
+
     def test_plain_403_is_not_rate_limited(self):
         gh, _ = client({('GET', '/x'): http_error(f'{API}/x', 403, 'Resource not accessible')})
         with self.assertRaises(GitHubError) as cm:
@@ -203,6 +223,7 @@ class TriggerTest(unittest.TestCase):
 class PollTest(unittest.TestCase):
     def setUp(self):
         self.store = Store(':memory:')
+        self.store.put('github-start', '2026-11-08T00:00:00+00:00')  # the service started before the fixtures
 
     def routes(self, notifications=(), issues=None, comments=None, reviews=None):
         r = {('GET', '/notifications'): list(notifications)}
@@ -295,6 +316,21 @@ class PollTest(unittest.TestCase):
         self.assertIsNone(self.store.get('github-since'))
         self.assertIsNone(self.store.get('github-retry'))
 
+    def test_first_run_starts_from_now_and_ignores_older_items(self):
+        self.store = Store(':memory:')
+        routes = self.routes([notif(1)], issues={1: issue(1)}, comments={1: [comment(10)]})
+        out, op = self.poll(routes)
+        self.assertEqual(out, [])
+        start = NOW.isoformat(timespec='seconds')
+        self.assertEqual((self.store.get('github-start'), self.store.get('github-since')), (start, start))
+        self.assertNotIn('/repos/o/r/issues/1', op.paths())
+        # Later: the old issue and its old comment stay ignored; only the comment written after the start counts.
+        new = comment(11, updated=(NOW + timedelta(seconds=30)).isoformat().replace('+00:00', 'Z'))
+        routes = self.routes([notif(1)], issues={1: issue(1)}, comments={1: [comment(10), new]})
+        out, op = self.poll(routes, now=NOW + timedelta(minutes=1))
+        self.assertEqual([t.id for t in out], [f"github-comment|11|{new['updated_at']}"])
+        self.assertEqual(op.query('/repos/o/r/issues/1/comments')['since'], [start])
+
     def test_poll_does_not_store_triggers(self):
         self.poll(self.routes([notif(1)], issues={1: issue(1)}))
         self.assertFalse(self.store.has_trigger('github-issue|1'))
@@ -344,32 +380,74 @@ class FakeRun:
         return self.result
 
 
+HARDEN = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false']
+AUTH = base64.b64encode(f'x-access-token:{TOKEN}'.encode()).decode()
+
+
 class GitTest(unittest.TestCase):
-    def test_push_keeps_token_out_of_argv_and_in_env(self):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='superagent-git-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.push_dir = os.path.join(self.tmp, 'push.git')
+
+    def test_push_goes_through_a_private_bare_repo_with_the_token_only_in_the_push_env(self):
         run = FakeRun()
-        gh_mod.push_branch('/w/t', 'agent/fix', TOKEN, REPO, run=run)
-        argv, kw = run.calls[0]
-        self.assertEqual(argv, ['git', '-C', '/w/t', 'push', 'https://github.com/o/r.git', 'HEAD:refs/heads/agent/fix'])
-        self.assertNotIn(TOKEN, ' '.join(argv))
-        env = kw['env']
-        expected = base64.b64encode(f'x-access-token:{TOKEN}'.encode()).decode()
+        with mock.patch.dict(os.environ, {'SUPERAGENT_GITHUB_TOKEN': TOKEN, 'GIT_CONFIG_COUNT': '1',
+                                          'GIT_CONFIG_KEY_0': 'core.hooksPath', 'GIT_CONFIG_VALUE_0': '/evil'}):
+            gh_mod.push_branch('/w/t', 'agent/fix', TOKEN, REPO, self.push_dir, run=run)
+        (init, init_kw), (fetch, fetch_kw), (push, push_kw) = run.calls
+        self.assertEqual(init, ['git', *HARDEN, 'init', '--bare', '-q', self.push_dir])
+        self.assertEqual(fetch, ['git', f'--git-dir={self.push_dir}', *HARDEN, 'fetch', '--no-tags', '/w/t',
+                                 '+HEAD:refs/heads/agent/fix'])
+        self.assertEqual(push, ['git', f'--git-dir={self.push_dir}', *HARDEN, 'push', '--no-verify',
+                                'https://github.com/o/r.git', '+refs/heads/agent/fix:refs/heads/agent/fix'])
+        for argv, kw in run.calls:
+            self.assertNotIn(TOKEN, ' '.join(argv))
+        for kw in (init_kw, fetch_kw):  # the worker-reachable steps never see the token
+            self.assertFalse(any(TOKEN in v or AUTH in v for v in kw['env'].values()))
+            self.assertNotIn('GIT_CONFIG_KEY_0', kw['env'])
+            self.assertEqual((kw['env']['GIT_CONFIG_NOSYSTEM'], kw['env']['GIT_CONFIG_GLOBAL']), ('1', os.devnull))
+        env = push_kw['env']
+        self.assertLessEqual(set(env), {'PATH', 'HOME', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_TERMINAL_PROMPT',
+                                        'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'})
         self.assertEqual(env['GIT_CONFIG_COUNT'], '1')
         self.assertEqual(env['GIT_CONFIG_KEY_0'], 'http.https://github.com/.extraheader')
-        self.assertEqual(env['GIT_CONFIG_VALUE_0'], f'AUTHORIZATION: basic {expected}')
-        self.assertEqual(env['GIT_TERMINAL_PROMPT'], '0')
+        self.assertEqual(env['GIT_CONFIG_VALUE_0'], f'AUTHORIZATION: basic {AUTH}')
+        self.assertEqual((env['GIT_TERMINAL_PROMPT'], env['GIT_CONFIG_NOSYSTEM'], env['GIT_CONFIG_GLOBAL']),
+                         ('0', '1', os.devnull))
+
+    def test_push_reuses_an_existing_push_repo(self):
+        os.makedirs(self.push_dir)
+        open(os.path.join(self.push_dir, 'HEAD'), 'w').close()
+        run = FakeRun()
+        gh_mod.push_branch('/w/t', 'agent/fix', TOKEN, REPO, self.push_dir, run=run)
+        self.assertEqual([argv[len(HARDEN) + 2] for argv, _ in run.calls], ['fetch', 'push'])
 
     def test_push_failure_raises_with_redacted_stderr(self):
-        run = FakeRun(1, stderr=f'fatal: denied for {TOKEN}')
+        run = FakeRun(1, stderr=f'fatal: denied for {TOKEN} {AUTH}')
         with self.assertRaises(GitHubError) as cm:
-            gh_mod.push_branch('/w/t', 'agent/fix', TOKEN, REPO, run=run)
+            gh_mod.push_branch('/w/t', 'agent/fix', TOKEN, REPO, self.push_dir, run=run)
         self.assertIn('fatal: denied', str(cm.exception))
         self.assertNotIn(TOKEN, str(cm.exception))
+        self.assertNotIn(AUTH, str(cm.exception))
 
-    def test_has_new_commits(self):
+    def test_has_new_commits_runs_hardened_without_secrets(self):
         run = FakeRun(stdout='2\n')
-        self.assertTrue(gh_mod.has_new_commits('/w/t', 'origin/main', run=run))
-        self.assertEqual(run.calls[0][0], ['git', '-C', '/w/t', 'rev-list', '--count', 'origin/main..HEAD'])
+        with mock.patch.dict(os.environ, {'SUPERAGENT_GITHUB_TOKEN': TOKEN}):
+            self.assertTrue(gh_mod.has_new_commits('/w/t', 'origin/main', run=run,
+                                                   env=gh_mod.git_env({'SUPERAGENT_GITHUB_TOKEN'})))
+        argv, kw = run.calls[0]
+        self.assertEqual(argv, ['git', *HARDEN, '-C', '/w/t', 'rev-list', '--count', 'origin/main..HEAD'])
+        self.assertNotIn('SUPERAGENT_GITHUB_TOKEN', kw['env'])
         self.assertFalse(gh_mod.has_new_commits('/w/t', 'origin/main', run=FakeRun(stdout='0\n')))
+
+    def test_git_env_drops_secrets_and_inherited_git_config(self):
+        base = {'PATH': '/bin', 'HOME': '/h', 'SUPERAGENT_GITHUB_TOKEN': TOKEN, 'OTHER': f'x{TOKEN}',
+                'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.hooksPath', 'GIT_CONFIG_VALUE_0': '/evil',
+                'GIT_CONFIG_PARAMETERS': "'core.hooksPath'='/evil'"}
+        env = gh_mod.git_env({'SUPERAGENT_GITHUB_TOKEN'}, [TOKEN], base=base)
+        self.assertEqual(env, {'PATH': '/bin', 'HOME': '/h', 'GIT_CONFIG_NOSYSTEM': '1',
+                               'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0'})
 
 
 class PullTest(unittest.TestCase):

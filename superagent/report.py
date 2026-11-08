@@ -18,6 +18,10 @@ SUMMARY_MAX = 4000
 BODY_MAX = 64 * 1024
 
 
+class NotRunning(Exception):
+    """`on_report` raises this when the Ticket's current Assignment is not running: the report is refused (409)."""
+
+
 def validate(body):
     """Return (report, '') or (None, reason)."""
     if not isinstance(body, dict):
@@ -67,7 +71,8 @@ def main(argv=None):
 
 class ReportServer:
     """POST /report on 127.0.0.1. `lookup(token) -> ticket_id | None`; `on_report(ticket_id, report)` runs on a
-    server thread, so it must be thread-safe (e.g. hand off with loop.call_soon_threadsafe)."""
+    server thread, so it must be thread-safe (e.g. hand off with loop.call_soon_threadsafe). It raises NotRunning
+    to refuse a report with 409 and change nothing."""
 
     def __init__(self, lookup, on_report, port=0, host='127.0.0.1'):
         self.lookup, self.on_report = lookup, on_report
@@ -106,7 +111,10 @@ class ReportServer:
                 ticket_id = server.lookup(token) if token else None
                 if not ticket_id:
                     return self.reply(401, {'ok': False, 'error': 'unknown ticket token'})
-                size = int(self.headers.get('Content-Length') or 0)
+                length = (self.headers.get('Content-Length') or '0').strip()
+                if not (length.isascii() and length.isdigit()):
+                    return self.reply(400, {'ok': False, 'error': 'bad Content-Length'})
+                size = int(length)
                 if size > BODY_MAX:
                     return self.reply(413, {'ok': False, 'error': 'body too large'})
                 try:
@@ -118,6 +126,8 @@ class ReportServer:
                     return self.reply(400, {'ok': False, 'error': error})
                 try:
                     server.on_report(ticket_id, report)
+                except NotRunning as e:
+                    return self.reply(409, {'ok': False, 'error': str(e)})
                 except Exception as e:  # the worker should retry, not lose the report
                     log.exception('on_report failed for %s', ticket_id)
                     return self.reply(500, {'ok': False, 'error': str(e)})

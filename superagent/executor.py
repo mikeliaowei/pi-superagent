@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 
+from .github import GIT_HARDEN, git_env as _git_env
 from .pi_rpc import PiRpc, RpcError
 
 PACKAGE = os.path.dirname(os.path.abspath(__file__))
@@ -17,6 +18,11 @@ class PrepareError(Exception):
     pass
 
 
+def git_env(cfg):
+    """Environment for the service's own git commands: no GitHub token, no configured secrets, no global config."""
+    return _git_env({cfg.token_env, *cfg.secret_env}, [cfg.token])
+
+
 def prepare_worktree(cfg, ticket, run=subprocess.run):
     """Create (or reuse) <work_dir>/<name> on branch agent/<name> from origin/<base_branch>. Returns (path, branch)."""
     path = os.path.join(cfg.work_dir, ticket.name)
@@ -24,8 +30,11 @@ def prepare_worktree(cfg, ticket, run=subprocess.run):
     if os.path.exists(os.path.join(path, '.git')):
         return path, branch
 
+    env = git_env(cfg)
+
     def git(*args, check=True):
-        p = run(['git', *args], cwd=cfg.checkout, capture_output=True, text=True)
+        # The checkout shares config and hooks with every worker's worktree: hooks off, no secrets in env.
+        p = run(['git', *GIT_HARDEN, *args], cwd=cfg.checkout, env=env, capture_output=True, text=True)
         if check and p.returncode != 0:
             raise PrepareError(f'git {args[0]} failed: {(p.stderr or p.stdout).strip()}')
         return p
@@ -48,8 +57,27 @@ def pi_argv(cfg, ticket):
             '--append-system-prompt', PROMPT_PATH, '--no-approve', '--offline']
 
 
+def _no_git_credentials(env):
+    """Turn off git credential helpers and prompts, so a worker cannot push with the user's stored credentials.
+
+    Appends `credential.helper=` (an empty value clears the helper list) after any GIT_CONFIG_* entries already set.
+    """
+    try:
+        n = int(env.get('GIT_CONFIG_COUNT') or 0)
+    except ValueError:
+        n = -1
+    if n < 0:  # malformed: git would refuse it anyway, so start over
+        for k in [k for k in env if k.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_'))]:
+            del env[k]
+        n = 0
+    env[f'GIT_CONFIG_KEY_{n}'], env[f'GIT_CONFIG_VALUE_{n}'] = 'credential.helper', ''
+    env['GIT_CONFIG_COUNT'] = str(n + 1)
+    env.update(GIT_TERMINAL_PROMPT='0', GIT_ASKPASS='/usr/bin/false', SSH_ASKPASS='/usr/bin/false')
+
+
 def worker_env(cfg, ticket, report_url):
     env = cfg.worker_env()
+    _no_git_credentials(env)
     env.update(SUPERAGENT_URL=report_url, SUPERAGENT_TICKET_ID=ticket.id, SUPERAGENT_TICKET_TOKEN=ticket.token,
                PI_SKIP_VERSION_CHECK='1')
     # superagent-report lives next to the interpreter running the service (the venv's bin).

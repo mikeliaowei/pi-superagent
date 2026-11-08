@@ -1,11 +1,14 @@
 import os
+import shutil
 import tempfile
+import threading
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 from superagent import config as cfgmod
 from superagent.model import Assignment, Ticket, Trigger, short_name, stage
-from superagent.policy import gate, mentions
+from superagent.policy import gate, is_stop, mentions
 from superagent.store import Store
 
 NOW = datetime(2026, 11, 8, 12, tzinfo=timezone.utc)
@@ -51,6 +54,17 @@ class PolicyTest(unittest.TestCase):
         self.assertTrue(mentions('hey @bot, look', 'bot'))
         self.assertFalse(mentions('hey @bot-two look', 'bot'))
         self.assertFalse(mentions('mail me at x@bot.com', 'bot'))
+
+    def test_quoted_lines_neither_mention_nor_stop(self):
+        self.assertFalse(mentions('> @bot fix it\nthanks for the fix', 'bot'))
+        self.assertTrue(mentions('> earlier\n@bot fix it', 'bot'))
+        self.assertFalse(is_stop('  > @bot stop\nI disagree with this', 'bot'))
+        self.assertTrue(is_stop('> quote\n@bot stop', 'bot'))
+
+    def test_stop_uses_the_same_mention_boundary(self):
+        self.assertTrue(is_stop('@BOT stop now', 'bot'))
+        self.assertFalse(is_stop('write to x@bot stop', 'bot'))
+        self.assertFalse(is_stop('@bot-two stop', 'bot'))
 
 
 class ModelTest(unittest.TestCase):
@@ -108,10 +122,49 @@ class StoreTest(unittest.TestCase):
         self.s.effect_done(e['id'])
         self.assertEqual(self.s.due_effects(now=NOW + timedelta(days=1)), [])
 
+    def test_token_lookup_compares_in_constant_time(self):
+        self.s.save_ticket(ticket(token='secret'))
+        with mock.patch('superagent.store.hmac.compare_digest', wraps=__import__('hmac').compare_digest) as cmp:
+            self.assertEqual(self.s.ticket_by_token('secret').id, 'tk-1')
+            self.assertIsNone(self.s.ticket_by_token('secreT'))
+        self.assertTrue(cmp.called)
+
     def test_kv(self):
         self.assertEqual(self.s.get('cursor', 'none'), 'none')
         self.s.put('cursor', {'since': 'x'})
         self.assertEqual(self.s.get('cursor'), {'since': 'x'})
+
+
+class StoreThreadTest(unittest.TestCase):
+    def test_report_lookups_on_other_threads_never_fail_or_miss_while_the_loop_writes(self):
+        tmp = tempfile.mkdtemp(prefix='superagent-store-')
+        self.addCleanup(shutil.rmtree, tmp, True)
+        s = Store(os.path.join(tmp, 'db.sqlite'))
+        t = ticket(token='tok-1', assignments=[assignment(state='running')])
+        s.save_ticket(t)
+        errors, misses = [], []
+
+        def reader():
+            for _ in range(2000):
+                try:
+                    if s.ticket_by_token('tok-1') is None:
+                        misses.append(1)
+                except Exception as e:  # noqa: BLE001 - any error is the defect
+                    errors.append(repr(e))
+
+        readers = [threading.Thread(target=reader) for _ in range(2)]
+        for r in readers:
+            r.start()
+        for i in range(2000):
+            try:
+                s.put('github-since', f'2026-11-08T12:00:{i % 60:02d}+00:00')
+                s.save_ticket(t)
+            except Exception as e:  # noqa: BLE001
+                errors.append(repr(e))
+        for r in readers:
+            r.join()
+        self.assertEqual(errors[:3], [])
+        self.assertEqual(len(misses), 0)
 
 
 class ConfigTest(unittest.TestCase):
