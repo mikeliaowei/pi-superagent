@@ -34,7 +34,7 @@ Branch: main (new repo, no commits yet). Delivery: ask-on-risk. Runner: `.venv/b
 | T7 | S11 | inline (each fix < 100 lines) | done | 136 tests GREEN; real DB upgrade kept 7/7 rows; `kill` leaves no streamlit; commit 48f2ba4; Risk: item 1 (triggers table gains a column) |
 | T8 | S12 S13 | delegated (context backstop; sequential) | done | 156 tests GREEN; differential CLI check identical for single-repo; store reason-table fix included; commit a810e12; Risk: items 1, 2, 3 |
 | T9 | S14 | delegated after T8 (sequential) | done | 170 tests GREEN (13 new in test_crossrepo); commit 3681565; Risk: items 1, 2, 3 |
-| T10 | S15 | delegated after T9 (sequential) | open | local source + Pi skill/template |
+| T10 | S15 | delegated after T9 (sequential) | done | 195 tests GREEN (23 in test_local); Pi loaders accept skill and template; commit d180461; Risk: items 1, 2, 3 |
 | T11 | S12-S15 | independent verifier | open | items 1 (ticket/config format), 2 (token, test command env), 3 (config compatibility) |
 | T5 | all | inline | open | live run once an Anthropic API key or extra usage is available |
 
