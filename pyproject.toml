@@ -1,0 +1,21 @@
+[project]
+name = "pi-superagent"
+version = "0.1.0"
+description = "A proactive coding agent for one GitHub repository, running Pi workers (a Python port of dsh-superagent's ideas)"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = []
+
+[project.scripts]
+superagent = "superagent.cli:main"
+superagent-report = "superagent.report:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["superagent"]
+
+[tool.setuptools.package-data]
+superagent = ["skills/*/SKILL.md", "prompts/*.md"]
