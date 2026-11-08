@@ -177,7 +177,7 @@ only while that Ticket's worker is not running:
 
 ```sh
 cd <worktree shown in the panel>
-~/.pi/agent/bin/pi --session-dir ~/.local/share/pi-superagent/sessions --session <ticket-id>
+~/.pi/agent/bin/pi --session-dir ~/.local/share/pi-superagent/sessions --session-id <ticket-id>
 ```
 
 ## Operator commands
