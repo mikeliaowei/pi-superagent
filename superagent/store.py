@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from .model import Ticket, Trigger, now_iso
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS triggers (id TEXT PRIMARY KEY, thread_key TEXT, decision TEXT, data TEXT);
+CREATE TABLE IF NOT EXISTS triggers (id TEXT PRIMARY KEY, thread_key TEXT, decision TEXT, data TEXT, reason TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, thread_key TEXT, state TEXT, data TEXT);
 CREATE TABLE IF NOT EXISTS inputs (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id TEXT, kind TEXT, text TEXT, trigger_id TEXT,
@@ -55,14 +55,28 @@ class Store:
             self.db.row_factory = sqlite3.Row
             self.db.execute('PRAGMA journal_mode=WAL')
             self.db.executescript(SCHEMA)
+            self._upgrade()
+
+    def _upgrade(self):
+        """Bring a database from an older version up to SCHEMA. Only adds columns; never rewrites rows."""
+        columns = {r['name'] for r in self.db.execute('PRAGMA table_info(triggers)')}
+        if 'reason' not in columns:
+            self.db.execute("ALTER TABLE triggers ADD COLUMN reason TEXT DEFAULT ''")
+            self.db.commit()
 
     # Triggers: the same id twice is a no-op.
     @_locked
-    def add_trigger(self, t: Trigger, decision):
-        cur = self.db.execute('INSERT OR IGNORE INTO triggers VALUES (?, ?, ?, ?)',
-                              (t.id, t.thread_key, decision, json.dumps(t.__dict__)))
+    def add_trigger(self, t: Trigger, decision, reason=''):
+        cur = self.db.execute('INSERT OR IGNORE INTO triggers (id, thread_key, decision, data, reason) '
+                              'VALUES (?, ?, ?, ?, ?)', (t.id, t.thread_key, decision, json.dumps(t.__dict__), reason))
         self.db.commit()
         return cur.rowcount == 1
+
+    @_locked
+    def recent_triggers(self, limit=300):
+        """[(Trigger, decision, reason)], most recently received first."""
+        rows = self.db.execute('SELECT data, decision, reason FROM triggers ORDER BY rowid DESC LIMIT ?', (limit,))
+        return [(Trigger(**json.loads(r['data'])), r['decision'], r['reason'] or '') for r in rows.fetchall()]
 
     @_locked
     def has_trigger(self, trigger_id):
@@ -119,6 +133,11 @@ class Store:
     def pending_inputs(self, ticket_id):
         return [dict(r) for r in self.db.execute(
             'SELECT * FROM inputs WHERE ticket_id = ? AND delivered = 0 ORDER BY seq', (ticket_id,))]
+
+    @_locked
+    def inputs(self, ticket_id):
+        """Every input for a Ticket, delivered or not, oldest first."""
+        return [dict(r) for r in self.db.execute('SELECT * FROM inputs WHERE ticket_id = ? ORDER BY seq', (ticket_id,))]
 
     @_locked
     def mark_delivered(self, seqs):

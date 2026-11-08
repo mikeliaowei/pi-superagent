@@ -172,9 +172,11 @@ def cmd_panel(cfg, args):
     panel = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'panel.py')
     env = {**os.environ, 'SUPERAGENT_CONFIG': os.path.abspath(os.path.expanduser(args.config))}
     print(f'superagent panel on http://127.0.0.1:{args.port} (Ctrl+C to stop)', file=sys.stderr)
-    return subprocess.run([sys.executable, '-m', 'streamlit', 'run', panel, '--server.address', '127.0.0.1',
-                           '--server.port', str(args.port), '--server.headless', 'true',
-                           '--browser.gatherUsageStats', 'false'], env=env).returncode
+    sys.stderr.flush()
+    # Replace this process instead of starting a child, so Ctrl+C and kill reach streamlit directly.
+    os.execve(sys.executable, [sys.executable, '-m', 'streamlit', 'run', panel, '--server.address', '127.0.0.1',
+                               '--server.port', str(args.port), '--server.headless', 'true',
+                               '--browser.gatherUsageStats', 'false'], env)
 
 
 def cmd_check(cfg, args):

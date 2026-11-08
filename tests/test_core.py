@@ -186,3 +186,37 @@ class ConfigTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class StoreMigrationTest(unittest.TestCase):
+    def test_a_database_from_before_reasons_is_upgraded_in_place(self):
+        import sqlite3
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__('shutil').rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, 'old.sqlite')
+        db = sqlite3.connect(path)
+        db.execute('CREATE TABLE triggers (id TEXT PRIMARY KEY, thread_key TEXT, decision TEXT, data TEXT)')
+        db.execute('INSERT INTO triggers VALUES (?, ?, ?, ?)', ('old', 'github:o/r#1', 'accept', '{"id": "old", '
+                   '"thread_key": "github:o/r#1", "actor": "alice", "human": true, "addressed": true, "at": "a", "text": "x"}'))
+        db.commit()
+        db.close()
+        s = Store(path)
+        s.add_trigger(trig(tid='new'), 'ignore', 'not addressed by a listed person')
+        rows = {t.id: (d, r) for t, d, r in s.recent_triggers()}
+        self.assertEqual(rows, {'old': ('accept', ''), 'new': ('ignore', 'not addressed by a listed person')})
+        Store(path)  # opening an upgraded database again is a no-op
+
+
+class StoreHistoryTest(unittest.TestCase):
+    def test_recent_triggers_are_newest_first_and_capped(self):
+        s = Store(':memory:')
+        for i in range(5):
+            s.add_trigger(trig(tid=f't{i}'), 'context', f'reason {i}')
+        self.assertEqual([(t.id, r) for t, _, r in s.recent_triggers(limit=2)], [('t4', 'reason 4'), ('t3', 'reason 3')])
+
+    def test_inputs_lists_delivered_and_pending(self):
+        s = Store(':memory:')
+        s.add_input('tk-1', 'trigger', 'first')
+        s.add_input('tk-1', 'trigger', 'second')
+        s.mark_delivered([s.pending_inputs('tk-1')[0]['seq']])
+        self.assertEqual([(i['text'], i['delivered']) for i in s.inputs('tk-1')], [('first', 1), ('second', 0)])

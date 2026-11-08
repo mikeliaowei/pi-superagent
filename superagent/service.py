@@ -134,7 +134,7 @@ class Service:
             # Editing a comment re-reads it, but its authority was used once: never a second Ticket or stop.
             d = (policy.Decision('context', 'edit of a handled request', tuple(live)) if live
                  else policy.Decision('ignore', 'edit of a handled request'))
-        if not self.store.add_trigger(trig, d.kind):
+        if not self.store.add_trigger(trig, d.kind, d.reason):
             return
         log.info('trigger %s from %s on %s: %s (%s)', trig.id, trig.actor, trig.thread_key, d.kind, d.reason)
         if d.kind == 'accept':

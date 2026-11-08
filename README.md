@@ -122,8 +122,11 @@ debug logging. Exit codes: 0 ok, 1 runtime error, 2 configuration error.
 A local web panel shows what needs a person first, in the spirit of dsh-superagent's panel: Tickets waiting for
 an answer, a review, or help after a block, failure or delivery error, each with its thread link and Stop / Retry
 buttons. Its other tabs list Tickets (filter by stage, open/all, text; details show the mandate, assignments,
-request and pending inputs), recent Triggers with the policy decision (`accept`, `stop`, `context`, `ignore`), and
-the loaded settings (whether the token is set, never its value).
+request and every message for the worker, marked delivered or not), recent Triggers with the policy decision
+(`accept`, `stop`, `context`, `ignore`) and why it was made, and the loaded settings (whether the token is set,
+never its value). `superagent panel` replaces itself with Streamlit, so Ctrl+C or `kill` stops the panel completely.
+Databases from earlier versions are upgraded in place when opened (a `reason` column is added; Triggers recorded
+before it show no reason).
 
 ```sh
 pip install -e ".[panel]"

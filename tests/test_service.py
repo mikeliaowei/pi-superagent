@@ -231,6 +231,8 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(decisions), 2)  # the agent's own comment is never even a Trigger
         self.assertFalse(any(str(own['id']) in k for k in decisions))
         self.assertEqual(set(decisions.values()), {'ignore'})
+        reasons = {t.actor: r for t, _, r in self.store.recent_triggers()}  # why, not just what, is stored
+        self.assertEqual(reasons, {'mallory': 'not addressed by a listed person', 'dependabot[bot]': 'bot'})
 
     async def test_waiting_question_is_posted_and_the_answer_resumes_the_same_session(self):
         n = self.gh.add_issue('Add storage', '@bot add storage')

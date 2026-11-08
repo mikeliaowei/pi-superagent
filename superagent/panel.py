@@ -55,17 +55,6 @@ def ended_at(t):
     return (a.ended_at if a and a.ended_at else None) or updated_at(t)
 
 
-def recent_triggers(store):
-    """Stored Triggers with their decision, newest first. The store keeps the decision, not the reason."""
-    trigs = []
-    for tid, decision in store.trigger_decisions('').items():
-        trig = store.trigger(tid)
-        if trig:
-            trigs.append((trig, decision))
-    trigs.sort(key=lambda x: x[0].at or '', reverse=True)
-    return trigs[:RECENT_TRIGGERS]
-
-
 def act(store, ticket, action, where):
     if st.button(action.capitalize(), key=f'{where}-{action}-{ticket.id}'):
         try:
@@ -107,7 +96,7 @@ def overview(cfg, store, tickets):
     st.subheader('Last 24 hours')
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     recent = lambda s: (parse_time(s) or datetime.min.replace(tzinfo=timezone.utc)) >= cutoff  # noqa: E731
-    triggers = [trig for trig, _ in recent_triggers(store) if recent(trig.at)]
+    triggers = [trig for trig, _, _ in store.recent_triggers(RECENT_TRIGGERS) if recent(trig.at)]
     opened = [t for t in tickets if recent(t.created_at)]
     ended = [t for t in tickets if t.state == 'ended' and recent(ended_at(t))]
     running = sum(1 for t in tickets if t.state == 'open' and t.current and t.current.state == 'running')
@@ -173,24 +162,27 @@ def tickets_tab(cfg, store, tickets):
                                                     'started_at', 'ended_at')} for a in t.assignments],
                               columns=['id', 'state', 'report', 'summary', 'question', 'end_reason', 'started_at',
                                        'ended_at']), hide_index=True, width='stretch')
-    pending = store.pending_inputs(t.id)
-    st.markdown(f'Pending inputs (not yet delivered to the worker): {len(pending)}')
-    if pending:
-        st.dataframe(pd.DataFrame([{'at': i['at'], 'kind': i['kind'], 'text': i['text']} for i in pending]),
+    inputs = store.inputs(t.id)
+    waiting = sum(1 for i in inputs if not i['delivered'])
+    st.markdown(f'Messages for the worker: {len(inputs)} ({waiting} not yet delivered)')
+    if inputs:
+        st.dataframe(pd.DataFrame([{'at': i['at'], 'kind': i['kind'], 'text': i['text'],
+                                    'delivered': 'yes' if i['delivered'] else 'no'} for i in inputs]),
                      hide_index=True, width='stretch')
     actions(store, t, 'tk')
 
 
 def triggers_tab(cfg, store):
-    st.caption('Every message the service read, with the policy decision. The reason is in the service log.')
+    st.caption('Every message the service read, with its policy decision and why.')
     decisions = st.multiselect('Decision', DECISIONS, key='trigger-decisions')
-    trigs = [(trig, d) for trig, d in recent_triggers(store) if not decisions or d in decisions]
+    trigs = [(trig, d, r) for trig, d, r in store.recent_triggers(RECENT_TRIGGERS) if not decisions or d in decisions]
     if not trigs:
         st.info('No triggers yet.' if not decisions else 'No triggers match.')
         return
-    rows = [{'at': trig.at, 'decision': d, 'actor': trig.actor, 'kind': trig.kind, 'human': trig.human,
-             'addressed': trig.addressed, 'thread': trig.thread_key, 'text': trig.text[:300], 'url': trig.url or None}
-            for trig, d in trigs]
+    rows = [{'at': trig.at, 'decision': d, 'reason': r or '(recorded before reasons were kept)', 'actor': trig.actor,
+             'kind': trig.kind, 'human': trig.human, 'addressed': trig.addressed, 'thread': trig.thread_key,
+             'text': trig.text[:300], 'url': trig.url or None}
+            for trig, d, r in trigs]
     st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch',
                  column_config={'url': st.column_config.LinkColumn('link')})
 
