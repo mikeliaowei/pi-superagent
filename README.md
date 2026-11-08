@@ -126,6 +126,41 @@ Ticket's name; the token is never logged.
 - With several repos configured, name the others in the request to change them together, e.g. `@your-bot rename
   the endpoint here and update the client in acme/web-client`: one Ticket, one PR per changed repo.
 
+## Ask it from this machine or from Pi
+
+You do not need GitHub to make a request. Whoever can run `superagent` on this machine is the operator, so a local
+request carries an explicit mandate from `local_user` (config `[policy] local_user`, default your OS user name):
+
+```sh
+superagent ask --repo acme/api "fix the flaky test in tests/test_login.py"   # prints: queued request 1 for acme/api
+superagent show local:1            # the Ticket once `superagent run` picked it up: stage, PRs, conversation
+superagent answer add-storage "Use SQLite."   # answer its question; the same Pi session resumes
+superagent stop add-storage
+```
+
+`--repo` can repeat for a cross-repo change; without it the request goes to the only configured repo, or to the
+configured repos its text names. The running service picks requests up each poll round. A local Ticket's thread is
+`local:<id>`: its replies (the acknowledgement, questions, reports and PR links) go to a local outbox that
+`superagent show` and the panel display, never to GitHub. Its pull requests say "Requested locally by <user>"
+instead of closing an issue. Everything else (worker, tests, cross-repo PRs, stop and retry) works as for GitHub.
+
+### From a Pi chat
+
+```sh
+superagent pi-install        # writes ~/.pi/agent/skills/superagent/SKILL.md and ~/.pi/agent/prompts/superagent.md
+```
+
+Then run `/reload` in Pi (or restart it) and try:
+
+- `/superagent fix the flaky test in owner/repo`: queues the request with `superagent ask`.
+- "what are my super-agent tickets?": Pi runs `superagent tickets --json` and reports names, stages and PR links.
+- "answer its question: use SQLite": Pi runs `superagent answer <ticket> "use SQLite"`.
+
+The skill uses the absolute path of the `superagent` that ran `pi-install` (plus `--config` when you passed one), and
+tells Pi to confirm ambiguous requests and stops with you and never to touch the Tickets' worktrees itself.
+`--agent-dir DIR` installs elsewhere (default: `$PI_CODING_AGENT_DIR` or `~/.pi/agent`). It refuses to overwrite
+files it did not write unless you pass `--force`; `superagent pi-install --uninstall` removes only its own files.
+
 ## Operator commands
 
 | Command | What it does |
@@ -133,26 +168,32 @@ Ticket's name; the token is never logged.
 | `superagent check` | Preflight; exit 2 if the config or token is missing, 1 if another check fails. |
 | `superagent run` | Run the service. |
 | `superagent status` | JSON: repo (`repos` with `[[repos]]`), agent login, whether the token is set, open Tickets by stage, failing effects, last poll time. |
-| `superagent tickets [--all] [--json]` | Tickets with id, name, repo (with `[[repos]]`; every repo of a cross-repo Ticket), stage, issue number, PR (`owner/name#<n>, ...` for a cross-repo Ticket) and last report. |
+| `superagent tickets [--all] [--json]` | Tickets with id, name, repo (with `[[repos]]`; every repo of a cross-repo Ticket), stage, issue number (`local` for a local Ticket), PR (`owner/name#<n>, ...` for a cross-repo Ticket) and last report; `--json` adds each Ticket's `thread` (`github:owner/name#<n>` or `local:<id>`). |
+| `superagent ask [--repo R ...] TEXT` | Queue a local request (see above). |
+| `superagent show <ticket> [--json]` | A Ticket's stage, repos, PR links and conversation (request, local replies, answers); `local:<id>` also finds a request not picked up yet. |
+| `superagent answer <ticket> TEXT` | Give a Ticket an answer or instruction: it steers a running worker or resumes the same session. |
+| `superagent pi-install [--agent-dir DIR] [--force] [--uninstall]` | Install the Pi skill and `/superagent` prompt template (see above). |
 | `superagent stop <ticket>` | Stop a Ticket (id or name). |
 | `superagent retry <ticket>` | Relaunch a Ticket whose last run ended, or retry a failed delivery. |
 | `superagent panel [--port 8742]` | Local web panel (see below); needs the `panel` extra. |
 
 `stop` and `retry` write a request to the store (`operator:stop:<ticket>` / `operator:retry:<ticket>` in the kv
-table). The running service applies it at its next poll round; if the service is not running, it applies it at
-the next start. All commands take `--config PATH` (default `~/.config/pi-superagent/config.toml`) and `-v` for
+table); `ask` and `answer` queue theirs in the `local_requests` table. The running service applies them at its next
+poll round; if the service is not running, at the next start. All commands take `--config PATH` (default `~/.config/pi-superagent/config.toml`) and `-v` for
 debug logging. Exit codes: 0 ok, 1 runtime error, 2 configuration error.
 
 ## Web panel
 
 A local web panel shows what needs a person first, in the spirit of dsh-superagent's panel: Tickets waiting for
 an answer, a review, or help after a block, failure or delivery error, each with its thread link and Stop / Retry
-buttons. Its other tabs list Tickets (filter by stage, open/all, text; details show the mandate, assignments,
-request and every message for the worker, marked delivered or not), recent Triggers with the policy decision
+buttons, plus an Answer box for a local Ticket waiting on a question and a New request form (the same as
+`superagent ask`). Its other tabs list Tickets (filter by stage, open/all, text; details show the mandate, assignments,
+request (a local Ticket's whole conversation) and every message for the worker, marked delivered or not), recent Triggers with the policy decision
 (`accept`, `stop`, `context`, `ignore`) and why it was made, and the loaded settings (whether the token is set,
 never its value). `superagent panel` replaces itself with Streamlit, so Ctrl+C or `kill` stops the panel completely.
-Databases from earlier versions are upgraded in place when opened (a `reason` column is added; Triggers recorded
-before it show no reason).
+Databases from earlier versions gain new tables when opened (`trigger_reasons`, `local_requests`,
+`local_messages`); existing tables are never altered, so an older version keeps working on the same database.
+Triggers recorded before reasons were kept show no reason.
 
 ```sh
 pip install -e ".[panel]"
@@ -160,7 +201,7 @@ superagent panel            # http://127.0.0.1:8742, --port to change
 ```
 
 It binds to 127.0.0.1 only and refreshes every 10 s. It reads the same database as `superagent run`; Stop and Retry
-record the same requests as `superagent stop|retry`, which the running service applies at its next poll round.
+record the same requests as `superagent stop|retry` (Answer and New request as `answer|ask`), which the running service applies at its next poll round.
 
 ## Safety model
 
@@ -188,8 +229,10 @@ record the same requests as `superagent stop|retry`, which the running service a
 
 - Explicit requests only: no observe mode or proactive rules.
 - No LLM router; the policy gate is deterministic.
-- The web panel is read-only apart from Stop and Retry; no login, so keep it on localhost.
-- GitHub only; other sources (Slack, email, ...) are not ported.
+- The web panel is read-only apart from Stop, Retry, Answer and New request; no login, so keep it on localhost.
+- Sources are GitHub and local requests (`superagent ask`, the Pi skill); others (Slack, email, ...) are not ported.
+- Anyone who can run `superagent` as you (or write its database) can request work: local requests are not checked
+  against `allowed`.
 - A Ticket can span several configured repositories only when the request names them; a later comment cannot
   add a repo to a running Ticket.
 

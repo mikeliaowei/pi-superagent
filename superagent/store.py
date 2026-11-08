@@ -27,6 +27,13 @@ CREATE TABLE IF NOT EXISTS effects (
   next_at TEXT, done INTEGER DEFAULT 0, last_error TEXT DEFAULT '', UNIQUE (kind, key)
 );
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS local_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, ticket_id TEXT, repos TEXT, text TEXT, actor TEXT, at TEXT,
+  done INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS local_messages (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id TEXT, at TEXT, kind TEXT, body TEXT, key TEXT UNIQUE, actor TEXT
+);
 CREATE INDEX IF NOT EXISTS tickets_thread ON tickets (thread_key, state);
 CREATE INDEX IF NOT EXISTS effects_due ON effects (done, next_at);
 """
@@ -192,6 +199,56 @@ class Store:
     @_locked
     def failing_effects(self):
         return [dict(r) for r in self.db.execute("SELECT * FROM effects WHERE done = 0 AND last_error != ''")]
+
+    # Local requests (S15): `superagent ask` and `answer` queue them; the running service applies each once.
+    @_locked
+    def queue_ask(self, text, repos, actor):
+        """Queue a local request for a new Ticket in `repos`; returns its id (the thread is `local:<id>`)."""
+        cur = self.db.execute('INSERT INTO local_requests (kind, repos, text, actor, at) VALUES (?, ?, ?, ?, ?)',
+                              ('ask', json.dumps(list(repos)), text, actor, now_iso()))
+        self.db.commit()
+        return cur.lastrowid
+
+    @_locked
+    def queue_answer(self, ticket_id, text, actor):
+        """Queue an answer for the Ticket and record it in its conversation, in one transaction."""
+        at = now_iso()
+        cur = self.db.execute('INSERT INTO local_requests (kind, ticket_id, text, actor, at) VALUES (?, ?, ?, ?, ?)',
+                              ('answer', ticket_id, text, actor, at))
+        self.db.execute('INSERT INTO local_messages (ticket_id, at, kind, body, key, actor) VALUES (?, ?, ?, ?, ?, ?)',
+                        (ticket_id, at, 'answer', text, f'answer-{cur.lastrowid}', actor))
+        self.db.commit()
+        return cur.lastrowid
+
+    @_locked
+    def local_requests(self):
+        """Requests the service has not applied yet, oldest first."""
+        return [dict(r) for r in self.db.execute('SELECT * FROM local_requests WHERE done = 0 ORDER BY id')]
+
+    @_locked
+    def local_request(self, request_id):
+        row = self.db.execute('SELECT * FROM local_requests WHERE id = ?', (request_id,)).fetchone()
+        return dict(row) if row else None
+
+    @_locked
+    def local_request_done(self, request_id, ticket_id=None):
+        self.db.execute('UPDATE local_requests SET done = 1, ticket_id = COALESCE(?, ticket_id) WHERE id = ?',
+                        (ticket_id, request_id))
+        self.db.commit()
+
+    @_locked
+    def add_local_message(self, ticket_id, kind, body, key):
+        """Add a message to a local Ticket's conversation; the same `key` twice is a no-op."""
+        cur = self.db.execute('INSERT OR IGNORE INTO local_messages (ticket_id, at, kind, body, key) '
+                              'VALUES (?, ?, ?, ?, ?)', (ticket_id, now_iso(), kind, body, key))
+        self.db.commit()
+        return cur.rowcount == 1
+
+    @_locked
+    def local_messages(self, ticket_id):
+        """The Ticket's local outbox (`reply`) and answers (`answer`), oldest first."""
+        return [dict(r) for r in self.db.execute('SELECT * FROM local_messages WHERE ticket_id = ? ORDER BY seq',
+                                                 (ticket_id,))]
 
     # KV: cursors and small settings.
     @_locked

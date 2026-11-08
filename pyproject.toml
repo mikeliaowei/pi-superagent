@@ -21,4 +21,4 @@ build-backend = "setuptools.build_meta"
 packages = ["superagent"]
 
 [tool.setuptools.package-data]
-superagent = ["skills/*/SKILL.md", "prompts/*.md"]
+superagent = ["skills/*/SKILL.md", "prompts/*.md", "pi/*.md", "pi/*/SKILL.md"]

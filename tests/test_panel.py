@@ -242,6 +242,45 @@ class PanelAppTest(unittest.TestCase):
         self.assertIn(f'{t.worktree}/b__two', text)
         self.assertEqual(list(at.tabs[1].dataframe[0].value['repo']), ['a/one, b/two'])
 
+    def local_ticket(self, store):
+        t = self.ticket(store, 'tk-1', 'add-storage', 0, report='waiting', question='Which database?')
+        t.thread_key = 'local:1'
+        store.save_ticket(t)
+        store.add_local_message(t.id, 'reply', "On it: I'll work on this as `add-storage`.", 'tk-1-ack')
+        store.add_local_message(t.id, 'reply', 'Question: Which database?', 'tk-1-q')
+        return t
+
+    def test_a_local_ticket_shows_its_conversation_and_the_answer_box_queues_the_same_answer_as_the_cli(self):
+        store = self.store()
+        self.local_ticket(store)
+        at = self.app()
+        text = rendered_text(at)
+        self.assertIn('Question: Which database?', text)
+        self.assertIn("On it: I'll work on this", text)
+        self.assertIn('local request `local:1`', '\n'.join(m.value for m in at.tabs[1].markdown))
+        self.assertNotIn('issues/0', text)
+        at.text_area(key='tk-answer-text-tk-1').input('Use SQLite.')
+        with mock.patch.dict(os.environ, {'SUPERAGENT_CONFIG': self.config}):
+            at.button(key='tk-answer-tk-1').click().run()
+        self.assertIn('answer queued for add-storage (tk-1)', '\n'.join(s.value for s in at.success))
+        (r,) = store.local_requests()
+        self.assertEqual((r['kind'], r['ticket_id'], r['text']), ('answer', 'tk-1', 'Use SQLite.'))
+        self.assertEqual(store.local_messages('tk-1')[-1]['body'], 'Use SQLite.')
+
+    def test_the_new_request_form_queues_the_same_request_as_ask(self):
+        import getpass
+        store = self.store()
+        at = self.app()
+        self.assertEqual(at.multiselect(key='new-request-repos').value, ['o/r'])  # the only configured repo
+        at.text_area(key='new-request-text').input('Fix the flaky test')
+        with mock.patch.dict(os.environ, {'SUPERAGENT_CONFIG': self.config}):
+            at.button(key='new-request-submit').click().run()
+        self.assertIn('queued request 1 for o/r', '\n'.join(s.value for s in at.success))
+        (r,) = store.local_requests()
+        self.assertEqual((r['kind'], r['text'], r['repos'], r['actor']),
+                         ('ask', 'Fix the flaky test', '["o/r"]', getpass.getuser()))
+
+
 class PanelCommandTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='superagent-panel-cli-')

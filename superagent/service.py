@@ -6,10 +6,13 @@ quiet until there is a question, a result, or an honest failure.
 
 Operator actions from the CLI reach a running service through kv keys `operator:stop:<ticket>` and
 `operator:retry:<ticket>`; the service applies them at the start of each poll round (or at the next start).
+Local requests (`superagent ask` and `answer`) wait in the store's `local_requests` table and are applied in the
+same place. A local Ticket's thread is `local:<request id>`; its replies go to the store's local outbox, not GitHub.
 """
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -19,7 +22,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 
 from . import executor, github, policy
-from .model import Assignment, Ticket, named_repos, new_id, new_part, short_name
+from .model import Assignment, Ticket, Trigger, named_repos, new_id, new_part, short_name
 from .pi_rpc import PiRpc, RunResult
 from .report import NotRunning
 
@@ -29,6 +32,11 @@ RUN_TIMEOUT = 2 * 3600  # one worker run, seconds
 DELIVER_ATTEMPTS = 5
 REPLY_WORDS = 100
 TITLE_MAX = 80
+LOCAL = 'local:'  # thread key prefix of local Tickets
+
+
+def is_local(t):
+    return t.thread_key.startswith(LOCAL)
 RATE_PAUSE_START, RATE_PAUSE_MAX = timedelta(minutes=5), timedelta(hours=1)
 
 
@@ -116,12 +124,14 @@ class Service:
     async def poll_once(self):
         self.loop = asyncio.get_running_loop()
         await self.apply_operator_requests()
+        await self.take_local_requests()
         now = self.clock()
         if self.paused_until and now < self.paused_until:
             return
         subscribed = {}
         for t in self.store.tickets(state='open'):
-            subscribed.setdefault(t.repo, set()).add(t.number)
+            if not is_local(t):  # a local Ticket has no GitHub thread to read
+                subscribed.setdefault(t.repo, set()).add(t.number)
         try:
             triggers = await asyncio.to_thread(github.poll_repos, self.gh, self.store, self.cfg.repo_names,
                                                self.cfg.agent_login, subscribed, now, self.cfg.legacy)
@@ -216,6 +226,60 @@ class Service:
             self._new_assignment(t, 'resume')
             log.info('[%s] follow-up from %s resumes the session', t.name, trig.actor)
 
+    # Local requests (S15)
+    async def take_local_requests(self):
+        """Apply each queued `superagent ask` and `answer` once; a failure leaves it queued for the next round."""
+        for r in self.store.local_requests():
+            try:
+                if r['kind'] == 'ask':
+                    self._take_ask(r)
+                elif r['kind'] == 'answer':
+                    await self._take_answer(r)
+                else:
+                    self.store.local_request_done(r['id'])
+            except Exception:
+                log.exception('local request %s failed', r['id'])
+
+    def _take_ask(self, r):
+        """Open the Ticket of a local request: the local operator's explicit mandate. Idempotent: a request whose
+        Ticket exists (the service stopped before marking it done) opens nothing."""
+        thread = f"{LOCAL}{r['id']}"
+        existing = self.store.tickets(thread_key=thread)
+        if existing:
+            self.store.local_request_done(r['id'], existing[0].id)
+            return
+        trig = Trigger(id=f"local|{r['id']}", thread_key=thread, actor=r['actor'], human=True, addressed=True,
+                       at=r['at'], text=r['text'], kind='local')
+        repos = []
+        for name in json.loads(r['repos'] or '[]'):
+            try:
+                repos.append(self.cfg.repo_config(name).name)
+            except ValueError:
+                pass  # the config changed since `ask`
+        if not repos:
+            self.store.add_trigger(trig, 'ignore', 'local request names no configured repo')
+            self.store.local_request_done(r['id'])
+            log.warning('local request %s names no configured repo: ignored', r['id'])
+            return
+        self.store.add_trigger(trig, 'accept', 'local request')
+        first = next((line for line in r['text'].splitlines() if line.strip()), '')
+        title = ' '.join(first.split())[:TITLE_MAX].strip() or 'Request'
+        t = self.open_ticket(trig, title, repos, 0)
+        self.store.local_request_done(r['id'], t.id)
+
+    async def _take_answer(self, r):
+        """Deliver an operator's answer like a human follow-up on the thread: steer or resume the worker."""
+        t = self.store.ticket(r['ticket_id'])
+        trig_id = f"local-answer|{r['id']}"
+        if not t or t.state == 'ended':
+            log.info('answer %s for %s dropped: the ticket ended', r['id'], r['ticket_id'])
+        elif not any(i['trigger_id'] == trig_id for i in self.store.inputs(t.id)):
+            trig = Trigger(id=trig_id, thread_key=t.thread_key, actor=r['actor'], human=True, addressed=True,
+                           at=r['at'], text=r['text'], kind='answer')
+            self.store.add_trigger(trig, 'context', 'local answer')
+            await self._context(t.id, trig)
+        self.store.local_request_done(r['id'])
+
     # Operator requests
     async def apply_operator_requests(self):
         for t in self.store.tickets(state='open'):
@@ -291,6 +355,12 @@ class Service:
 
     async def _effect_reply(self, e):
         d = e['data']
+        t = self.store.ticket(d.get('ticket_id', ''))
+        if t and is_local(t):
+            self.store.add_local_message(t.id, 'reply', d['body'], e['key'])
+            self.store.effect_done(e['id'])
+            log.info('[%s] reply %s to the local outbox', t.name, e['key'])
+            return
         repo = d.get('repo')
         if not repo:  # queued by a version before replies named their repo
             t = self.store.ticket(d.get('ticket_id', ''))
@@ -560,16 +630,8 @@ class Service:
         os.makedirs(os.path.dirname(push_dir), exist_ok=True)
         await asyncio.to_thread(github.push_branch, t.worktree, t.branch, self.cfg.token, repo.name, push_dir,
                                 self.run_git, env)
-        trig = self._request(t)
-        if not repo.test_command:
-            tests = f'Tests: no test command configured for {repo.name}.'
-        else:
-            tests = t.test_result or f'Tests: `{repo.test_command}` was not run for this delivery.'
-        body = f'{a.summary or t.title}\n\n{tests}'
-        if not (trig and trig.meta.get('is_pr')):
-            body += f'\n\nCloses #{t.number}'
         number = await asyncio.to_thread(github.open_pull, self._gh(repo.name), t.branch, repo.base_branch, t.title,
-                                         body)
+                                         self._pr_body(t, a, repo, t.test_result))
         t = self.store.ticket(t.id)
         t.pr_number = number
         self.store.save_ticket(t)
@@ -584,7 +646,9 @@ class Service:
         else:
             tests = test_result or f'Tests: `{repo.test_command}` was not run for this delivery.'
         body = f'{a.summary or t.title}\n\n{tests}'
-        if repo.name.lower() != t.repo.lower():
+        if is_local(t):
+            body += f"\n\nRequested locally by {t.mandate.get('actor') or 'the operator'}."
+        elif repo.name.lower() != t.repo.lower():
             body += f'\n\nRequested in https://github.com/{t.repo}/issues/{t.number}'
         elif not (trig and trig.meta.get('is_pr')):
             body += f'\n\nCloses #{t.number}'

@@ -14,6 +14,9 @@ token_env = "SUPERAGENT_GITHUB_TOKEN"
 # GitHub logins allowed to ask for work by mentioning the bot. Anyone else's comments on a live
 # Ticket's thread are passed to the worker as context only, never as new requests.
 allowed = ["your-login"]
+# Who requests made on this machine (`superagent ask`, `answer`, the panel, the Pi skill) are recorded as.
+# Anyone who can run `superagent` here is the operator. Default: your OS user name.
+# local_user = "your-name"
 
 [executor]
 # Local clone of the repository (with an `origin` remote). Worktrees are created from it.

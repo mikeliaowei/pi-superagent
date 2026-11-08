@@ -3,7 +3,7 @@
 Run it with `superagent panel` (or `streamlit run superagent/panel.py -- <config>`); the config path comes from
 the SUPERAGENT_CONFIG environment variable or the argument after `--`. The panel reads the store through Store
 methods only. Its Stop and Retry buttons record the same operator requests as `superagent stop|retry`, which the
-running service applies. It never shows the GitHub token, a Ticket's report token, or environment values.
+running service applies; its New request form and Answer box call the same functions as `superagent ask|answer`. It never shows the GitHub token, a Ticket's report token, or environment values.
 """
 
 import os
@@ -38,7 +38,12 @@ def parse_time(s):
 
 
 def issue_url(t):
-    return f'https://github.com/{t.repo}/issues/{t.number}'
+    """The request thread on GitHub; None for a local Ticket, which has none."""
+    return None if cli.is_local(t) else f'https://github.com/{t.repo}/issues/{t.number}'
+
+
+def thread_markdown(t):
+    return f'local request `{t.thread_key}`' if cli.is_local(t) else f'[#{t.number}]({issue_url(t)})'
 
 
 def pr_url(t):
@@ -88,6 +93,40 @@ def actions(store, t, where):
         act(store, t, 'retry', where)
 
 
+def answer_box(cfg, store, t, where):
+    """For a Ticket waiting on a question: the same answer as `superagent answer`."""
+    if t.state != 'open' or stage(t) != 'person/answer':
+        return
+    text = st.text_area('Answer', key=f'{where}-answer-text-{t.id}')
+    if st.button('Answer', key=f'{where}-answer-{t.id}'):
+        try:
+            st.success(cli.answer_request(cfg, store, t.id, text))
+        except RuntimeError as e:
+            st.error(str(e))
+
+
+def conversation(cfg, store, t):
+    """A local Ticket's conversation: the request, the local outbox and the answers, as `superagent show` lists it."""
+    st.markdown('Conversation')
+    for msg in cli.show_data(cfg, store, t.id)['conversation']:
+        st.markdown(f"**{msg['from']}** · {msg['kind']} · {msg['at']}")
+        st.text(msg['text'])
+
+
+def new_request(cfg, store):
+    """The same request as `superagent ask`."""
+    st.subheader('New request')
+    only = cfg.repo_names if len(cfg.repo_names) == 1 else []
+    repos = st.multiselect('Repos', cfg.repo_names, default=only, key='new-request-repos')
+    text = st.text_area('What to do', key='new-request-text')
+    if st.button('Queue request', key='new-request-submit'):
+        try:
+            _, message = cli.ask_request(cfg, store, text, repos)
+            st.success(message)
+        except RuntimeError as e:
+            st.error(str(e))
+
+
 # Tabs
 
 def overview(cfg, store, tickets):
@@ -98,15 +137,17 @@ def overview(cfg, store, tickets):
     for t in people:
         a = t.current
         with st.container(border=True):
-            st.markdown(f'**{t.name}** · `{stage(t)}` · [#{t.number}]({issue_url(t)})'
-                        + pr_markdown(t))
+            st.markdown(f'**{t.name}** · `{stage(t)}` · {thread_markdown(t)}' + pr_markdown(t))
             if t.delivery_error:
                 st.markdown(f'Delivery failed: {t.delivery_error}')
             if a and a.question:
                 st.markdown(f'Question: {a.question}')
             if a and a.summary:
                 st.markdown(f'Summary: {a.summary}')
+            answer_box(cfg, store, t, 'ov')
             actions(store, t, 'ov')
+
+    new_request(cfg, store)
 
     st.subheader('Last 24 hours')
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
@@ -160,8 +201,7 @@ def tickets_tab(cfg, store, tickets):
                        key='ticket-detail')
     t = by_id[tid]
     m = t.mandate
-    st.markdown(f"**{t.name}**: {t.title} · `{stage(t)}` · [#{t.number}]({issue_url(t)})"
-                + pr_markdown(t))
+    st.markdown(f"**{t.name}**: {t.title} · `{stage(t)}` · {thread_markdown(t)}" + pr_markdown(t))
     st.markdown(f"Asked by **{m.get('actor', '?')}** at {m.get('at') or t.created_at}"
                 f" ({m.get('strength', 'explicit')} mandate)")
     st.markdown(f'Branch `{t.branch or "-"}` · {"ticket folder" if t.parts else "worktree"} `{t.worktree or "-"}`'
@@ -174,7 +214,10 @@ def tickets_tab(cfg, store, tickets):
     if t.delivery_error:
         st.markdown(f'Delivery error: {t.delivery_error}')
     request = store.trigger(m.get('trigger_id'))
-    if request:
+    if cli.is_local(t):
+        conversation(cfg, store, t)
+        answer_box(cfg, store, t, 'tk')
+    elif request:
         st.markdown('Request')
         st.text(request.text)
     st.markdown('Assignments')
@@ -221,7 +264,7 @@ def settings_tab(cfg):
             ('allowed', ', '.join(cfg.allowed)), ('provider', cfg.provider), ('model', cfg.model),
             ('thinking', cfg.thinking), ('tools', cfg.tools), ('max_workers', cfg.max_workers),
             ('poll_seconds', cfg.poll_seconds), *([('checkout', cfg.checkout)] if cfg.legacy else []),
-            ('max_test_retries', cfg.max_test_retries), ('work_dir', cfg.work_dir),
+            ('max_test_retries', cfg.max_test_retries), ('local_user', cfg.local_user), ('work_dir', cfg.work_dir),
             ('state_dir', cfg.state_dir), (f'token set ({cfg.token_env})', 'yes' if cfg.token else 'no')]
     st.dataframe(pd.DataFrame([{'setting': k, 'value': str(v)} for k, v in rows]), hide_index=True, width='stretch')
 
@@ -245,7 +288,7 @@ def body(cfg):
         pass  # the click itself reruns this fragment
     st.caption(f'Updated {datetime.now().strftime("%H:%M:%S")}; refreshes every {REFRESH_SECONDS} s.')
     if not tickets:
-        st.info('No tickets yet. Mention the bot on an issue to start one.')
+        st.info('No tickets yet. Mention the bot on an issue, or queue a New request below, to start one.')
     tabs = st.tabs(['Overview', 'Tickets', 'Triggers', 'Settings'])
     with tabs[0]:
         overview(cfg, store, tickets)

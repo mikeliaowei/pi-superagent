@@ -1,5 +1,6 @@
 """Configuration from a TOML file. Secrets are never stored here: only the names of environment variables."""
 
+import getpass
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -48,8 +49,15 @@ class Config:
     repos: list | None = None
     # Failed fix attempts after a failing test_command before the Ticket is reported blocked.
     max_test_retries: int = 2
+    # Who `superagent ask` and `answer` act as (S15): the local operator. Default: the OS user name.
+    local_user: str = ''
 
     def __post_init__(self):
+        if not self.local_user:
+            try:
+                self.local_user = getpass.getuser()
+            except (OSError, KeyError):
+                self.local_user = 'local'
         self.state_dir = os.path.expanduser(self.state_dir)
         self.work_dir = os.path.expanduser(self.work_dir or os.path.join(self.state_dir, 'work'))
         self.checkout = os.path.expanduser(self.checkout) if self.checkout else ''
