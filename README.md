@@ -42,7 +42,7 @@ policy, the effect queue and the "confirm once, then stay quiet" reply style com
 - **Replies.** The agent acknowledges once. After that it speaks only to ask a question (`waiting`), link a pull
   request (`ready`), or say honestly that it is blocked, failed, or dropped the request. `progress` posts nothing.
 - **Tests.** When the Ticket's repo has a `test_command`, a `ready` report first runs it in the worktree
-  (`sh -c`, with the worker's environment: no token, no `secret_env`, no git credential helpers; its own process
+  (`sh -c`, or `cmd.exe /c` on Windows, with the worker's environment: no token, no `secret_env`, no git credential helpers; its own process
   group; killed after `test_timeout`). A failure opens no PR: the command, its exit code (or the timeout) and the
   last 3,000 characters of output go back to the same Pi session, which fixes and reports ready again. After
   `max_test_retries` failed fixes the Ticket is reported blocked ("tests still failing: <command>").
@@ -85,6 +85,126 @@ python3 -m venv .venv
 
 This installs `superagent` (the service and operator CLI) and `superagent-report` (what workers call) into the
 venv. Workers find `superagent-report` because the service puts its own `bin` directory first on their `PATH`.
+
+On Windows, see [Windows (native, no WSL)](#windows-native-no-wsl): the same features, installed with `py` and
+run from cmd or PowerShell.
+
+## Windows (native, no WSL)
+
+`superagent` runs natively on Windows 10/11: no WSL, no Ubuntu. Each command below says whether it is for
+**cmd** or **PowerShell**; where both are shown, use either.
+
+**Prerequisites**
+
+- Python 3.11 or newer from [python.org](https://www.python.org/downloads/windows/) (keep the `py` launcher
+  ticked), or `winget install Python.Python.3.13`.
+- [Git for Windows](https://git-scm.com/download/win).
+- Pi installed and signed in, following Pi's own instructions. Check a provider, for example:
+  `pi auth check --provider github-copilot --json`.
+- Find the Pi executable with `where pi` (cmd) or `where.exe pi` (PowerShell), for example
+  `C:\Users\me\AppData\Roaming\npm\pi.cmd`. If `~/.pi/agent/bin/pi` does not exist, `superagent` uses the `pi` on
+  `PATH` and `superagent check` says which one. To pin it, set `pi` in the config's `[executor]` with forward slashes
+  or a TOML literal string (single quotes keep backslashes):
+
+  ```toml
+  pi = 'C:\Users\me\AppData\Roaming\npm\pi.cmd'
+  # or: pi = "C:/Users/me/AppData/Roaming/npm/pi.cmd"
+  ```
+
+**Install** (cmd and PowerShell alike)
+
+```bat
+git clone https://github.com/mikeliaowei/pi-superagent.git
+cd pi-superagent
+py -3 -m venv .venv
+.venv\Scripts\pip install -e ".[panel]"
+```
+
+**Config.** It lives in `%USERPROFILE%\.config\pi-superagent\config.toml`; the database, Pi sessions and worktrees
+go to `%USERPROFILE%\.local\share\pi-superagent` unless you set `state_dir`.
+
+cmd:
+
+```bat
+mkdir "%USERPROFILE%\.config\pi-superagent"
+copy config.example.toml "%USERPROFILE%\.config\pi-superagent\config.toml"
+notepad "%USERPROFILE%\.config\pi-superagent\config.toml"
+```
+
+PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.config\pi-superagent"
+Copy-Item config.example.toml "$env:USERPROFILE\.config\pi-superagent\config.toml"
+notepad "$env:USERPROFILE\.config\pi-superagent\config.toml"
+```
+
+Write Windows paths in the config with forward slashes (`checkout = "C:/src/your-repo"`) or as TOML literal strings
+in single quotes (`checkout = 'C:\src\your-repo'`); in a double-quoted TOML string a backslash is an escape.
+
+**Token.** Never in the config file.
+
+- For every new terminal (cmd or PowerShell): `setx SUPERAGENT_GITHUB_TOKEN github_pat_...`, then open a **new**
+  terminal; `setx` does not change the one you typed it in. It is stored in your user environment.
+- For the current PowerShell only: `$env:SUPERAGENT_GITHUB_TOKEN = 'github_pat_...'`
+- For the current cmd only: `set SUPERAGENT_GITHUB_TOKEN=github_pat_...`
+
+**Check and run** (cmd and PowerShell alike)
+
+```bat
+.venv\Scripts\superagent check
+.venv\Scripts\superagent run
+.venv\Scripts\superagent ask --repo owner/name "add a CONTRIBUTING.md"
+.venv\Scripts\superagent panel
+```
+
+`superagent run` stops cleanly on Ctrl+C (or Ctrl+Break): workers are closed and relaunch with a recovery note at
+the next start. The panel is at http://127.0.0.1:8742; on Windows `superagent panel` runs Streamlit as a child
+process and Ctrl+C stops both.
+
+**Tests run through cmd.exe.** A repo's `test_command` runs as `cmd.exe /c <command>` in the worktree, in its own
+process group; on timeout the whole process tree is killed (`taskkill /F /T`). Write it in cmd syntax (`&&`
+between steps, `\` in paths), for example:
+
+```toml
+test_command = '.venv\Scripts\python -m pytest -q'
+# or the repo's own command, e.g. "npm test" or "gradlew.bat test"
+```
+
+**Pi skill.** `superagent pi-install` writes to `%USERPROFILE%\.pi\agent` by default (or `--agent-dir`, or
+`PI_CODING_AGENT_DIR`). The commands it writes use `superagent.exe` with forward slashes.
+
+**Long paths.** Worktrees nest deep (`<state_dir>\work\<owner>__<name>\<ticket>\...`), and Windows' 260-character
+limit can break checkouts. Turn on long paths for git, in your global config (used by the workers' own git) and in
+each checkout (the service's own git commands ignore global config):
+
+```bat
+git config --global core.longpaths true
+git -C C:/src/your-repo config core.longpaths true
+```
+
+Also turn on Windows long paths once (PowerShell as administrator), or keep `state_dir` short (`state_dir = "C:/sa"`):
+
+```powershell
+New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force
+```
+
+**What differs from macOS/Linux, and limits**
+
+- Workers' git cannot use stored credentials or prompt: `credential.helper=` clears Git Credential Manager,
+  `GCM_INTERACTIVE=never`, `GIT_TERMINAL_PROMPT=0`, and `GIT_ASKPASS`/`SSH_ASKPASS` point to
+  `<state_dir>\deny-askpass.cmd`, which fails without output (Windows has no `/usr/bin/false`; leaving askpass unset
+  would let an inherited one, such as VS Code's, answer instead).
+- The service's own git commands turn hooks off with `core.hooksPath=C:/Windows/System32/cmd.exe` (a file, so no
+  hook can exist below it) instead of `/dev/null`: Git for Windows would look `/dev/null/<hook>` up as
+  `C:\dev\null\<hook>`, a folder any user can create.
+- A test command's background processes are killed through the process tree. One whose parent already exited is no
+  longer in that tree and can survive the command.
+- There is no SIGTERM: stopping `superagent run` from Task Manager ends it at once; the next start recovers the
+  running Assignments as after any restart.
+- Verified on GitHub's `windows-latest` runners (the test suite), not yet on a real company laptop. Workers still run
+  as your user without isolation, as on every platform (see [Safety model](#safety-model)). Antivirus scanning can
+  make git and worktree creation noticeably slower; excluding `state_dir` from scanning helps if policy allows it.
 
 ## Quick start
 
@@ -235,7 +355,8 @@ buttons, plus an Answer box for a local Ticket waiting on a question and a New r
 `superagent ask`). Its other tabs list Tickets (filter by stage, open/all, text; details show the mandate, assignments,
 request (a local Ticket's whole conversation) and every message for the worker, marked delivered or not), recent Triggers with the policy decision
 (`accept`, `stop`, `context`, `ignore`) and why it was made, and the loaded settings (whether the token is set,
-never its value). `superagent panel` replaces itself with Streamlit, so Ctrl+C or `kill` stops the panel completely.
+never its value). `superagent panel` replaces itself with Streamlit, so Ctrl+C or `kill` stops the panel completely
+(on Windows it runs Streamlit as a child, and Ctrl+C stops both).
 Databases from earlier versions gain new tables when opened (`trigger_reasons`, `local_requests`,
 `local_messages`); existing tables are never altered, so an older version keeps working on the same database.
 Triggers recorded before reasons were kept show no reason.
@@ -258,7 +379,8 @@ record the same requests as `superagent stop|retry` (Answer and New request as `
 - Workers report over localhost with a per-Ticket token. A report is accepted only while that Ticket's current
   run is going; a late one gets 409 and changes nothing.
 - Worktrees share `.git/config` and hooks with the checkout, so a worker can plant hooks or URL rewrites there.
-  Every git command the service runs therefore has hooks off (`-c core.hooksPath=/dev/null`), no system or global
+  Every git command the service runs therefore has hooks off (`-c core.hooksPath=/dev/null`; on Windows a path
+  below `C:/Windows/System32/cmd.exe`), no system or global
   git config, and no token or `secret_env` variable in its environment. The token is used only by the final
   `git push`, which runs from a bare repo created for that push alone (mode 0700, deleted afterwards) with proxy
   and TLS settings pinned and an environment holding nothing but `PATH`, `HOME` and the auth header. A long-lived
@@ -266,8 +388,8 @@ record the same requests as `superagent stop|retry` (Answer and New request as `
   Because global git config is off, `git fetch origin` in the checkout cannot use a credential helper configured
   there; use an SSH remote or a public repository for `checkout`.
 - Workers get git credential helpers and prompts turned off (`credential.helper=`, `GIT_TERMINAL_PROMPT=0`,
-  `GIT_ASKPASS=/usr/bin/false`, `SSH_ASKPASS=/usr/bin/false`), so their `git push` cannot fall back on your
-  keychain. This only raises the bar: a worker with `bash` runs as your user and can still read any file you can
+  `GIT_ASKPASS=/usr/bin/false`, `SSH_ASKPASS=/usr/bin/false`; on Windows also `GCM_INTERACTIVE=never` and a
+  failing `deny-askpass.cmd`), so their `git push` cannot fall back on your keychain. This only raises the bar: a worker with `bash` runs as your user and can still read any file you can
   read, including `<state_dir>`. Container isolation is the real fix.
 - Workers can use Pi's stored provider logins (that is how signed-in providers work), and a worker with `bash`
   could also read that file. Treat model credentials Pi holds as reachable by workers.

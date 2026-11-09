@@ -17,6 +17,10 @@ PROMPT_PATH = os.path.join(PACKAGE, 'prompts', 'worker.md')
 REQUEST_CAP, FOLLOWUP_CAP, MAX_FOLLOWUPS = 1500, 600, 20
 TEST_OUTPUT_CAP = 64 * 1024  # bytes of a test command's output kept (the tail)
 TEST_TAIL = 3000  # characters of that output sent back to the worker
+WINDOWS = os.name == 'nt'
+CREATE_NEW_PROCESS_GROUP = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200)
+# Windows has no /usr/bin/false: askpass points at this batch file instead (see deny_askpass).
+DENY_ASKPASS = 'deny-askpass.cmd'
 
 
 class PrepareError(Exception):
@@ -86,10 +90,25 @@ def pi_argv(cfg, ticket):
             '--append-system-prompt', PROMPT_PATH, '--no-approve', '--offline']
 
 
-def _no_git_credentials(env):
+def deny_askpass(state_dir):
+    """Windows: a batch file that prints nothing and fails, used as GIT_ASKPASS and SSH_ASKPASS (created on demand).
+
+    Leaving askpass unset is not enough: an inherited GIT_ASKPASS (VS Code's terminal sets one) would ask another
+    program for the user's credentials. Git for Windows starts a .cmd askpass through cmd.exe; if it could not start it
+    at all, git fails the same way, without a credential."""
+    path = os.path.join(state_dir, DENY_ASKPASS)
+    if not os.path.isfile(path):
+        os.makedirs(state_dir, exist_ok=True)
+        with open(path, 'w') as f:
+            f.write('@exit /b 1\n')
+    return path
+
+
+def _no_git_credentials(env, state_dir):
     """Turn off git credential helpers and prompts, so a worker cannot push with the user's stored credentials.
 
-    Appends `credential.helper=` (an empty value clears the helper list) after any GIT_CONFIG_* entries already set.
+    Appends `credential.helper=` (an empty value clears the helper list, including Git for Windows' system-wide
+    Git Credential Manager) after any GIT_CONFIG_* entries already set.
     """
     try:
         n = int(env.get('GIT_CONFIG_COUNT') or 0)
@@ -101,7 +120,12 @@ def _no_git_credentials(env):
         n = 0
     env[f'GIT_CONFIG_KEY_{n}'], env[f'GIT_CONFIG_VALUE_{n}'] = 'credential.helper', ''
     env['GIT_CONFIG_COUNT'] = str(n + 1)
-    env.update(GIT_TERMINAL_PROMPT='0', GIT_ASKPASS='/usr/bin/false', SSH_ASKPASS='/usr/bin/false')
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    if WINDOWS:
+        askpass = deny_askpass(state_dir)
+        env.update(GIT_ASKPASS=askpass, SSH_ASKPASS=askpass, GCM_INTERACTIVE='never')
+    else:
+        env.update(GIT_ASKPASS='/usr/bin/false', SSH_ASKPASS='/usr/bin/false')
 
 
 def test_env(cfg):
@@ -110,7 +134,7 @@ def test_env(cfg):
     The command is worker-authored code, so it never gets the service's environment: no GitHub token, no configured
     secrets, no git credential helpers."""
     env = cfg.worker_env()
-    _no_git_credentials(env)
+    _no_git_credentials(env, cfg.state_dir)
     return env
 
 
@@ -124,10 +148,12 @@ def worker_env(cfg, ticket, report_url):
 
 
 class TestRun:
-    """One run of a repo's test command: `sh -c <command>` in the worktree, in its own process group.
+    """One run of a repo's test command in the worktree, in its own process group: `sh -c <command>` on POSIX,
+    `cmd.exe /c <command>` (CREATE_NEW_PROCESS_GROUP) on Windows.
 
     Output (stdout and stderr together) goes to a temporary file, so a chatty or stuck command never blocks a pipe;
-    the last TEST_OUTPUT_CAP bytes are kept. `wait` blocks (run it in a thread); `kill` ends the whole group.
+    the last TEST_OUTPUT_CAP bytes are kept. `wait` blocks (run it in a thread); `kill` ends the whole group (on
+    Windows the process tree, with `taskkill /F /T`).
     """
 
     def __init__(self, command, cwd, env, timeout):
@@ -138,9 +164,11 @@ class TestRun:
         """Returns {'passed', 'code', 'timed_out', 'seconds', 'output'}."""
         began = time.monotonic()
         with tempfile.TemporaryFile() as out:
-            self.proc = subprocess.Popen(['sh', '-c', self.command], cwd=self.cwd, env=self.env,
-                                         stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                                         start_new_session=True)
+            opts = dict(cwd=self.cwd, env=self.env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
+            if WINDOWS:
+                self.proc = subprocess.Popen(self.command, shell=True, creationflags=CREATE_NEW_PROCESS_GROUP, **opts)
+            else:
+                self.proc = subprocess.Popen(['sh', '-c', self.command], start_new_session=True, **opts)
             timed_out = False
             try:
                 code = self.proc.wait(timeout=self.timeout)
@@ -152,11 +180,24 @@ class TestRun:
             size = out.seek(0, os.SEEK_END)
             out.seek(max(0, size - TEST_OUTPUT_CAP))
             output = out.read().decode(errors='replace')
+        if WINDOWS:
+            output = output.replace('\r\n', '\n')  # cmd.exe and most Windows tools end lines with CRLF
         return {'passed': code == 0 and not timed_out, 'code': code, 'timed_out': timed_out,
                 'seconds': round(time.monotonic() - began), 'output': output.rstrip()}
 
     def kill(self):
         if self.proc is None:
+            return
+        if WINDOWS:
+            # Popen keeps the process handle open, so the pid cannot be reused while we hold it. Exit code 128
+            # ("not found") after a normal exit is expected. Limit: children whose parent already exited are no
+            # longer in the tree taskkill walks.
+            taskkill = os.path.join(os.environ.get('SystemRoot') or r'C:\Windows', 'System32', 'taskkill.exe')
+            try:
+                subprocess.run([taskkill, '/F', '/T', '/PID', str(self.proc.pid)], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
             return
         try:
             os.killpg(self.proc.pid, signal.SIGKILL)

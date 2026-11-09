@@ -177,7 +177,7 @@ class ConfigTest(unittest.TestCase):
         finally:
             os.unlink(f.name)
         self.assertEqual((c.model, c.provider, c.poll_seconds), ('claude-haiku-5-5', 'anthropic', 60))
-        self.assertTrue(c.checkout.startswith('/'))
+        self.assertTrue(os.path.isabs(c.checkout))
         env = c.worker_env({'SUPERAGENT_GITHUB_TOKEN': 'x', 'GH_TOKEN': 'y', 'GITHUB_TOKEN': 'z', 'PATH': '/bin'})
         self.assertEqual(env, {'PATH': '/bin'})
         with self.assertRaisesRegex(ValueError, 'poll_seconds'):

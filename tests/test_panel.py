@@ -301,7 +301,7 @@ class PanelCommandTest(unittest.TestCase):
             s.bind(('127.0.0.1', 0))
             s.listen()
             port = s.getsockname()[1]
-            with mock.patch('superagent.cli.os.execve') as run:
+            with mock.patch('superagent.cli.os.execve') as run, mock.patch('superagent.cli.WINDOWS', False):
                 code, _, err = self.cli('panel', '--port', str(port))
         self.assertEqual(code, 1)
         self.assertIn(f'port {port} is in use', err)
@@ -309,7 +309,8 @@ class PanelCommandTest(unittest.TestCase):
         run.assert_not_called()
 
     def test_panel_without_streamlit_exits_2_with_the_install_hint(self):
-        with mock.patch.dict(sys.modules, {'streamlit': None}), mock.patch('superagent.cli.os.execve') as run:
+        with mock.patch.dict(sys.modules, {'streamlit': None}), mock.patch('superagent.cli.os.execve') as run, \
+                mock.patch('superagent.cli.WINDOWS', False):
             code, _, err = self.cli('panel')
         self.assertEqual(code, 2)
         self.assertIn('install the panel extra: pip install -e ".[panel]"', err)
@@ -317,8 +318,9 @@ class PanelCommandTest(unittest.TestCase):
 
     @unittest.skipIf(AppTest is None, 'streamlit is not installed')
     def test_panel_replaces_itself_with_streamlit_on_localhost_with_the_config(self):
-        # exec, not a child process: a SIGTERM to `superagent panel` then reaches streamlit itself.
-        with mock.patch('superagent.cli.os.execve') as execve:
+        # exec, not a child process: a SIGTERM to `superagent panel` then reaches streamlit itself. (Windows has no
+        # exec and runs a child instead: tests/test_windows.py.)
+        with mock.patch('superagent.cli.os.execve') as execve, mock.patch('superagent.cli.WINDOWS', False):
             self.cli('panel', '--port', '0')
         path, argv, env = execve.call_args.args
         self.assertEqual(path, sys.executable)

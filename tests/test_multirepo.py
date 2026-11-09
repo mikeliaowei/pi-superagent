@@ -6,7 +6,9 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -31,6 +33,12 @@ def write(path, text):
     with open(path, 'w') as f:
         f.write(text)
     return path
+
+
+def py_command(tmp, name, code):
+    """A test_command running `code` with this Python. The same command line works in sh and in cmd.exe."""
+    script = write(os.path.join(tmp, f'{name}.py'), textwrap.dedent(code))
+    return f'"{sys.executable}" "{script}"'
 
 
 def make_clone(tmp, slug):
@@ -360,8 +368,14 @@ class EnforcedTestsTest(ServiceBase):
     async def test_passing_tests_deliver_with_a_pr_line_and_run_with_the_worker_environment(self):
         seen = os.path.join(self.tmp, 'seen')
         os.makedirs(seen)
-        self.start(f'env > {seen}/env; pwd > {seen}/pwd; echo all good',
-                   {'commit': True, 'report': {'status': 'ready', 'summary': 'Fixed.'}})
+        self.start(py_command(self.tmp, 'dump', f'''
+            import os
+            with open({os.path.join(seen, 'env')!r}, 'w') as f:
+                f.writelines(f'{{k}}={{v}}\\n' for k, v in os.environ.items())
+            with open({os.path.join(seen, 'pwd')!r}, 'w') as f:
+                f.write(os.getcwd())
+            print('all good')
+            '''), {'commit': True, 'report': {'status': 'ready', 'summary': 'Fixed.'}})
         await self.round()
         await self.drain()
         t = self.store.tickets()[0]
@@ -380,7 +394,14 @@ class EnforcedTestsTest(ServiceBase):
     async def test_failing_tests_open_no_pr_and_resume_the_same_session_with_the_output_tail(self):
         def fix(cwd, env):
             write(os.path.join(cwd, 'ok.txt'), 'ok\n')
-        self.start("test -f ok.txt || { printf '%s-%s\\n' first line; seq 1 3000; exit 3; }",
+        self.start(py_command(self.tmp, 'check', '''
+            import os, sys
+            if not os.path.exists('ok.txt'):
+                print('first' + '-line')
+                for i in range(1, 3001):
+                    print(i)
+                sys.exit(3)
+            '''),
                    {'commit': True, 'report': {'status': 'ready', 'summary': 'Fixed.'}},
                    {'before': fix, 'report': {'status': 'ready', 'summary': 'Fixed the tests.'}})
         await self.round()
@@ -393,7 +414,7 @@ class EnforcedTestsTest(ServiceBase):
         self.assertIn('exit code 3', msg)
         self.assertIn('2999\n3000', msg)
         self.assertNotIn('first-line', msg)  # only the tail
-        self.assertLess(len(msg), 3600)
+        self.assertLess(len(msg) - 2 * len(self.command), 3460)  # the tail is capped; the command appears twice
         self.assertEqual(len(self.gh.pulls), 1)  # only after the fix
         self.assertEqual(len(self.git.pushes), 1)
         self.assertEqual(self.gh.pulls[t.pr_number]['body'].count('Tests:'), 1)
@@ -405,22 +426,28 @@ class EnforcedTestsTest(ServiceBase):
 
     async def test_tests_still_failing_after_the_retries_block_the_ticket_honestly(self):
         ready = {'report': {'status': 'ready', 'summary': 'Fixed.'}}
-        self.start('echo nope; exit 1', {'commit': True, **ready}, dict(ready), dict(ready))
+        self.start(py_command(self.tmp, 'nope', 'print("nope"); raise SystemExit(1)'),
+                   {'commit': True, **ready}, dict(ready), dict(ready))
         await self.round()
         await self.drain()
         t = self.store.tickets()[0]
         self.assertEqual(len(self.pi.runs), 3)  # the first try plus max_test_retries (2) fixes
         self.assertEqual(len(self.effect_keys('test')), 3)
-        self.assertEqual((t.current.report, t.current.summary), ('blocked', 'tests still failing: echo nope; exit 1'))
+        self.assertEqual((t.current.report, t.current.summary), ('blocked', f'tests still failing: {self.command}'))
         self.assertEqual((stage(t), t.test_failures, t.pr_number), ('person/blocked', 3, None))
         self.assertEqual((self.gh.pulls, self.git.pushes), ({}, []))
         posted = [p.split('<!--')[0].strip() for p in self.gh.posted(self.n)]
         self.assertEqual(len(posted), 2)
         self.assertIn('tests still failing', posted[1])
-        self.assertIn('echo nope; exit 1', posted[1])
+        self.assertIn(self.command, posted[1])
 
     async def test_a_test_command_that_runs_too_long_is_killed_and_reported_as_a_timeout(self):
-        self.start('echo started; sleep 30 & wait', {'commit': True, 'report': {'status': 'ready', 'summary': 'x'}},
+        # The command leaves a child running: the kill must end the whole group (process tree on Windows).
+        self.start(py_command(self.tmp, 'slow', '''
+            import subprocess, sys
+            print('started', flush=True)
+            subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']).wait()
+            '''), {'commit': True, 'report': {'status': 'ready', 'summary': 'x'}},
                    {'report': {'status': 'blocked', 'summary': 'cannot speed it up'}}, test_timeout=1)
         began = time.monotonic()
         await self.round()

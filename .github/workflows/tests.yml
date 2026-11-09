@@ -15,6 +15,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         python: ["3.11", "3.13"]
+        include:
+          # Native Windows (S16): cmd.exe test commands, taskkill, Git for Windows hardening.
+          - os: windows-latest
+            python: "3.13"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:

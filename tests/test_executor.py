@@ -210,6 +210,7 @@ class ArgvEnvTest(unittest.TestCase):
         self.assertEqual(env['PI_SKIP_VERSION_CHECK'], '1')
         self.assertEqual(env['PATH'], os.path.dirname(sys.executable) + os.pathsep + '/usr/bin')
 
+    @mock.patch.object(executor, 'WINDOWS', False)  # the Windows values: tests/test_windows.py
     def test_worker_env_turns_off_git_credential_helpers_and_prompts(self):
         base = {'PATH': '/usr/bin', 'GIT_CONFIG_COUNT': '2', 'GIT_CONFIG_KEY_0': 'user.name',
                 'GIT_CONFIG_VALUE_0': 'w', 'GIT_CONFIG_KEY_1': 'user.email', 'GIT_CONFIG_VALUE_1': 'w@x'}
@@ -229,12 +230,13 @@ class ArgvEnvTest(unittest.TestCase):
         tmp = self.tmp
         helper = os.path.join(tmp, 'helper.sh')
         log = os.path.join(tmp, 'helper.log')
+        # Forward slashes: Git for Windows runs the helper through its sh, and a config file treats \ as an escape.
         with open(helper, 'w') as f:
-            f.write(f'#!/bin/sh\necho called >> {log}\necho username=u; echo password=p\n')
+            f.write(f'#!/bin/sh\necho called >> "{log.replace(os.sep, "/")}"\necho username=u; echo password=p\n')
         os.chmod(helper, 0o755)
         gitconfig = os.path.join(tmp, 'gitconfig')
         with open(gitconfig, 'w') as f:
-            f.write(f'[credential]\n\thelper = {helper}\n')
+            f.write(f'[credential]\n\thelper = {helper.replace(os.sep, "/")}\n')
         with mock.patch.dict(os.environ, {'PATH': os.environ['PATH'], 'GIT_CONFIG_GLOBAL': gitconfig,
                                           'GIT_CONFIG_NOSYSTEM': '1'}, clear=True):
             env = executor.worker_env(self.cfg, ticket(), 'http://127.0.0.1:9')

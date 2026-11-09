@@ -11,7 +11,7 @@ from superagent.executor import first_message
 from superagent.model import Ticket
 from superagent.store import Store
 from tests.fake_github import FakeGitHub, FakeGitHubs
-from tests.test_multirepo import ServiceBase, make_clone, write
+from tests.test_multirepo import ServiceBase, make_clone, py_command, write
 from tests.test_service import TOKEN, Pi, git, until
 
 READY = {'report': {'status': 'ready', 'summary': 'Changed both.'}}
@@ -107,17 +107,23 @@ class CrossRepoTest(ServiceBase):
     async def test_ready_with_commits_in_both_tests_both_and_opens_two_linked_prs_and_one_reply(self):
         seen = os.path.join(self.tmp, 'seen')
         os.makedirs(seen)
-        t = await self.deliver_both(one_test=f'pwd > {seen}/one; echo ok', two_test=f'pwd > {seen}/two; echo ok')
+        one, two = (py_command(self.tmp, f'pwd_{slug}', f'''
+            import os
+            with open({os.path.join(seen, slug)!r}, 'w') as f:
+                f.write(os.getcwd())
+            print('ok')
+            ''') for slug in ('one', 'two'))
+        t = await self.deliver_both(one_test=one, two_test=two)
         for slug, part in zip(('one', 'two'), t.parts):
             self.assertEqual(os.path.realpath(open(f'{seen}/{slug}').read().strip()), os.path.realpath(part['worktree']))
         (a_pr,), (b_pr,) = list(self.one.pulls), list(self.two.pulls)
         self.assertEqual([p['pr_number'] for p in t.parts], [a_pr, b_pr])
         a_url, b_url = f'https://github.com/a/one/pull/{a_pr}', f'https://github.com/b/two/pull/{b_pr}'
         a_body, b_body = self.one.pulls[a_pr]['body'], self.two.pulls[b_pr]['body']
-        for body, other, command in ((a_body, b_url, f'pwd > {seen}/one'), (b_body, a_url, f'pwd > {seen}/two')):
+        for body, other, command in ((a_body, b_url, one), (b_body, a_url, two)):
             self.assertIn('Part of a cross-repo change:', body)
             self.assertIn(other, body)
-            self.assertIn(f'Tests: `{command}; echo ok` passed in ', body)
+            self.assertIn(f'Tests: `{command}` passed in ', body)
         self.assertIn('Closes #1', a_body)
         self.assertNotIn('Closes', b_body)  # #1 in b/two is another issue
         self.assertIn('https://github.com/a/one/issues/1', b_body)
@@ -170,7 +176,12 @@ class CrossRepoTest(ServiceBase):
         self.one.add_issue('Rename the API', '@bot rename it here and in b/two')
         self.start({'before': commit_in('a__one', 'b__two'), **READY},
                    {'before': fix, 'report': {'status': 'ready', 'summary': 'Fixed b/two.'}},
-                   one_test='echo one fine', two_test="test -f ok.txt || { echo two-broken; exit 4; }")
+                   one_test='echo one fine', two_test=py_command(self.tmp, 'two', '''
+                       import os, sys
+                       if not os.path.exists('ok.txt'):
+                           print('two-broken')
+                           sys.exit(4)
+                       '''))
         await self.round()
         await self.until_effects(lambda: len(self.pi.runs) == 2 and self.pi.runs[1].messages)
         t = self.ticket()
@@ -190,7 +201,7 @@ class CrossRepoTest(ServiceBase):
     async def test_tests_still_failing_after_the_retries_block_the_whole_ticket(self):
         self.one.add_issue('Rename the API', '@bot rename it here and in b/two')
         self.start({'before': commit_in('a__one', 'b__two'), **READY}, dict(READY), dict(READY),
-                   two_test='echo nope; exit 1')
+                   two_test=py_command(self.tmp, 'nope', 'print("nope"); raise SystemExit(1)'))
         await self.round()
         await self.drain()
         t = self.ticket()
@@ -235,7 +246,12 @@ class CrossRepoTest(ServiceBase):
     async def test_the_token_never_reaches_test_commands_or_posted_bodies(self):
         seen = os.path.join(self.tmp, 'seen')
         os.makedirs(seen)
-        t = await self.deliver_both(one_test=f'env > {seen}/one', two_test=f'env > {seen}/two')
+        one, two = (py_command(self.tmp, f'env_{slug}', f'''
+            import os
+            with open({os.path.join(seen, slug)!r}, 'w') as f:
+                f.writelines(f'{{k}}={{v}}\\n' for k, v in os.environ.items())
+            ''') for slug in ('one', 'two'))
+        t = await self.deliver_both(one_test=one, two_test=two)
         for slug in ('one', 'two'):
             env = open(f'{seen}/{slug}').read()
             for secret in (TOKEN, 'gh-secret-456', 'SUPERAGENT_GITHUB_TOKEN', 'GH_TOKEN', t.token):
