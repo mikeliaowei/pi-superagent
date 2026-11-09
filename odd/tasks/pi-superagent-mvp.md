@@ -24,6 +24,8 @@ Branch: main (new repo, no commits yet). Delivery: ask-on-risk. Runner: `.venv/b
 
 - S16 (L15 "Add Windows support + doc (Recommended)") Native Windows (no WSL): `superagent` installs and runs with the same features. test_command runs through cmd.exe in a new process group and a timeout kills the whole process tree; workers cannot fall back on stored git credentials or prompts; `superagent run` stops cleanly on Ctrl+C; `superagent panel` stops cleanly; the service's hardened git commands (hooks off, no global/system config, fresh push repo) work with Git for Windows. The GitHub test run includes a Windows job. README gets a native Windows install guide (cmd and PowerShell). POSIX behaviour is unchanged.
 
+- S17 (L17 "can we see agent worker process log in the panel?") The panel's ticket detail shows a worker log: (a) the ticket's Pi session as a timeline (prompts sent, assistant text, tool calls with their arguments, tool results trimmed, errors and stop reasons, timestamps), newest activity visible without scrolling the whole page, refreshed with the panel; (b) the service's log lines for that ticket (launch, tests, delivery, reports), which `superagent run` also writes to a rotating log file in the state dir. Read-only; strings that look like tokens (GitHub, Anthropic/OpenAI keys) are masked before display; a missing or still-empty session says so.
+
 ## Tasks
 
 | ID | Specs | Route | Status | Evidence |
@@ -39,6 +41,7 @@ Branch: main (new repo, no commits yet). Delivery: ask-on-risk. Runner: `.venv/b
 | T10 | S15 | delegated after T9 (sequential) | done | 195 tests GREEN (23 in test_local); Pi loaders accept skill and template; commit d180461; Risk: items 1, 2, 3 |
 | T11 | S12-S15 | independent verifier | done | items 1 (ticket/config format), 2 (token, test command env), 3 (config compatibility) |
 | T12 | S16 | delegated (context backstop) | done | GitHub Actions green on windows-latest, macOS and Ubuntu (3.11, 3.13); merged to main |
+| T13 | S17 | delegated (context backstop) | open | worker log in panel + service log file |
 | T5 | all | inline | open | live run once an Anthropic API key or extra usage is available |
 
 Route evidence: T2 and T3 are independent units of behavior with disjoint edit surfaces, each several hundred lines (Writer trigger, parallelism); T4 is delegated by the long-session context backstop.
@@ -61,3 +64,4 @@ Route evidence: T2 and T3 are independent units of behavior with disjoint edit s
 - L14 (2026-11-08) Recheck of B1, B2, A1 at 1b1730d: all fixed (baseline runs on the new DB; interrupted ask launches once; pushes use fresh repos, planted proxy never resolves, none left on disk). Flaky CLI test from GC ResourceWarnings fixed by closing stores when a command returns. 199 tests OK. T8-T11 done; T5 live run still needs a bot account, test repo and model access.
 - L15 (2026-11-09) User, verbatim: "can you add doc to how install it in windows machine without ubuntu?"; answer to the follow-up question: "Add Windows support + doc (Recommended)".
 - L16 (2026-11-09) Windows CI iterations on feat/windows: TOML test configs with Windows backslash paths (fixed with toml_path), mixed separators from unnormalized config paths (product fix: config paths go through os.path.normpath), path assertions made portable, stray ResourceWarnings kept out of captured CLI stderr, a timing race in one service test (counted all comments instead of the ack). Final run green on all 5 jobs; fast-forwarded main. CI reports failing tests as public annotations because job logs need a signed-in viewer.
+- L17 (2026-11-09) User, verbatim: "one enhancement: can we see agent worker process log in the panel?"
