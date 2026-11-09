@@ -27,4 +27,13 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install -e ".[panel]"
-      - run: python -m unittest discover -s tests -t .
+      - name: Run tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -t . 2>&1 | tee test-output.txt
+      - name: Report failures as annotations
+        if: failure()
+        shell: bash
+        # Job logs need a signed-in viewer; annotations are public, so failures are readable by anyone.
+        run: python .github/report_failures.py test-output.txt
