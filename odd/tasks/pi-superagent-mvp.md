@@ -41,7 +41,7 @@ Branch: main (new repo, no commits yet). Delivery: ask-on-risk. Runner: `.venv/b
 | T10 | S15 | delegated after T9 (sequential) | done | 195 tests GREEN (23 in test_local); Pi loaders accept skill and template; commit d180461; Risk: items 1, 2, 3 |
 | T11 | S12-S15 | independent verifier | done | items 1 (ticket/config format), 2 (token, test command env), 3 (config compatibility) |
 | T12 | S16 | delegated (context backstop) | done | GitHub Actions green on windows-latest, macOS and Ubuntu (3.11, 3.13); merged to main |
-| T13 | S17 | delegated (context backstop) | open | worker log in panel + service log file |
+| T13 | S17 | delegated (context backstop) | done | 234 tests; CI green on Ubuntu, macOS, Windows (run 42559924101); commit fba7dbe |
 | T5 | all | inline | open | live run once an Anthropic API key or extra usage is available |
 
 Route evidence: T2 and T3 are independent units of behavior with disjoint edit surfaces, each several hundred lines (Writer trigger, parallelism); T4 is delegated by the long-session context backstop.
