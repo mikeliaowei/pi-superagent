@@ -13,11 +13,12 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import streamlit as st
 
-from superagent import cli
+from superagent import cli, worklog
 from superagent.model import stage
 
 REFRESH_SECONDS = 10
 RECENT_TRIGGERS = 300
+WORKLOG_SHOWN = (50, 200, 500)  # newest Pi session events shown; the first is the default
 DECISIONS = ('accept', 'stop', 'context', 'ignore')
 
 
@@ -127,6 +128,57 @@ def new_request(cfg, store):
             st.error(str(e))
 
 
+def session_event(e):
+    """One Pi session event; titles and texts come masked from worklog."""
+    head = f'`{e.at}` · '
+    if e.kind == 'tool_call':
+        st.markdown(head + f'**tool** `{e.title}`')
+        st.code(e.text, language='bash' if e.title.startswith('bash:') else 'json')
+    elif e.kind == 'tool_result':
+        st.markdown(head + f'*{e.title}*')
+        st.code(e.text or '(no output)', language=None)
+    elif e.kind == 'error':
+        st.error(f'{e.at} · {e.title}: {e.text}')
+    elif e.kind == 'prompt':
+        st.markdown(head + '**prompt**')
+        st.text(e.text)
+    elif e.kind == 'assistant':
+        st.markdown(head + '**assistant**')
+        st.text(e.text)
+    elif e.kind == 'thinking':
+        st.caption(f'{e.at} · thinking: {e.text}')
+    else:
+        st.caption(f'{e.at} · {e.title}' + (f': {e.text[:300]}' if e.text else ''))
+
+
+def worker_log(cfg, t):
+    """The selected Ticket's Pi session timeline and service log lines (read only for this Ticket)."""
+    st.markdown('#### Worker log')
+    # Sub-sections, not st.tabs: nested tabs would sit between the page tabs in the element tree.
+    st.markdown('**Pi session**')
+    files = worklog.session_files(cfg.state_dir, t.id)
+    if not files:
+        started = any(a['state'] != 'pending' for a in t.assignments)
+        st.info(f"Session file not found in `{os.path.join(cfg.state_dir, 'sessions')}`." if started
+                else 'No worker session yet — the ticket has not started.')
+    else:
+        c1, c2 = st.columns([1, 1])
+        shown = c1.selectbox('Events shown', WORKLOG_SHOWN, key=f'worklog-shown-{t.id}')
+        thinking = c2.checkbox('Show thinking', key=f'worklog-thinking-{t.id}')
+        events = [e for f in files for e in worklog.read_session(f) if thinking or e.kind != 'thinking']
+        st.caption(f'Latest {len(events[-shown:])} of {len(events)} events · '
+                   + ', '.join(os.path.basename(f) for f in files))
+        with st.container(height=600, autoscroll=True):  # newest at the bottom, kept in view
+            for e in events[-shown:]:
+                session_event(e)
+    st.markdown('**Service log**')
+    lines = worklog.service_lines(cfg.log_path, t)
+    if lines:
+        st.code('\n'.join(lines), language=None)
+    else:
+        st.info(f'No lines for this ticket in `{cfg.log_path}` (written by `superagent run`).')
+
+
 # Tabs
 
 def overview(cfg, store, tickets):
@@ -232,6 +284,7 @@ def tickets_tab(cfg, store, tickets):
         st.dataframe(pd.DataFrame([{'at': i['at'], 'kind': i['kind'], 'text': i['text'],
                                     'delivered': 'yes' if i['delivered'] else 'no'} for i in inputs]),
                      hide_index=True, width='stretch')
+    worker_log(cfg, t)
     actions(store, t, 'tk')
 
 

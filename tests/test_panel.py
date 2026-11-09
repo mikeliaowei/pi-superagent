@@ -1,6 +1,7 @@
 """The web panel (superagent/panel.py) and the `superagent panel` command."""
 
 import io
+import json
 import os
 import shutil
 import socket
@@ -24,6 +25,7 @@ except ImportError:  # the panel extra is optional
     st = AppTest = None
 
 PANEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'superagent', 'panel.py')
+FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures', 'session.jsonl')
 TOKEN_VALUE = 'ghp_SECRET_bot_token_value_123'
 TICKET_TOKEN = 'tok-SECRET-ticket-token-456'
 
@@ -185,6 +187,37 @@ class PanelAppTest(unittest.TestCase):
         inputs = at.tabs[1].dataframe[2].value
         self.assertEqual(dict(zip(inputs['text'], inputs['delivered'])),
                          {'also update docs': 'yes', 'use the new API': 'no'})
+
+    def test_ticket_detail_shows_the_worker_log_with_masked_secrets(self):
+        store = self.store()
+        self.ticket(store, 'tk-1', 'fix-it', 1, report='ready', summary='Opened a PR')
+        sessions = os.path.join(self.tmp, 'state', 'sessions')
+        os.makedirs(sessions)
+        seeded = 'ghp_' + 'Z9' * 18
+        with open(FIXTURE, encoding='utf-8') as src, \
+                open(os.path.join(sessions, '2026-01-02T10-00-00-000Z_tk-1.jsonl'), 'w', encoding='utf-8') as f:
+            f.write(json.dumps({'type': 'message', 'timestamp': '2026-01-02T09:59:59.000Z', 'message': {
+                'role': 'user', 'content': [{'type': 'text', 'text': f'push with {seeded}'}]}}) + '\n')
+            f.write(src.read())
+        logs = os.path.join(self.tmp, 'state', 'logs')
+        os.makedirs(logs)
+        with open(os.path.join(logs, 'service.log'), 'w', encoding='utf-8') as f:
+            f.write('2026-01-02 10:00:00 INFO [fix-it] new ticket for #1 from alice\n'
+                    '2026-01-02 10:00:01 INFO [other-one] new ticket for #2 from bob\n')
+        at = self.app()
+        text = rendered_text(at)
+        self.assertIn('Worker log', text)
+        self.assertIn('bash: pytest -q tests/test_login.py', text)
+        self.assertIn('429 rate limit exceeded', text)
+        self.assertIn('[fix-it] new ticket for #1 from alice', text)
+        self.assertNotIn('[other-one]', text)
+        self.assertNotIn(seeded, text)
+
+    def test_ticket_detail_says_when_no_worker_session_exists(self):
+        store = self.store()
+        self.ticket(store, 'tk-1', 'fix-it', 1)
+        at = self.app()
+        self.assertIn('No worker session yet', rendered_text(at))
 
     def test_settings_show_whether_the_token_is_set_and_never_a_secret(self):
         store = self.store()

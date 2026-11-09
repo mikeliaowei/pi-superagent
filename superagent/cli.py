@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import shlex
 import shutil
@@ -28,6 +29,7 @@ DEFAULT_CONFIG = '~/.config/pi-superagent/config.toml'
 WINDOWS = os.name == 'nt'
 
 log = logging.getLogger('superagent')
+LOG_FORMAT = '%(asctime)s %(levelname)s %(message)s'
 
 
 class ConfigError(Exception):
@@ -114,6 +116,25 @@ def install_stop_handlers(loop, stop):
 def cmd_run(cfg, args):
     if not cfg.token:
         raise ConfigError(f'environment variable {cfg.token_env} is not set (the bot account\'s GitHub token)')
+    log_file = attach_log_file(cfg)
+    try:
+        return _run(cfg)
+    finally:
+        logging.getLogger().removeHandler(log_file)
+        log_file.close()
+
+
+def attach_log_file(cfg):
+    """Also write the service log to `cfg.log_path` (2 MB, 3 rotations) for the panel's worker log."""
+    os.makedirs(os.path.dirname(cfg.log_path), exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(cfg.log_path, maxBytes=2 * 1024 * 1024, backupCount=3,
+                                                   encoding='utf-8')
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    logging.getLogger().addHandler(handler)
+    return handler
+
+
+def _run(cfg):
     from .github import GitHub
     from .report import ReportServer
     from .service import Service
@@ -557,7 +578,7 @@ def parser():
 def main(argv=None):
     args = parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, stream=sys.stderr,
-                        format='%(asctime)s %(levelname)s %(message)s')
+                        format=LOG_FORMAT)
     try:
         cfg = None if args.command in NO_CONFIG else load_config(args.config)
         return COMMANDS[args.command](cfg, args)

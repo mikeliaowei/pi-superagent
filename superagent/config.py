@@ -151,6 +151,11 @@ class Config:
         return os.path.join(self.state_dir, 'superagent.sqlite')
 
     @property
+    def log_path(self):
+        """The service log `superagent run` writes (rotated: service.log.1, .2, .3); the panel reads it."""
+        return os.path.join(self.state_dir, 'logs', 'service.log')
+
+    @property
     def token(self):
         return os.environ.get(self.token_env, '')
 

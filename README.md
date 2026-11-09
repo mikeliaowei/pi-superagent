@@ -266,7 +266,8 @@ It verifies the config loads, the token variable is set, every repo's checkout i
 
 Ctrl+C (or SIGTERM) stops it gracefully: workers are closed and their Assignments stay "running" in the store, so
 the next `superagent run` relaunches them with a recovery note. Logs go to stderr, one line per event, with the
-Ticket's name; the token is never logged.
+Ticket's name, and to `<state_dir>/logs/service.log` (rotated at 2 MB, three old files kept as `service.log.1`..`.3`),
+which the panel's worker log reads; the token is never logged.
 
 ## Use it on GitHub
 
@@ -353,7 +354,9 @@ A local web panel shows what needs a person first, in the spirit of dsh-superage
 an answer, a review, or help after a block, failure or delivery error, each with its thread link and Stop / Retry
 buttons, plus an Answer box for a local Ticket waiting on a question and a New request form (the same as
 `superagent ask`). Its other tabs list Tickets (filter by stage, open/all, text; details show the mandate, assignments,
-request (a local Ticket's whole conversation) and every message for the worker, marked delivered or not), recent Triggers with the policy decision
+request (a local Ticket's whole conversation), every message for the worker, marked delivered or not, and a
+worker log: the Ticket's Pi session as a timeline of prompts, assistant text, tool calls with their arguments,
+trimmed tool results and errors, newest at the bottom, plus the service log lines for that Ticket), recent Triggers with the policy decision
 (`accept`, `stop`, `context`, `ignore`) and why it was made, and the loaded settings (whether the token is set,
 never its value). `superagent panel` replaces itself with Streamlit, so Ctrl+C or `kill` stops the panel completely
 (on Windows it runs Streamlit as a child, and Ctrl+C stops both).
@@ -365,6 +368,10 @@ Triggers recorded before reasons were kept show no reason.
 pip install -e ".[panel]"
 superagent panel            # http://127.0.0.1:8742, --port to change
 ```
+
+The worker log reads only the selected Ticket's files (`<state_dir>/sessions/*_<ticket-id>.jsonl`, the last 5 MB,
+and `<state_dir>/logs/service.log`) and masks strings that look like tokens or keys (GitHub, Anthropic, OpenAI,
+AWS, bearer tokens, private keys) before showing them; masking is pattern-based, so treat the panel as private anyway.
 
 It binds to 127.0.0.1 only and refreshes every 10 s. It reads the same database as `superagent run`; Stop and Retry
 record the same requests as `superagent stop|retry` (Answer and New request as `answer|ask`), which the running service applies at its next poll round.
