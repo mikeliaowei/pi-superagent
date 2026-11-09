@@ -1,8 +1,13 @@
 # pi-superagent
 
-A coding agent for one or more GitHub repositories. Mention its bot account on an issue or pull request, and it opens a
-Ticket, runs a [Pi](https://github.com/earendil-works/pi) worker in its own git worktree, asks you when it needs a
-decision, and delivers a pull request.
+[![tests](https://github.com/mikeliaowei/pi-superagent/actions/workflows/tests.yml/badge.svg)](https://github.com/mikeliaowei/pi-superagent/actions/workflows/tests.yml)
+
+A coding agent for one or more GitHub repositories. Mention its bot account on an issue or pull request, or ask it
+from your terminal, a [Pi](https://github.com/earendil-works/pi) chat or DSH, and it opens a Ticket, runs a Pi
+worker in its own git worktree, runs your tests, asks you when it needs a decision, and delivers a pull request.
+
+> **Status: early.** It works end to end, but workers run as your OS user with no container isolation. Point it at
+> test repositories you do not mind it touching, and read the [Safety model](#safety-model) first.
 
 This is a Python port of the design of DeepSeek's
 [dsh-superagent prototype](https://github.com/deepseek-ai/dsh-superagent-prototype) (MIT), moved from the DSH
@@ -64,15 +69,36 @@ policy, the effect queue and the "confirm once, then stay quiet" reply style com
 
 ## Install
 
-Python 3.11 or newer, standard library only.
+You need:
+
+- Python 3.11 or newer (the service uses only the standard library; the web panel needs `streamlit`).
+- git, and the [Pi coding agent](https://github.com/earendil-works/pi) signed in to at least one model provider
+  (`pi auth check --provider <name>`).
+- A GitHub account the agent can act as, with a token that can push to your repositories (see Setup).
 
 ```sh
+git clone https://github.com/mikeliaowei/pi-superagent.git
+cd pi-superagent
 python3 -m venv .venv
-.venv/bin/pip install -e .
+.venv/bin/pip install -e .              # add ".[panel]" for the web panel
 ```
 
 This installs `superagent` (the service and operator CLI) and `superagent-report` (what workers call) into the
 venv. Workers find `superagent-report` because the service puts its own `bin` directory first on their `PATH`.
+
+## Quick start
+
+```sh
+mkdir -p ~/.config/pi-superagent && cp config.example.toml ~/.config/pi-superagent/config.toml
+# edit it: [[repos]] name + checkout, agent_login, allowed, provider/model
+export SUPERAGENT_GITHUB_TOKEN=...      # never put the token in the config file
+.venv/bin/superagent check              # fix anything marked FAIL
+.venv/bin/superagent run                # leave running
+.venv/bin/superagent ask --repo owner/name "add a CONTRIBUTING.md"   # in another terminal
+.venv/bin/superagent panel              # http://127.0.0.1:8742
+```
+
+Each section below explains a step in detail.
 
 ## Setup
 
@@ -261,6 +287,16 @@ record the same requests as `superagent stop|retry` (Answer and New request as `
 - Rolling back to an earlier version: the database stays readable and writable by it, and Tickets that never used
   test retries, cross-repo parts or local requests load there unchanged. Tickets that did use them only load in
   this version or later.
+
+## Development
+
+```sh
+.venv/bin/pip install -e ".[panel]"
+.venv/bin/python -m unittest discover -s tests -t .
+```
+
+The tests use a fake Pi and a fake GitHub, real git in temporary directories, and no network. Issues and pull
+requests are welcome; please run the tests first. `odd/tasks/` holds the design log the project was built from.
 
 ## License
 
