@@ -67,7 +67,7 @@ class ConfigTest(unittest.TestCase):
     def test_single_repo_form_is_one_legacy_repo(self):
         c = self.load('[github]\nrepo = "o/r"\nagent_login = "bot"\n[policy]\nallowed = ["alice"]\n'
                       '[executor]\ncheckout = "~/src/r"\nbase_branch = "dev"\n')
-        self.assertEqual(c.repos, [RepoConfig('o/r', os.path.expanduser('~/src/r'), 'dev', '', 900, legacy=True)])
+        self.assertEqual(c.repos, [RepoConfig('o/r', os.path.normpath(os.path.expanduser('~/src/r')), 'dev', '', 900, legacy=True)])
         self.assertTrue(c.legacy)
         self.assertIs(c.repo_config('O/R'), c.repos[0])
         self.assertEqual((c.repo, c.checkout, c.base_branch, c.max_test_retries), ('o/r', c.repos[0].checkout, 'dev', 2))
@@ -76,8 +76,8 @@ class ConfigTest(unittest.TestCase):
         c = self.load(self.HEAD + '[executor]\nbase_branch = "dev"\nmax_test_retries = 3\n'
                       '[[repos]]\nname = "a/one"\ncheckout = "~/src/one"\ntest_command = "make test"\n'
                       '[[repos]]\nname = "b/two"\ncheckout = "/src/two"\nbase_branch = "main"\ntest_timeout = 60\n')
-        self.assertEqual(c.repos, [RepoConfig('a/one', os.path.expanduser('~/src/one'), 'dev', 'make test', 900),
-                                   RepoConfig('b/two', '/src/two', 'main', '', 60)])
+        self.assertEqual(c.repos, [RepoConfig('a/one', os.path.normpath(os.path.expanduser('~/src/one')), 'dev', 'make test', 900),
+                                   RepoConfig('b/two', os.path.normpath('/src/two'), 'main', '', 60)])
         self.assertFalse(c.legacy)
         self.assertEqual((c.max_test_retries, c.repo_config('B/Two').name), (3, 'b/two'))
         with self.assertRaisesRegex(ValueError, 'x/y is not configured'):

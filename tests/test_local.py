@@ -1,6 +1,7 @@
 """Local requests (S15): `superagent ask/show/answer`, the local outbox, and the Pi skill and prompt template."""
 
 import asyncio
+import gc
 import getpass
 import io
 import json
@@ -46,6 +47,7 @@ class CliBase(unittest.TestCase):
         return write(os.path.join(self.tmp, 'config.toml'), text)
 
     def cli(self, *argv):
+        gc.collect()  # unclosed objects left by earlier tests warn now, not inside the captured stderr below
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
             code = cli.main(['--config', self.config, *argv])

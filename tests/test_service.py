@@ -170,8 +170,10 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         await self.svc.run_effects()
         await self.round()  # a second poll sees the same issue and the agent's own ack: nothing new
         self.assertEqual(len(self.store.tickets()), 1)
-        self.assertEqual(len(self.gh.posted(n)), 1)
-        self.assertNotIn('\n\n', self.gh.posted(n)[0].split('<!--')[0].strip())  # one short sentence
+        # The fast fake worker may already have delivered (a PR-link reply); what matters is one ack.
+        acks = [c for c in self.gh.posted(n) if c.startswith('On it')]
+        self.assertEqual(len(acks), 1)
+        self.assertNotIn('\n\n', acks[0].split('<!--')[0].strip())  # one short sentence
         await until(lambda: pi.runs and pi.runs[0].messages)
         t = self.store.ticket(t.id)
         self.assertEqual(pi.runs[0].session_id(), t.id)
