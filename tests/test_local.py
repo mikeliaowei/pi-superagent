@@ -22,6 +22,7 @@ from tests.fake_github import FakeGitHub, FakeGitHubs
 from tests.test_crossrepo import commit_in
 from tests.test_multirepo import ServiceBase, make_clone, write
 from tests.test_service import GIT_ENV, Pi, until
+from tests import toml_path
 
 WAITING = {'report': {'status': 'waiting', 'summary': 'Need a choice.', 'question': 'Which database?'}}
 
@@ -40,8 +41,8 @@ class CliBase(unittest.TestCase):
     def write_config(self, repos, local_user=None):
         text = (f'[github]\nagent_login = "bot"\ntoken_env = "SA_LOCAL_TOKEN"\n[policy]\nallowed = ["alice"]\n'
                 + (f'local_user = "{local_user}"\n' if local_user else '')
-                + f'[service]\nstate_dir = "{self.state}"\nreport_port = 0\n'
-                + ''.join(f'[[repos]]\nname = "{r}"\ncheckout = "{self.tmp}/{r.split("/")[1]}"\n' for r in repos))
+                + f'[service]\nstate_dir = "{toml_path(self.state)}"\nreport_port = 0\n'
+                + ''.join(f'[[repos]]\nname = "{r}"\ncheckout = "{toml_path(self.tmp)}/{r.split("/")[1]}"\n' for r in repos))
         return write(os.path.join(self.tmp, 'config.toml'), text)
 
     def cli(self, *argv):
@@ -476,7 +477,7 @@ class CliCloseTest(unittest.TestCase):
         config = os.path.join(tmp, 'config.toml')
         with open(config, 'w') as f:
             f.write(f'[github]\nrepo = "o/r"\nagent_login = "bot"\n[policy]\nallowed = ["alice"]\n'
-                    f'[executor]\ncheckout = "{tmp}/co"\n[service]\nstate_dir = "{tmp}/state"\n')
+                    f'[executor]\ncheckout = "{toml_path(tmp)}/co"\n[service]\nstate_dir = "{toml_path(tmp)}/state"\n')
         opened = []
         real = cli.open_store
 

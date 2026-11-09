@@ -26,6 +26,7 @@ from superagent.report import ReportServer
 from superagent.service import Service
 from superagent.store import Store
 from tests.fake_github import FakeGitHub
+from tests import toml_path
 
 FAKE_PI = os.path.join(os.path.dirname(__file__), 'fake_pi.py')
 TOKEN = 'ghp_TESTTOKEN_must_never_leak_123'
@@ -522,8 +523,8 @@ class CliTest(unittest.TestCase):
         with open(self.config, 'w') as f:
             f.write(f'[github]\nrepo = "o/r"\nagent_login = "bot"\ntoken_env = "SA_TEST_TOKEN"\n'
                     f'[policy]\nallowed = ["alice"]\n'
-                    f'[executor]\ncheckout = "{self.tmp}/checkout"\npi = "{self.tmp}/no-pi"\n'
-                    f'[service]\nstate_dir = "{self.tmp}/state"\nreport_port = 0\n')
+                    f'[executor]\ncheckout = "{toml_path(self.tmp)}/checkout"\npi = "{toml_path(self.tmp)}/no-pi"\n'
+                    f'[service]\nstate_dir = "{toml_path(self.tmp)}/state"\nreport_port = 0\n')
 
     def cli(self, *argv, env=None):
         out, err = io.StringIO(), io.StringIO()

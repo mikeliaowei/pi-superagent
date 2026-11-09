@@ -25,6 +25,7 @@ from superagent.service import Service
 from superagent.store import Store
 from tests.fake_github import FakeGitHub, FakeGitHubs
 from tests.test_service import GIT_ENV, TOKEN, Git, Pi, git, until
+from tests import toml_path
 
 NOW = datetime(2026, 11, 8, 13, tzinfo=timezone.utc)
 
@@ -107,9 +108,9 @@ class CheckTest(unittest.TestCase):
             good = make_clone(tmp, 'one')
         config = write(os.path.join(tmp, 'c.toml'),
                        f'[github]\nagent_login = "bot"\ntoken_env = "SA_TEST_TOKEN"\n[policy]\nallowed = ["alice"]\n'
-                       f'[executor]\npi = "{tmp}/no-pi"\n[service]\nstate_dir = "{tmp}/state"\nreport_port = 0\n'
-                       f'[[repos]]\nname = "a/one"\ncheckout = "{good}"\n'
-                       f'[[repos]]\nname = "b/two"\ncheckout = "{tmp}/missing"\n')
+                       f'[executor]\npi = "{toml_path(tmp)}/no-pi"\n[service]\nstate_dir = "{toml_path(tmp)}/state"\nreport_port = 0\n'
+                       f'[[repos]]\nname = "a/one"\ncheckout = "{toml_path(good)}"\n'
+                       f'[[repos]]\nname = "b/two"\ncheckout = "{toml_path(tmp)}/missing"\n')
         out = io.StringIO()
         with mock.patch.dict(os.environ, {'SA_TEST_TOKEN': 'x'}), redirect_stdout(out), redirect_stderr(io.StringIO()):
             code = cli.main(['--config', config, 'check'])
@@ -275,7 +276,7 @@ class MultiRepoServiceTest(ServiceBase):
         self.assertEqual(cli.status_data(cfg, self.store)['repos'], ['a/one', 'b/two'])
         self.assertEqual(cli._row(self.store.ticket('tk-1'), cfg)['repo'], 'b/two')
         cfg_path = write(os.path.join(self.tmp, 'c.toml'),
-                         f'[github]\nagent_login = "bot"\n[policy]\nallowed = ["a"]\n[service]\nstate_dir = "{self.state}"\n'
+                         f'[github]\nagent_login = "bot"\n[policy]\nallowed = ["a"]\n[service]\nstate_dir = "{toml_path(self.state)}"\n'
                          f'[[repos]]\nname = "a/one"\ncheckout = "/x"\n[[repos]]\nname = "b/two"\ncheckout = "/y"\n')
         out = io.StringIO()
         with redirect_stdout(out), redirect_stderr(io.StringIO()):
