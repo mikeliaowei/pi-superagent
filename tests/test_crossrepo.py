@@ -80,7 +80,7 @@ class CrossRepoTest(ServiceBase):
         msg = self.pi.runs[0].messages[0]
         for part in t.parts:
             self.assertIn(part['repo'], msg)
-            self.assertIn(part['worktree'], msg)
+            self.assertIn(json.dumps(part['worktree'])[1:-1], msg)  # the message is JSON: Windows backslashes are escaped
         self.assertIn('"base_branch": "main"', msg)
         self.assertIn('commit in each repo you change', msg)
         self.assertEqual(len(self.store.tickets()), 1)
@@ -136,7 +136,8 @@ class CrossRepoTest(ServiceBase):
         self.assertEqual(self.two.posted(), [])
         dirs = sorted(next(a for a in argv if a.startswith('--git-dir=')) for argv, _ in self.git.pushes)
         self.assertEqual([re.sub(r'\.git\.\w+$', '.git', d) for d in dirs],
-                         [f'--git-dir={self.state}/push/a__one.git', f'--git-dir={self.state}/push/b__two.git'])
+                         [f"--git-dir={os.path.join(self.state, 'push', 'a__one.git')}",
+                          f"--git-dir={os.path.join(self.state, 'push', 'b__two.git')}"])
         self.assertFalse(any(os.path.exists(d.split('=', 1)[1]) for d in dirs))  # each fresh push repo is removed
         self.assertEqual(len(self.effect_keys('test')), 1)
 

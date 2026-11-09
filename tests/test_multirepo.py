@@ -117,9 +117,10 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(code, 1)
         lines = out.getvalue().splitlines()
         self.assertEqual(lines[0], 'ok    config loads: a/one, b/two as bot')
-        self.assertIn(f'ok    checkout: {good} is a git repo with origin {tmp}/one.git', lines)
-        self.assertIn(f'FAIL  checkout: {tmp}/missing is not a git clone with an origin remote; '
-                      f'run `git clone https://github.com/b/two.git {tmp}/missing`', lines)
+        self.assertIn(f'ok    checkout: {os.path.normpath(good)} is a git repo with origin {os.path.join(tmp, "one.git")}', lines)
+        missing = os.path.join(tmp, 'missing')
+        self.assertIn(f'FAIL  checkout: {missing} is not a git clone with an origin remote; '
+                      f'run `git clone https://github.com/b/two.git {missing}`', lines)
 
 
 class PollTest(unittest.TestCase):
@@ -262,8 +263,8 @@ class MultiRepoServiceTest(ServiceBase):
         self.assertEqual(other.posted(), [])
         pushes = sorted((argv[-2], re.sub(r'\.git\.\w+$', '.git', next(a for a in argv if a.startswith('--git-dir='))))
                         for argv, _ in self.git.pushes)
-        self.assertEqual(pushes, [('https://github.com/a/one.git', f"--git-dir={self.state}/push/a__one.git"),
-                                  ('https://github.com/b/two.git', f"--git-dir={self.state}/push/b__two.git")])
+        self.assertEqual(pushes, [('https://github.com/a/one.git', f"--git-dir={os.path.join(self.state, 'push', 'a__one.git')}"),
+                                  ('https://github.com/b/two.git', f"--git-dir={os.path.join(self.state, 'push', 'b__two.git')}")])
 
         two.merge(tb.pr_number)
         await self.svc.check_pulls()

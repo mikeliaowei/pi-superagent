@@ -29,6 +29,12 @@ def resolve_pi(path, default, windows, which):
     return path, ''
 
 
+
+def local_path(path):
+    """A config path in this OS's form: `~` expanded and separators normalized, so Windows never mixes `/` and `\\`
+    (config files use forward slashes there, since backslashes are escapes in TOML strings)."""
+    return os.path.normpath(os.path.expanduser(path))
+
 @dataclass
 class RepoConfig:
     """One repository the service works in."""
@@ -79,9 +85,9 @@ class Config:
                 self.local_user = getpass.getuser()
             except (OSError, KeyError):
                 self.local_user = 'local'
-        self.state_dir = os.path.expanduser(self.state_dir)
-        self.work_dir = os.path.expanduser(self.work_dir or os.path.join(self.state_dir, 'work'))
-        self.checkout = os.path.expanduser(self.checkout) if self.checkout else ''
+        self.state_dir = local_path(self.state_dir)
+        self.work_dir = local_path(self.work_dir or os.path.join(self.state_dir, 'work'))
+        self.checkout = local_path(self.checkout) if self.checkout else ''
         self.pi, self.pi_note = resolve_pi(os.path.expanduser(self.pi), self.pi == DEFAULT_PI, WINDOWS,
                                            shutil.which)
         if self.repos is None:
@@ -112,7 +118,7 @@ class Config:
             if not r.checkout:
                 raise ValueError(f'repo {r.name} needs a checkout')
             seen.add(r.name.lower())
-            r.checkout, r.legacy = os.path.expanduser(r.checkout), False
+            r.checkout, r.legacy = local_path(r.checkout), False
             repos.append(r)
         return repos
 

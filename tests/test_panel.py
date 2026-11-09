@@ -220,7 +220,7 @@ class PanelAppTest(unittest.TestCase):
         values = dict(zip(settings['setting'], settings['value']))
         self.assertEqual(values['repos'], 'a/one, b/two')
         self.assertEqual(values['test command (b/two)'], 'make check')
-        self.assertEqual(values['checkout (a/one)'], f'{self.tmp}/one')
+        self.assertEqual(values['checkout (a/one)'], os.path.join(self.tmp, 'one'))
 
     def test_a_cross_repo_ticket_shows_every_repo_and_pr_link(self):
         with open(self.config, 'w') as f:

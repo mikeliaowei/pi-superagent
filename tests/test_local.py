@@ -52,7 +52,10 @@ class CliBase(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def store(self):
-        return Store(os.path.join(self.state, 'superagent.sqlite'))
+        # Closed by the test: an unclosed connection's ResourceWarning would land in a CLI call's captured stderr.
+        store = Store(os.path.join(self.state, 'superagent.sqlite'))
+        self.addCleanup(store.close)
+        return store
 
 
 class AskTest(CliBase):
@@ -438,7 +441,7 @@ class PiInstallTest(unittest.TestCase):
         config = os.path.join(self.tmp, 'my config.toml')
         code, _, _ = self.run_cli('--config', config, 'pi-install', env={'PI_CODING_AGENT_DIR': self.agent})
         self.assertEqual(code, 0)
-        self.assertIn(f"--config '{config}'", self.read(self.skill))
+        self.assertIn(f"--config '{toml_path(config) if os.name == 'nt' else config}'", self.read(self.skill))  # forward slashes on Windows
 
     def test_a_foreign_file_is_refused_unless_forced(self):
         os.makedirs(os.path.dirname(self.prompt))
