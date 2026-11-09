@@ -6,7 +6,9 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -23,6 +25,7 @@ from superagent.service import Service
 from superagent.store import Store
 from tests.fake_github import FakeGitHub, FakeGitHubs
 from tests.test_service import GIT_ENV, TOKEN, Git, Pi, git, until
+from tests import toml_path
 
 NOW = datetime(2026, 11, 8, 13, tzinfo=timezone.utc)
 
@@ -31,6 +34,12 @@ def write(path, text):
     with open(path, 'w') as f:
         f.write(text)
     return path
+
+
+def py_command(tmp, name, code):
+    """A test_command running `code` with this Python. The same command line works in sh and in cmd.exe."""
+    script = write(os.path.join(tmp, f'{name}.py'), textwrap.dedent(code))
+    return f'"{sys.executable}" "{script}"'
 
 
 def make_clone(tmp, slug):
@@ -58,7 +67,7 @@ class ConfigTest(unittest.TestCase):
     def test_single_repo_form_is_one_legacy_repo(self):
         c = self.load('[github]\nrepo = "o/r"\nagent_login = "bot"\n[policy]\nallowed = ["alice"]\n'
                       '[executor]\ncheckout = "~/src/r"\nbase_branch = "dev"\n')
-        self.assertEqual(c.repos, [RepoConfig('o/r', os.path.expanduser('~/src/r'), 'dev', '', 900, legacy=True)])
+        self.assertEqual(c.repos, [RepoConfig('o/r', os.path.normpath(os.path.expanduser('~/src/r')), 'dev', '', 900, legacy=True)])
         self.assertTrue(c.legacy)
         self.assertIs(c.repo_config('O/R'), c.repos[0])
         self.assertEqual((c.repo, c.checkout, c.base_branch, c.max_test_retries), ('o/r', c.repos[0].checkout, 'dev', 2))
@@ -67,8 +76,8 @@ class ConfigTest(unittest.TestCase):
         c = self.load(self.HEAD + '[executor]\nbase_branch = "dev"\nmax_test_retries = 3\n'
                       '[[repos]]\nname = "a/one"\ncheckout = "~/src/one"\ntest_command = "make test"\n'
                       '[[repos]]\nname = "b/two"\ncheckout = "/src/two"\nbase_branch = "main"\ntest_timeout = 60\n')
-        self.assertEqual(c.repos, [RepoConfig('a/one', os.path.expanduser('~/src/one'), 'dev', 'make test', 900),
-                                   RepoConfig('b/two', '/src/two', 'main', '', 60)])
+        self.assertEqual(c.repos, [RepoConfig('a/one', os.path.normpath(os.path.expanduser('~/src/one')), 'dev', 'make test', 900),
+                                   RepoConfig('b/two', os.path.normpath('/src/two'), 'main', '', 60)])
         self.assertFalse(c.legacy)
         self.assertEqual((c.max_test_retries, c.repo_config('B/Two').name), (3, 'b/two'))
         with self.assertRaisesRegex(ValueError, 'x/y is not configured'):
@@ -99,18 +108,19 @@ class CheckTest(unittest.TestCase):
             good = make_clone(tmp, 'one')
         config = write(os.path.join(tmp, 'c.toml'),
                        f'[github]\nagent_login = "bot"\ntoken_env = "SA_TEST_TOKEN"\n[policy]\nallowed = ["alice"]\n'
-                       f'[executor]\npi = "{tmp}/no-pi"\n[service]\nstate_dir = "{tmp}/state"\nreport_port = 0\n'
-                       f'[[repos]]\nname = "a/one"\ncheckout = "{good}"\n'
-                       f'[[repos]]\nname = "b/two"\ncheckout = "{tmp}/missing"\n')
+                       f'[executor]\npi = "{toml_path(tmp)}/no-pi"\n[service]\nstate_dir = "{toml_path(tmp)}/state"\nreport_port = 0\n'
+                       f'[[repos]]\nname = "a/one"\ncheckout = "{toml_path(good)}"\n'
+                       f'[[repos]]\nname = "b/two"\ncheckout = "{toml_path(tmp)}/missing"\n')
         out = io.StringIO()
         with mock.patch.dict(os.environ, {'SA_TEST_TOKEN': 'x'}), redirect_stdout(out), redirect_stderr(io.StringIO()):
             code = cli.main(['--config', config, 'check'])
         self.assertEqual(code, 1)
         lines = out.getvalue().splitlines()
         self.assertEqual(lines[0], 'ok    config loads: a/one, b/two as bot')
-        self.assertIn(f'ok    checkout: {good} is a git repo with origin {tmp}/one.git', lines)
-        self.assertIn(f'FAIL  checkout: {tmp}/missing is not a git clone with an origin remote; '
-                      f'run `git clone https://github.com/b/two.git {tmp}/missing`', lines)
+        self.assertIn(f'ok    checkout: {os.path.normpath(good)} is a git repo with origin {os.path.join(tmp, "one.git")}', lines)
+        missing = os.path.join(tmp, 'missing')
+        self.assertIn(f'FAIL  checkout: {missing} is not a git clone with an origin remote; '
+                      f'run `git clone https://github.com/b/two.git {missing}`', lines)
 
 
 class PollTest(unittest.TestCase):
@@ -253,8 +263,8 @@ class MultiRepoServiceTest(ServiceBase):
         self.assertEqual(other.posted(), [])
         pushes = sorted((argv[-2], re.sub(r'\.git\.\w+$', '.git', next(a for a in argv if a.startswith('--git-dir='))))
                         for argv, _ in self.git.pushes)
-        self.assertEqual(pushes, [('https://github.com/a/one.git', f"--git-dir={self.state}/push/a__one.git"),
-                                  ('https://github.com/b/two.git', f"--git-dir={self.state}/push/b__two.git")])
+        self.assertEqual(pushes, [('https://github.com/a/one.git', f"--git-dir={os.path.join(self.state, 'push', 'a__one.git')}"),
+                                  ('https://github.com/b/two.git', f"--git-dir={os.path.join(self.state, 'push', 'b__two.git')}")])
 
         two.merge(tb.pr_number)
         await self.svc.check_pulls()
@@ -267,7 +277,7 @@ class MultiRepoServiceTest(ServiceBase):
         self.assertEqual(cli.status_data(cfg, self.store)['repos'], ['a/one', 'b/two'])
         self.assertEqual(cli._row(self.store.ticket('tk-1'), cfg)['repo'], 'b/two')
         cfg_path = write(os.path.join(self.tmp, 'c.toml'),
-                         f'[github]\nagent_login = "bot"\n[policy]\nallowed = ["a"]\n[service]\nstate_dir = "{self.state}"\n'
+                         f'[github]\nagent_login = "bot"\n[policy]\nallowed = ["a"]\n[service]\nstate_dir = "{toml_path(self.state)}"\n'
                          f'[[repos]]\nname = "a/one"\ncheckout = "/x"\n[[repos]]\nname = "b/two"\ncheckout = "/y"\n')
         out = io.StringIO()
         with redirect_stdout(out), redirect_stderr(io.StringIO()):
@@ -360,8 +370,14 @@ class EnforcedTestsTest(ServiceBase):
     async def test_passing_tests_deliver_with_a_pr_line_and_run_with_the_worker_environment(self):
         seen = os.path.join(self.tmp, 'seen')
         os.makedirs(seen)
-        self.start(f'env > {seen}/env; pwd > {seen}/pwd; echo all good',
-                   {'commit': True, 'report': {'status': 'ready', 'summary': 'Fixed.'}})
+        self.start(py_command(self.tmp, 'dump', f'''
+            import os
+            with open({os.path.join(seen, 'env')!r}, 'w') as f:
+                f.writelines(f'{{k}}={{v}}\\n' for k, v in os.environ.items())
+            with open({os.path.join(seen, 'pwd')!r}, 'w') as f:
+                f.write(os.getcwd())
+            print('all good')
+            '''), {'commit': True, 'report': {'status': 'ready', 'summary': 'Fixed.'}})
         await self.round()
         await self.drain()
         t = self.store.tickets()[0]
@@ -380,7 +396,14 @@ class EnforcedTestsTest(ServiceBase):
     async def test_failing_tests_open_no_pr_and_resume_the_same_session_with_the_output_tail(self):
         def fix(cwd, env):
             write(os.path.join(cwd, 'ok.txt'), 'ok\n')
-        self.start("test -f ok.txt || { printf '%s-%s\\n' first line; seq 1 3000; exit 3; }",
+        self.start(py_command(self.tmp, 'check', '''
+            import os, sys
+            if not os.path.exists('ok.txt'):
+                print('first' + '-line')
+                for i in range(1, 3001):
+                    print(i)
+                sys.exit(3)
+            '''),
                    {'commit': True, 'report': {'status': 'ready', 'summary': 'Fixed.'}},
                    {'before': fix, 'report': {'status': 'ready', 'summary': 'Fixed the tests.'}})
         await self.round()
@@ -393,7 +416,7 @@ class EnforcedTestsTest(ServiceBase):
         self.assertIn('exit code 3', msg)
         self.assertIn('2999\n3000', msg)
         self.assertNotIn('first-line', msg)  # only the tail
-        self.assertLess(len(msg), 3600)
+        self.assertLess(len(msg) - 2 * len(self.command), 3460)  # the tail is capped; the command appears twice
         self.assertEqual(len(self.gh.pulls), 1)  # only after the fix
         self.assertEqual(len(self.git.pushes), 1)
         self.assertEqual(self.gh.pulls[t.pr_number]['body'].count('Tests:'), 1)
@@ -405,22 +428,28 @@ class EnforcedTestsTest(ServiceBase):
 
     async def test_tests_still_failing_after_the_retries_block_the_ticket_honestly(self):
         ready = {'report': {'status': 'ready', 'summary': 'Fixed.'}}
-        self.start('echo nope; exit 1', {'commit': True, **ready}, dict(ready), dict(ready))
+        self.start(py_command(self.tmp, 'nope', 'print("nope"); raise SystemExit(1)'),
+                   {'commit': True, **ready}, dict(ready), dict(ready))
         await self.round()
         await self.drain()
         t = self.store.tickets()[0]
         self.assertEqual(len(self.pi.runs), 3)  # the first try plus max_test_retries (2) fixes
         self.assertEqual(len(self.effect_keys('test')), 3)
-        self.assertEqual((t.current.report, t.current.summary), ('blocked', 'tests still failing: echo nope; exit 1'))
+        self.assertEqual((t.current.report, t.current.summary), ('blocked', f'tests still failing: {self.command}'))
         self.assertEqual((stage(t), t.test_failures, t.pr_number), ('person/blocked', 3, None))
         self.assertEqual((self.gh.pulls, self.git.pushes), ({}, []))
         posted = [p.split('<!--')[0].strip() for p in self.gh.posted(self.n)]
         self.assertEqual(len(posted), 2)
         self.assertIn('tests still failing', posted[1])
-        self.assertIn('echo nope; exit 1', posted[1])
+        self.assertIn(self.command, posted[1])
 
     async def test_a_test_command_that_runs_too_long_is_killed_and_reported_as_a_timeout(self):
-        self.start('echo started; sleep 30 & wait', {'commit': True, 'report': {'status': 'ready', 'summary': 'x'}},
+        # The command leaves a child running: the kill must end the whole group (process tree on Windows).
+        self.start(py_command(self.tmp, 'slow', '''
+            import subprocess, sys
+            print('started', flush=True)
+            subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']).wait()
+            '''), {'commit': True, 'report': {'status': 'ready', 'summary': 'x'}},
                    {'report': {'status': 'blocked', 'summary': 'cannot speed it up'}}, test_timeout=1)
         began = time.monotonic()
         await self.round()

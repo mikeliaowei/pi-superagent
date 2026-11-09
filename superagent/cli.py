@@ -25,6 +25,7 @@ from . import config as config_mod
 from .model import named_repos, stage
 
 DEFAULT_CONFIG = '~/.config/pi-superagent/config.toml'
+WINDOWS = os.name == 'nt'
 
 log = logging.getLogger('superagent')
 
@@ -76,6 +77,38 @@ def pr_urls(t):
     return [f'https://github.com/{t.repo}/pull/{t.pr_number}'] if t.pr_number else []
 
 
+def install_stop_handlers(loop, stop):
+    """Set `stop` on Ctrl+C (and SIGTERM), so `run` closes its workers before it exits. Returns a function that
+    undoes it.
+
+    The loop's own signal handlers are POSIX-only; on Windows (NotImplementedError) a plain signal handler sets the
+    event through the loop instead, for SIGINT and Ctrl+Break."""
+    undo = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+            undo.append(lambda sig=sig: loop.remove_signal_handler(sig))
+        except (NotImplementedError, RuntimeError):
+            if sig == signal.SIGTERM:
+                continue  # Windows cannot deliver SIGTERM to a console program
+            for s in (signal.SIGINT, getattr(signal, 'SIGBREAK', None)):
+                if s is None:
+                    continue
+                try:
+                    previous = signal.signal(s, lambda *_: loop.call_soon_threadsafe(stop.set))
+                except ValueError:  # not the main thread
+                    continue
+                undo.append(lambda s=s, previous=previous: signal.signal(s, previous))
+
+    def restore():
+        for u in reversed(undo):
+            try:
+                u()
+            except (ValueError, RuntimeError):
+                pass
+    return restore
+
+
 # Commands
 
 def cmd_run(cfg, args):
@@ -90,12 +123,7 @@ def cmd_run(cfg, args):
 
     async def main():
         stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, stop.set)
-            except (NotImplementedError, RuntimeError):
-                pass
+        restore = install_stop_handlers(asyncio.get_running_loop(), stop)
         holder = {}
         try:
             server = ReportServer(lambda tok: holder['svc'].lookup(tok),
@@ -109,6 +137,7 @@ def cmd_run(cfg, args):
             await svc.run_forever(stop)
         finally:
             server.close()
+            restore()
         log.info('superagent stopped')
 
     asyncio.run(main())
@@ -332,12 +361,20 @@ PI_FILES = (('pi/superagent/SKILL.md', ('skills', 'superagent', 'SKILL.md')), ('
 
 
 def superagent_command():
-    """The absolute command that runs this `superagent`, shell-quoted."""
-    here = sys.argv[0] if os.path.basename(sys.argv[0]) == 'superagent' else None
-    for c in (here, os.path.join(os.path.dirname(sys.executable), 'superagent'), shutil.which('superagent')):
+    """The absolute command that runs this `superagent`, shell-quoted. On Windows it is superagent.exe, written with
+    forward slashes so it works unquoted in Pi's bash and in cmd.exe alike."""
+    names = ('superagent', 'superagent.exe') if WINDOWS else ('superagent',)
+    base = os.path.basename(sys.argv[0])
+    here = sys.argv[0] if (base.lower() if WINDOWS else base) in names else None
+    found = [os.path.join(os.path.dirname(sys.executable), n) for n in names]
+    for c in (here, *found, shutil.which('superagent')):
         if c and os.path.isfile(c) and os.access(c, os.X_OK):
-            return shlex.quote(os.path.abspath(c))
-    return f'{shlex.quote(sys.executable)} -m superagent.cli'
+            return shlex.quote(_path(os.path.abspath(c)))
+    return f'{shlex.quote(_path(sys.executable))} -m superagent.cli'
+
+
+def _path(p):
+    return p.replace('\\', '/') if WINDOWS else p
 
 
 def cmd_pi_install(cfg, args):
@@ -372,7 +409,7 @@ def cmd_pi_install(cfg, args):
     command = superagent_command()
     config = os.path.abspath(os.path.expanduser(args.config))
     if config != os.path.abspath(os.path.expanduser(DEFAULT_CONFIG)):
-        command += f' --config {shlex.quote(config)}'
+        command += f' --config {shlex.quote(_path(config))}'
     skill_path = files[0][1]
     for src, dst in files:
         with open(src, encoding='utf-8') as f:
@@ -403,10 +440,26 @@ def cmd_panel(cfg, args):
     env = {**os.environ, 'SUPERAGENT_CONFIG': os.path.abspath(os.path.expanduser(args.config))}
     print(f'superagent panel on http://127.0.0.1:{args.port} (Ctrl+C to stop)', file=sys.stderr)
     sys.stderr.flush()
+    argv = [sys.executable, '-m', 'streamlit', 'run', panel, '--server.address', '127.0.0.1',
+            '--server.port', str(args.port), '--server.headless', 'true', '--browser.gatherUsageStats', 'false']
+    if WINDOWS:
+        return _run_child(argv, env)
     # Replace this process instead of starting a child, so Ctrl+C and kill reach streamlit directly.
-    os.execve(sys.executable, [sys.executable, '-m', 'streamlit', 'run', panel, '--server.address', '127.0.0.1',
-                               '--server.port', str(args.port), '--server.headless', 'true',
-                               '--browser.gatherUsageStats', 'false'], env)
+    os.execve(sys.executable, argv, env)
+
+
+def _run_child(argv, env, grace=10):
+    """Windows has no exec: run streamlit as a child and return its exit code. Ctrl+C reaches every process in the
+    console, so on Ctrl+C the child stops by itself; it is killed only if it has not after `grace` seconds."""
+    child = subprocess.Popen(argv, env=env)
+    try:
+        return child.wait()
+    except KeyboardInterrupt:
+        try:
+            return child.wait(timeout=grace)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            child.kill()
+            return child.wait()
 
 
 def cmd_check(cfg, args):
@@ -441,8 +494,10 @@ def cmd_check(cfg, args):
             version = (r.stdout or r.stderr).strip().splitlines()[0] if r.returncode == 0 else None
         except (OSError, subprocess.TimeoutExpired, IndexError):
             version = None
-    check(bool(version), f'pi: {cfg.pi} ({version})',
-          f'pi: {cfg.pi} is missing or `pi --version` fails; install Pi or set executor.pi in the config')
+    note = getattr(cfg, 'pi_note', '')  # Windows: the pi found on PATH instead of the configured path
+    check(bool(version), f'pi: {cfg.pi} ({version}' + (f'; {note})' if note else ')'),
+          f'pi: {cfg.pi}' + (f' ({note})' if note else '')
+          + ' is missing or `pi --version` fails; install Pi or set executor.pi in the config')
     free = True
     if cfg.report_port:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

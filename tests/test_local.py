@@ -1,6 +1,7 @@
 """Local requests (S15): `superagent ask/show/answer`, the local outbox, and the Pi skill and prompt template."""
 
 import asyncio
+import gc
 import getpass
 import io
 import json
@@ -22,6 +23,7 @@ from tests.fake_github import FakeGitHub, FakeGitHubs
 from tests.test_crossrepo import commit_in
 from tests.test_multirepo import ServiceBase, make_clone, write
 from tests.test_service import GIT_ENV, Pi, until
+from tests import toml_path
 
 WAITING = {'report': {'status': 'waiting', 'summary': 'Need a choice.', 'question': 'Which database?'}}
 
@@ -40,18 +42,22 @@ class CliBase(unittest.TestCase):
     def write_config(self, repos, local_user=None):
         text = (f'[github]\nagent_login = "bot"\ntoken_env = "SA_LOCAL_TOKEN"\n[policy]\nallowed = ["alice"]\n'
                 + (f'local_user = "{local_user}"\n' if local_user else '')
-                + f'[service]\nstate_dir = "{self.state}"\nreport_port = 0\n'
-                + ''.join(f'[[repos]]\nname = "{r}"\ncheckout = "{self.tmp}/{r.split("/")[1]}"\n' for r in repos))
+                + f'[service]\nstate_dir = "{toml_path(self.state)}"\nreport_port = 0\n'
+                + ''.join(f'[[repos]]\nname = "{r}"\ncheckout = "{toml_path(self.tmp)}/{r.split("/")[1]}"\n' for r in repos))
         return write(os.path.join(self.tmp, 'config.toml'), text)
 
     def cli(self, *argv):
+        gc.collect()  # unclosed objects left by earlier tests warn now, not inside the captured stderr below
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
             code = cli.main(['--config', self.config, *argv])
         return code, out.getvalue(), err.getvalue()
 
     def store(self):
-        return Store(os.path.join(self.state, 'superagent.sqlite'))
+        # Closed by the test: an unclosed connection's ResourceWarning would land in a CLI call's captured stderr.
+        store = Store(os.path.join(self.state, 'superagent.sqlite'))
+        self.addCleanup(store.close)
+        return store
 
 
 class AskTest(CliBase):
@@ -437,7 +443,7 @@ class PiInstallTest(unittest.TestCase):
         config = os.path.join(self.tmp, 'my config.toml')
         code, _, _ = self.run_cli('--config', config, 'pi-install', env={'PI_CODING_AGENT_DIR': self.agent})
         self.assertEqual(code, 0)
-        self.assertIn(f"--config '{config}'", self.read(self.skill))
+        self.assertIn(f"--config '{toml_path(config) if os.name == 'nt' else config}'", self.read(self.skill))  # forward slashes on Windows
 
     def test_a_foreign_file_is_refused_unless_forced(self):
         os.makedirs(os.path.dirname(self.prompt))
@@ -476,7 +482,7 @@ class CliCloseTest(unittest.TestCase):
         config = os.path.join(tmp, 'config.toml')
         with open(config, 'w') as f:
             f.write(f'[github]\nrepo = "o/r"\nagent_login = "bot"\n[policy]\nallowed = ["alice"]\n'
-                    f'[executor]\ncheckout = "{tmp}/co"\n[service]\nstate_dir = "{tmp}/state"\n')
+                    f'[executor]\ncheckout = "{toml_path(tmp)}/co"\n[service]\nstate_dir = "{toml_path(tmp)}/state"\n')
         opened = []
         real = cli.open_store
 

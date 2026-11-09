@@ -15,6 +15,7 @@ from unittest import mock
 from superagent import cli
 from superagent.model import Assignment, Ticket, Trigger
 from superagent.store import Store
+from tests import toml_path
 
 try:
     import streamlit as st
@@ -67,8 +68,8 @@ class PanelAppTest(unittest.TestCase):
         with open(self.config, 'w') as f:
             f.write(f'[github]\nrepo = "o/r"\nagent_login = "bot"\ntoken_env = "SA_PANEL_TOKEN"\n'
                     f'[policy]\nallowed = ["alice"]\n'
-                    f'[executor]\ncheckout = "{self.tmp}/checkout"\nmax_workers = 3\n'
-                    f'[service]\nstate_dir = "{self.tmp}/state"\nreport_port = 0\n')
+                    f'[executor]\ncheckout = "{toml_path(self.tmp)}/checkout"\nmax_workers = 3\n'
+                    f'[service]\nstate_dir = "{toml_path(self.tmp)}/state"\nreport_port = 0\n')
         self.db = os.path.join(self.tmp, 'state', 'superagent.sqlite')
         self.now = datetime.now(timezone.utc)
 
@@ -202,9 +203,9 @@ class PanelAppTest(unittest.TestCase):
     def test_with_several_repos_tickets_show_their_repo_and_link_to_it(self):
         with open(self.config, 'w') as f:
             f.write(f'[github]\nagent_login = "bot"\ntoken_env = "SA_PANEL_TOKEN"\n[policy]\nallowed = ["alice"]\n'
-                    f'[service]\nstate_dir = "{self.tmp}/state"\nreport_port = 0\n'
-                    f'[[repos]]\nname = "a/one"\ncheckout = "{self.tmp}/one"\n'
-                    f'[[repos]]\nname = "b/two"\ncheckout = "{self.tmp}/two"\ntest_command = "make check"\n')
+                    f'[service]\nstate_dir = "{toml_path(self.tmp)}/state"\nreport_port = 0\n'
+                    f'[[repos]]\nname = "a/one"\ncheckout = "{toml_path(self.tmp)}/one"\n'
+                    f'[[repos]]\nname = "b/two"\ncheckout = "{toml_path(self.tmp)}/two"\ntest_command = "make check"\n')
         store = self.store()
         t = self.ticket(store, 'tk-1', 'fix-it', 4, report='ready', summary='Opened a PR')
         t.repo, t.thread_key, t.pr_number = 'b/two', 'github:b/two#4', 9
@@ -219,14 +220,14 @@ class PanelAppTest(unittest.TestCase):
         values = dict(zip(settings['setting'], settings['value']))
         self.assertEqual(values['repos'], 'a/one, b/two')
         self.assertEqual(values['test command (b/two)'], 'make check')
-        self.assertEqual(values['checkout (a/one)'], f'{self.tmp}/one')
+        self.assertEqual(values['checkout (a/one)'], os.path.join(self.tmp, 'one'))
 
     def test_a_cross_repo_ticket_shows_every_repo_and_pr_link(self):
         with open(self.config, 'w') as f:
             f.write(f'[github]\nagent_login = "bot"\ntoken_env = "SA_PANEL_TOKEN"\n[policy]\nallowed = ["alice"]\n'
-                    f'[service]\nstate_dir = "{self.tmp}/state"\nreport_port = 0\n'
-                    f'[[repos]]\nname = "a/one"\ncheckout = "{self.tmp}/one"\n'
-                    f'[[repos]]\nname = "b/two"\ncheckout = "{self.tmp}/two"\n')
+                    f'[service]\nstate_dir = "{toml_path(self.tmp)}/state"\nreport_port = 0\n'
+                    f'[[repos]]\nname = "a/one"\ncheckout = "{toml_path(self.tmp)}/one"\n'
+                    f'[[repos]]\nname = "b/two"\ncheckout = "{toml_path(self.tmp)}/two"\n')
         store = self.store()
         t = self.ticket(store, 'tk-1', 'fix-it', 4, report='ready', summary='Opened PRs')
         t.repo, t.thread_key, t.worktree = 'a/one', 'github:a/one#4', f'{self.tmp}/work/tickets/fix-it'
@@ -288,7 +289,7 @@ class PanelCommandTest(unittest.TestCase):
         self.config = os.path.join(self.tmp, 'config.toml')
         with open(self.config, 'w') as f:
             f.write(f'[github]\nrepo = "o/r"\nagent_login = "bot"\n[policy]\nallowed = ["alice"]\n'
-                    f'[executor]\ncheckout = "{self.tmp}/checkout"\n[service]\nstate_dir = "{self.tmp}/state"\n')
+                    f'[executor]\ncheckout = "{toml_path(self.tmp)}/checkout"\n[service]\nstate_dir = "{toml_path(self.tmp)}/state"\n')
 
     def cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -301,7 +302,7 @@ class PanelCommandTest(unittest.TestCase):
             s.bind(('127.0.0.1', 0))
             s.listen()
             port = s.getsockname()[1]
-            with mock.patch('superagent.cli.os.execve') as run:
+            with mock.patch('superagent.cli.os.execve') as run, mock.patch('superagent.cli.WINDOWS', False):
                 code, _, err = self.cli('panel', '--port', str(port))
         self.assertEqual(code, 1)
         self.assertIn(f'port {port} is in use', err)
@@ -309,7 +310,8 @@ class PanelCommandTest(unittest.TestCase):
         run.assert_not_called()
 
     def test_panel_without_streamlit_exits_2_with_the_install_hint(self):
-        with mock.patch.dict(sys.modules, {'streamlit': None}), mock.patch('superagent.cli.os.execve') as run:
+        with mock.patch.dict(sys.modules, {'streamlit': None}), mock.patch('superagent.cli.os.execve') as run, \
+                mock.patch('superagent.cli.WINDOWS', False):
             code, _, err = self.cli('panel')
         self.assertEqual(code, 2)
         self.assertIn('install the panel extra: pip install -e ".[panel]"', err)
@@ -317,8 +319,9 @@ class PanelCommandTest(unittest.TestCase):
 
     @unittest.skipIf(AppTest is None, 'streamlit is not installed')
     def test_panel_replaces_itself_with_streamlit_on_localhost_with_the_config(self):
-        # exec, not a child process: a SIGTERM to `superagent panel` then reaches streamlit itself.
-        with mock.patch('superagent.cli.os.execve') as execve:
+        # exec, not a child process: a SIGTERM to `superagent panel` then reaches streamlit itself. (Windows has no
+        # exec and runs a child instead: tests/test_windows.py.)
+        with mock.patch('superagent.cli.os.execve') as execve, mock.patch('superagent.cli.WINDOWS', False):
             self.cli('panel', '--port', '0')
         path, argv, env = execve.call_args.args
         self.assertEqual(path, sys.executable)

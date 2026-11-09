@@ -25,7 +25,8 @@ checkout = "~/src/your-repo"
 # work_dir = "~/.local/share/pi-superagent/work"
 # Branch pull requests target, and the worktrees start from (origin/<base_branch>).
 base_branch = "main"
-# The Pi binary.
+# The Pi binary. On Windows, if this path does not exist, the `pi` on PATH (e.g. npm's pi.cmd) is used; to pin one,
+# use forward slashes or single quotes: pi = 'C:\Users\me\AppData\Roaming\npm\pi.cmd'
 pi = "~/.pi/agent/bin/pi"
 # Model for workers. Always explicit: the user's Pi defaults are never used.
 provider = "anthropic"
@@ -56,7 +57,8 @@ report_port = 8741
 # name = "your-org/your-repo"
 # checkout = "~/src/your-repo"
 # base_branch = "main"            # default: [executor] base_branch
-# test_command = "make test"      # run with `sh -c` in the worktree before any pull request; default: none
+# test_command = "make test"      # run with `sh -c` (cmd.exe on Windows) in the worktree before any pull request;
+#                                 # default: none
 # test_timeout = 900              # seconds
 #
 # [[repos]]

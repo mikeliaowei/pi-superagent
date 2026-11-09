@@ -1,10 +1,18 @@
 [project]
 name = "pi-superagent"
 version = "0.1.0"
-description = "A proactive coding agent for one GitHub repository, running Pi workers (a Python port of dsh-superagent's ideas)"
+description = "A proactive coding agent for your GitHub repositories, running Pi workers (a Python port of dsh-superagent's design)"
 requires-python = ">=3.11"
 license = "MIT"
+readme = "README.md"
+authors = [{ name = "Wei Liao" }]
+keywords = ["coding-agent", "pi", "github", "automation", "llm"]
+
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/mikeliaowei/pi-superagent"
+Issues = "https://github.com/mikeliaowei/pi-superagent/issues"
 
 [project.optional-dependencies]
 panel = ["streamlit>=1.67", "pandas>=2"]

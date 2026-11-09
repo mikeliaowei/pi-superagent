@@ -26,6 +26,7 @@ from superagent.report import ReportServer
 from superagent.service import Service
 from superagent.store import Store
 from tests.fake_github import FakeGitHub
+from tests import toml_path
 
 FAKE_PI = os.path.join(os.path.dirname(__file__), 'fake_pi.py')
 TOKEN = 'ghp_TESTTOKEN_must_never_leak_123'
@@ -169,8 +170,10 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         await self.svc.run_effects()
         await self.round()  # a second poll sees the same issue and the agent's own ack: nothing new
         self.assertEqual(len(self.store.tickets()), 1)
-        self.assertEqual(len(self.gh.posted(n)), 1)
-        self.assertNotIn('\n\n', self.gh.posted(n)[0].split('<!--')[0].strip())  # one short sentence
+        # The fast fake worker may already have delivered (a PR-link reply); what matters is one ack.
+        acks = [c for c in self.gh.posted(n) if c.startswith('On it')]
+        self.assertEqual(len(acks), 1)
+        self.assertNotIn('\n\n', acks[0].split('<!--')[0].strip())  # one short sentence
         await until(lambda: pi.runs and pi.runs[0].messages)
         t = self.store.ticket(t.id)
         self.assertEqual(pi.runs[0].session_id(), t.id)
@@ -522,8 +525,8 @@ class CliTest(unittest.TestCase):
         with open(self.config, 'w') as f:
             f.write(f'[github]\nrepo = "o/r"\nagent_login = "bot"\ntoken_env = "SA_TEST_TOKEN"\n'
                     f'[policy]\nallowed = ["alice"]\n'
-                    f'[executor]\ncheckout = "{self.tmp}/checkout"\npi = "{self.tmp}/no-pi"\n'
-                    f'[service]\nstate_dir = "{self.tmp}/state"\nreport_port = 0\n')
+                    f'[executor]\ncheckout = "{toml_path(self.tmp)}/checkout"\npi = "{toml_path(self.tmp)}/no-pi"\n'
+                    f'[service]\nstate_dir = "{toml_path(self.tmp)}/state"\nreport_port = 0\n')
 
     def cli(self, *argv, env=None):
         out, err = io.StringIO(), io.StringIO()

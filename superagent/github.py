@@ -9,7 +9,9 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 import urllib.error
 import urllib.request
@@ -23,8 +25,34 @@ MAX_PAGES = 10
 STEP_BACK = timedelta(seconds=5)  # late writes land slightly before the time we read
 RETRY_FOR = timedelta(hours=24)
 TIMEOUT = 30  # seconds for one API call
-# Every git command the service runs: no hooks and no fsmonitor, whatever the (worker-writable) repo config says.
-GIT_HARDEN = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false']
+WINDOWS = os.name == 'nt'
+
+
+def no_hooks_path(windows=WINDOWS):
+    """A core.hooksPath under which no hook can ever exist, so git runs none.
+
+    POSIX: /dev/null, a device nobody can create entries below. Git for Windows maps only the exact path /dev/null to
+    NUL, so `/dev/null/pre-push` would be looked up as C:\\dev\\null\\pre-push, which any user may create. Instead the
+    hooks path is a file in System32 (cmd.exe, present on every Windows): `<file>/pre-push` cannot exist, and only an
+    administrator could replace that file."""
+    if not windows:
+        return '/dev/null'
+    root = os.environ.get('SystemRoot') or r'C:\Windows'
+    return os.path.join(root, 'System32', 'cmd.exe').replace('\\', '/')
+
+
+def git_harden(windows=WINDOWS):
+    """Every git command the service runs: no hooks and no fsmonitor, whatever the (worker-writable) repo config
+    says."""
+    return ['-c', f'core.hooksPath={no_hooks_path(windows)}', '-c', 'core.fsmonitor=false']
+
+
+GIT_HARDEN = git_harden()
+# The push runs with a nearly empty environment. Windows also needs these (no secrets in them): without SYSTEMROOT
+# Winsock cannot start, and git finds the user's home and temp directory through the others.
+PUSH_ENV_KEYS = ('PATH', 'HOME')
+PUSH_ENV_KEYS_WINDOWS = ('SYSTEMROOT', 'WINDIR', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'TEMP', 'TMP', 'PATHEXT',
+                         'COMSPEC')
 # A worker runs as the same user and could edit push.git/config, so the token-bearing push pins its network
 # settings on the command line. URL-specific keys are pinned too: they win over the plain ones.
 PUSH_PINS = ['-c', 'http.proxy=', '-c', 'http.sslVerify=true',
@@ -348,8 +376,11 @@ def git_env(hidden=(), secrets=(), base=None):
     `GIT_CONFIG_*` is dropped, and system and global config are off. Hooks are off through GIT_HARDEN in argv.
     """
     secrets = [x for x in secrets if x]
+    if WINDOWS:  # environment names ignore case on Windows
+        hidden = {h.upper() for h in hidden}
+    name = str.upper if WINDOWS else str
     env = {k: v for k, v in (os.environ if base is None else base).items()
-           if k not in hidden and not k.startswith('GIT_CONFIG') and not any(x in v for x in secrets)}
+           if name(k) not in hidden and not name(k).startswith('GIT_CONFIG') and not any(x in v for x in secrets)}
     env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0')
     return env
 
@@ -381,14 +412,29 @@ def push_branch(worktree, branch, token, repo, push_dir, run=subprocess.run, env
         git('init', ['git', *GIT_HARDEN, 'init', '--bare', '-q', git_dir], env)
         in_push_repo = ['git', f'--git-dir={git_dir}', *GIT_HARDEN]
         git('fetch', [*in_push_repo, 'fetch', '--no-tags', worktree, f'+HEAD:refs/heads/{branch}'], env)
-        push_env = {k: os.environ[k] for k in ('PATH', 'HOME') if k in os.environ}
+        keys = PUSH_ENV_KEYS + (PUSH_ENV_KEYS_WINDOWS if WINDOWS else ())
+        push_env = {k: os.environ[k] for k in keys if k in os.environ}
         push_env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0',
                         GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',
                         GIT_CONFIG_VALUE_0=f'AUTHORIZATION: basic {auth}')
         git('push', [*in_push_repo, *PUSH_PINS, 'push', '--no-verify', f'https://github.com/{repo}.git',
                      f'+refs/heads/{branch}:refs/heads/{branch}'], push_env)
     finally:
-        shutil.rmtree(git_dir, ignore_errors=True)
+        rmtree(git_dir)
+
+
+def rmtree(path):
+    """Remove a tree, including git's read-only object files, which Windows refuses to delete as they are."""
+    def retry(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=retry)
+    else:
+        shutil.rmtree(path, onerror=retry)
 
 
 def has_new_commits(worktree, base_ref, run=subprocess.run, env=None):

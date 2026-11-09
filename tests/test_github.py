@@ -380,7 +380,13 @@ class FakeRun:
         return self.result
 
 
-HARDEN = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false']
+# Git for Windows looks /dev/null/<hook> up as C:/dev/null/<hook>; it gets a path below System32's cmd.exe.
+NO_HOOKS = ('/dev/null' if os.name != 'nt'
+            else os.path.join(os.environ.get('SystemRoot') or r'C:\Windows', 'System32', 'cmd.exe').replace('\\', '/'))
+HARDEN = ['-c', f'core.hooksPath={NO_HOOKS}', '-c', 'core.fsmonitor=false']
+# Windows networking needs a few more (secret-free) variables in the push env.
+PUSH_BASE = {'PATH', 'HOME'} | ({'SYSTEMROOT', 'WINDIR', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'TEMP', 'TMP',
+                                 'PATHEXT', 'COMSPEC'} if os.name == 'nt' else set())
 AUTH = base64.b64encode(f'x-access-token:{TOKEN}'.encode()).decode()
 
 
@@ -416,8 +422,8 @@ class GitTest(unittest.TestCase):
             self.assertNotIn('GIT_CONFIG_KEY_0', kw['env'])
             self.assertEqual((kw['env']['GIT_CONFIG_NOSYSTEM'], kw['env']['GIT_CONFIG_GLOBAL']), ('1', os.devnull))
         env = push_kw['env']
-        self.assertLessEqual(set(env), {'PATH', 'HOME', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_TERMINAL_PROMPT',
-                                        'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'})
+        self.assertLessEqual(set(env), PUSH_BASE | {'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_TERMINAL_PROMPT',
+                                                    'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'})
         self.assertEqual(env['GIT_CONFIG_COUNT'], '1')
         self.assertEqual(env['GIT_CONFIG_KEY_0'], 'http.https://github.com/.extraheader')
         self.assertEqual(env['GIT_CONFIG_VALUE_0'], f'AUTHORIZATION: basic {AUTH}')

@@ -2,11 +2,38 @@
 
 import getpass
 import os
+import shutil
 import tomllib
 from dataclasses import dataclass, field
 
 DEFAULT_TOOLS = 'read,grep,find,ls,edit,write,bash'
+DEFAULT_PI = '~/.pi/agent/bin/pi'
+WINDOWS = os.name == 'nt'
 
+
+def resolve_pi(path, default, windows, which):
+    """The pi executable to run, and a note for `superagent check` when it is not the configured path.
+
+    Windows only: an extensionless path (a POSIX launcher Windows cannot start) becomes its .exe or .cmd sibling, and a
+    missing default path falls back to the `pi` on PATH (npm installs pi.cmd). Elsewhere the path is used as is."""
+    if not windows:
+        return path, ''
+    if not os.path.splitext(path)[1]:
+        for ext in ('.exe', '.cmd', '.bat'):
+            if os.path.isfile(path + ext):
+                return path + ext, ''
+    if default and not os.path.isfile(path):
+        found = which('pi')
+        if found:
+            return found, f'found on PATH; {path} does not exist'
+    return path, ''
+
+
+
+def local_path(path):
+    """A config path in this OS's form: `~` expanded and separators normalized, so Windows never mixes `/` and `\\`
+    (config files use forward slashes there, since backslashes are escapes in TOML strings)."""
+    return os.path.normpath(os.path.expanduser(path))
 
 @dataclass
 class RepoConfig:
@@ -35,7 +62,7 @@ class Config:
     poll_seconds: int = 60
     state_dir: str = '~/.local/share/pi-superagent'
     work_dir: str = ''  # default: <state_dir>/work
-    pi: str = '~/.pi/agent/bin/pi'
+    pi: str = DEFAULT_PI
     provider: str = 'anthropic'
     model: str = 'claude-sonnet-5-5'
     thinking: str = 'medium'
@@ -58,10 +85,11 @@ class Config:
                 self.local_user = getpass.getuser()
             except (OSError, KeyError):
                 self.local_user = 'local'
-        self.state_dir = os.path.expanduser(self.state_dir)
-        self.work_dir = os.path.expanduser(self.work_dir or os.path.join(self.state_dir, 'work'))
-        self.checkout = os.path.expanduser(self.checkout) if self.checkout else ''
-        self.pi = os.path.expanduser(self.pi)
+        self.state_dir = local_path(self.state_dir)
+        self.work_dir = local_path(self.work_dir or os.path.join(self.state_dir, 'work'))
+        self.checkout = local_path(self.checkout) if self.checkout else ''
+        self.pi, self.pi_note = resolve_pi(os.path.expanduser(self.pi), self.pi == DEFAULT_PI, WINDOWS,
+                                           shutil.which)
         if self.repos is None:
             if '/' not in self.repo:
                 raise ValueError('repo must be owner/name')
@@ -90,7 +118,7 @@ class Config:
             if not r.checkout:
                 raise ValueError(f'repo {r.name} needs a checkout')
             seen.add(r.name.lower())
-            r.checkout, r.legacy = os.path.expanduser(r.checkout), False
+            r.checkout, r.legacy = local_path(r.checkout), False
             repos.append(r)
         return repos
 
@@ -129,6 +157,9 @@ class Config:
     def worker_env(self, base=None):
         """The environment a Pi worker gets: everything except the configured secrets."""
         hidden = {self.token_env, *self.secret_env}
+        if WINDOWS:  # environment names ignore case on Windows
+            hidden = {h.upper() for h in hidden}
+            return {k: v for k, v in (base if base is not None else os.environ).items() if k.upper() not in hidden}
         return {k: v for k, v in (base if base is not None else os.environ).items() if k not in hidden}
 
 

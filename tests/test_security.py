@@ -3,6 +3,7 @@ service runs may hand it the GitHub token, and the push must not follow the work
 
 import base64
 import os
+import pathlib
 import shutil
 import subprocess
 import tempfile
@@ -58,7 +59,7 @@ class GitSecretsTest(unittest.IsolatedAsyncioTestCase):
         self.store.put('github-start', '2000-01-01T00:00:00+00:00')
         self.gh = FakeGitHub()
         self.dump = os.path.join(self.tmp, 'hook-env.txt')
-        self.run_git = RedirectedGit('file://' + self.github)
+        self.run_git = RedirectedGit(pathlib.Path(self.github).as_uri())  # file:///C:/... on Windows
         self.server = ReportServer(lambda tok: self.svc.lookup(tok), lambda tid, r: self.svc.on_report(tid, r))
         self.addCleanup(self.server.close)
 
@@ -69,7 +70,8 @@ class GitSecretsTest(unittest.IsolatedAsyncioTestCase):
         for name in HOOKS:
             path = os.path.join(hooks, name)
             with open(path, 'w') as f:
-                f.write(f'#!/bin/sh\necho "== {name}" >> "{self.dump}"\nenv >> "{self.dump}"\n'
+                dump = self.dump.replace(os.sep, '/')  # Git for Windows runs hooks through its own sh
+                f.write(f'#!/bin/sh\necho "== {name}" >> "{dump}"\nenv >> "{dump}"\n'
                         f'[ "{name}" = pre-push ] && cat > /dev/null\nexit 0\n')
             os.chmod(path, 0o755)
 
@@ -77,8 +79,9 @@ class GitSecretsTest(unittest.IsolatedAsyncioTestCase):
             subprocess.run(['git', *args], cwd=cwd, env=env, check=True, capture_output=True, text=True)
 
         wgit('config', 'core.hooksPath', hooks)
-        wgit('config', f'url.file://{self.evil}.insteadOf', 'file://' + self.github)
-        wgit('config', f'url.file://{self.evil}.insteadOf', GITHUB_URL, '--add')
+        evil, github = pathlib.Path(self.evil).as_uri(), pathlib.Path(self.github).as_uri()
+        wgit('config', f'url.{evil}.insteadOf', github)
+        wgit('config', f'url.{evil}.insteadOf', GITHUB_URL, '--add')
         with open(os.path.join(cwd, 'fix.txt'), 'w') as f:
             f.write('fixed\n')
         wgit('add', 'fix.txt')
