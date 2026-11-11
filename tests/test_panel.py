@@ -544,7 +544,7 @@ class PanelAppTest(unittest.TestCase):
         self.assertIn('Saved name, checkout of c/three.', '\n'.join(s.value for s in at.success))
         c = cli.load_config(self.config)
         self.assertEqual([(r.name, r.checkout, r.test_command) for r in c.repos],
-                         [('a/one', f'{self.tmp}/one', ''), ('c/three', moved, 'make check')])
+                         [('a/one', os.path.join(self.tmp, 'one'), ''), ('c/three', os.path.normpath(moved), 'make check')])
         (remove,) = [b for b in at.button if b.label == 'Yes, remove a/one']
         with mock.patch.dict(os.environ, {'SUPERAGENT_CONFIG': self.config}):
             remove.click().run()
@@ -610,7 +610,7 @@ class PanelAppTest(unittest.TestCase):
         self.assertEqual([t.label for t in at.tabs], ['Overview', 'Tickets', 'New request', 'Settings', *SETTINGS_TABS])
         self.assertEqual(at.multiselect(key='new-request-repos').options, ['o/r', 'b/two'])
         c = cli.load_config(self.config)
-        self.assertEqual([(r.name, r.checkout) for r in c.repos], [('o/r', f'{self.tmp}/checkout'), ('b/two', two)])
+        self.assertEqual([(r.name, r.checkout) for r in c.repos], [('o/r', os.path.join(self.tmp, 'checkout')), ('b/two', os.path.normpath(two))])
         self.assertEqual(c.max_workers, 3)  # the rest of the config is kept
 
     def local_ticket(self, store):

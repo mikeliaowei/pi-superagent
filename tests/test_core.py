@@ -223,7 +223,7 @@ class ConfigUpdateTest(unittest.TestCase):
         c = cfgmod.load(path)
         self.assertEqual((c.model, c.thinking, c.poll_seconds), ('m2', 'high', 120))
         self.assertEqual([(r.checkout, r.test_command, r.test_timeout) for r in c.repos],
-                         [('D:\\work\\one', '', 900), ('/src/two', 'make "check"', 60)])
+                         [(os.path.normpath('D:\\work\\one'), '', 900), (os.path.normpath('/src/two'), 'make "check"', 60)])
 
     def test_update_keeps_windows_line_endings_and_adds_a_missing_table(self):
         no_executor = self.MULTI.replace('[executor]\n# the worker model\nmodel = "m1"  # old\n\n', '')
@@ -255,7 +255,7 @@ class ConfigUpdateTest(unittest.TestCase):
                                  '[executor]\ncheckout = "/old"\n')
         cfgmod.update(path, {'checkout': '/new', 'base_branch': 'dev'})
         c = cfgmod.load(path)
-        self.assertEqual((c.checkout, c.base_branch), ('/new', 'dev'))
+        self.assertEqual((c.checkout, c.base_branch), (os.path.normpath('/new'), 'dev'))  # config paths are OS-normalized
 
     def test_add_repo_appends_a_repos_table(self):
         path = self.write_config(self.MULTI)
@@ -309,7 +309,7 @@ class ConfigUpdateTest(unittest.TestCase):
         c = cfgmod.load(path)
         self.assertFalse(c.legacy)
         self.assertEqual([(r.name, r.checkout, r.base_branch) for r in c.repos],
-                         [('o/r', os.path.expanduser('~/src/r'), 'dev'), ('x/new', '/src/new', 'dev')])
+                         [('o/r', os.path.normpath(os.path.expanduser('~/src/r')), 'dev'), ('x/new', os.path.normpath('/src/new'), 'dev')])
 
 
 if __name__ == '__main__':
