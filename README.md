@@ -213,8 +213,9 @@ New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name
   worker (no token, no `secret_env`, case-insensitively, as Windows treats variable names).
 - Behind an HTTPS proxy, set it for the service the same way as the token, for example
   `setx HTTPS_PROXY http://proxy.example:8080` (see [Safety model](#safety-model)).
-- A test command's background processes are killed through the process tree. One whose parent already exited is no
-  longer in that tree and can survive the command.
+- A test command's background processes, and the processes a worker's tools started, are killed through the
+  process tree when the command ends or the worker stops. One whose parent already exited is no longer in that tree and
+  can survive.
 - There is no SIGTERM: stopping `superagent run` from Task Manager ends it at once; the next start recovers the
   running Assignments as after any restart.
 - Verified on GitHub's `windows-latest` runners (the test suite), not yet on a real company laptop. Workers still run
@@ -425,7 +426,7 @@ cd <worktree shown in the panel>
 | `superagent show <ticket> [--json]` | A Ticket's stage, repos, PR links and conversation (request, local replies, answers); `local:<id>` also finds a request not picked up yet. |
 | `superagent answer <ticket> TEXT` | Give a Ticket an answer or instruction: it steers a running worker or resumes the same session. On an ended Ticket it reopens it first (unless another Ticket is open on its thread); one that ended merged or closed gets a new pull request on its next delivery. A new run also clears a failed delivery. |
 | `superagent pi-install [--agent-dir DIR] [--force] [--uninstall]` | Install the Pi skill and `/superagent` prompt template (see above). |
-| `superagent stop <ticket>` | Stop a Ticket (id or name). |
+| `superagent stop <ticket>` | Stop a Ticket (id or name). Its worker ends with every process its tools started. |
 | `superagent retry <ticket>` | Relaunch a Ticket whose last run ended, or retry a failed delivery. |
 | `superagent panel [--port 8742]` | Local web panel (see below); needs the `panel` extra. |
 

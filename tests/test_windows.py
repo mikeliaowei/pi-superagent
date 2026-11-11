@@ -16,7 +16,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest import mock
 
-from superagent import cli, executor
+from superagent import cli, executor, proctree
 from superagent import config as config_mod
 from superagent import github as gh_mod
 from superagent.config import Config
@@ -57,7 +57,7 @@ class FakePopen:
 
 class TestCommandOnWindowsTest(unittest.TestCase):
     def setUp(self):
-        for patch in (mock.patch.object(executor, 'WINDOWS', True),
+        for patch in (mock.patch.object(executor, 'WINDOWS', True), mock.patch.object(proctree, 'WINDOWS', True),
                       mock.patch.dict(os.environ, {'SystemRoot': r'C:\Windows'})):
             patch.start()
             self.addCleanup(patch.stop)

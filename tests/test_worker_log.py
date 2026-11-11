@@ -119,6 +119,21 @@ class WorkerLogTest(unittest.TestCase):
         texts = [s.text for s in worker_log.steps([path], secrets=['tok-SECRET', 'ghp_abc', '', None])]
         self.assertEqual(texts, ['echo ***', '*** ***'])
 
+    def test_malformed_entries_are_shown_as_far_as_they_go_and_never_raise(self):
+        at = '2026-11-09T03:24:40.077Z'
+        path = self.write('2026-11-09T03-24-39-408Z_tk-1.jsonl', [
+            entry('user', [{'type': 'text', 'text': None}, {'type': 'text', 'text': 'fix it'}]),
+            entry('toolResult', [{'type': 'text', 'text': 7}], toolName='bash'),
+            {'type': 'assistant.message', 'timestamp': at, 'data': {'content': 'ok', 'toolRequests': 5}},
+            {'type': 'assistant.message', 'timestamp': at, 'data': {'toolRequests': {'name': 'x'}}},
+            {'type': 'session.usage_record', 'timestamp': at, 'data': ['not', 'a', 'dict']},
+            {'type': 'session.usage_record', 'timestamp': at, 'data': {'usage': {'inputTokens': 3}}},
+        ])
+        got = [(s.kind, s.text) for s in worker_log.steps([path])]
+        self.assertEqual(got, [('request', 'fix it'), ('result', '7'), ('said', 'ok')])
+        self.assertEqual(worker_log.usage([path])['tokens'], 3)
+        self.assertEqual(worker_log.daily_tokens([path]), {'2026-11-09': 3})
+
     def test_a_tool_call_shows_its_other_arguments_too(self):
         path = self.write('2026-11-09T03-24-39-408Z_tk-1.jsonl', [entry('assistant', [
             {'type': 'toolCall', 'id': 'c', 'name': 'edit', 'arguments': {'path': 'a.py', 'oldText': 'x', 'newText': 'y'}}])])

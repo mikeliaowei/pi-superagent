@@ -14,6 +14,7 @@ from functools import partial
 from .copilot_acp import CopilotAcp
 from .github import GIT_HARDEN, GitHubError, fetch_from_github, git_env as _git_env
 from .pi_rpc import PiRpc, RpcError
+from .proctree import group_options, kill_tree
 from .worker_log import copilot_home, copilot_session_file
 
 PACKAGE = os.path.dirname(os.path.abspath(__file__))
@@ -23,7 +24,6 @@ REQUEST_CAP, FOLLOWUP_CAP, MAX_FOLLOWUPS = 1500, 600, 20
 TEST_OUTPUT_CAP = 64 * 1024  # bytes of a test command's output kept (the tail)
 TEST_TAIL = 3000  # characters of that output sent back to the worker
 WINDOWS = os.name == 'nt'
-CREATE_NEW_PROCESS_GROUP = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200)
 # Windows has no /usr/bin/false: askpass points at this batch file instead (see deny_askpass).
 DENY_ASKPASS = 'deny-askpass.cmd'
 
@@ -237,10 +237,8 @@ class TestRun:
         began = time.monotonic()
         with tempfile.TemporaryFile() as out:
             opts = dict(cwd=self.cwd, env=self.env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
-            if WINDOWS:
-                self.proc = subprocess.Popen(self.command, shell=True, creationflags=CREATE_NEW_PROCESS_GROUP, **opts)
-            else:
-                self.proc = subprocess.Popen(['sh', '-c', self.command], start_new_session=True, **opts)
+            argv = self.command if WINDOWS else ['sh', '-c', self.command]  # cmd.exe parses a string
+            self.proc = subprocess.Popen(argv, shell=WINDOWS, **group_options(), **opts)
             timed_out = False
             try:
                 code = self.proc.wait(timeout=self.timeout)
@@ -258,23 +256,8 @@ class TestRun:
                 'seconds': round(time.monotonic() - began), 'output': output.rstrip()}
 
     def kill(self):
-        if self.proc is None:
-            return
-        if WINDOWS:
-            # Popen keeps the process handle open, so the pid cannot be reused while we hold it. Exit code 128
-            # ("not found") after a normal exit is expected. Limit: children whose parent already exited are no
-            # longer in the tree taskkill walks.
-            taskkill = os.path.join(os.environ.get('SystemRoot') or r'C:\Windows', 'System32', 'taskkill.exe')
-            try:
-                subprocess.run([taskkill, '/F', '/T', '/PID', str(self.proc.pid)], stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-            return
-        try:
-            os.killpg(self.proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        if self.proc is not None:
+            kill_tree(self.proc.pid)
 
 
 class Worker:

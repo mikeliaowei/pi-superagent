@@ -24,6 +24,21 @@ FAKE = os.path.join(os.path.dirname(__file__), 'fake_pi.py')
 FAKE_COPILOT = os.path.join(os.path.dirname(__file__), 'fake_copilot.py')
 
 
+def process_alive(pid):
+    if os.name == 'nt':
+        out = subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/NH'], capture_output=True, text=True).stdout
+        return str(pid) in out
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # A zombie still answers signal 0; it has exited.
+    state = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith('Z')
+
+
 def cfg(tmp, **kw):
     return Config(repo='o/r', agent_login='bot', allowed=['alice'], checkout=os.path.join(tmp, 'checkout'),
                   state_dir=tmp, **kw)
@@ -127,6 +142,45 @@ class PiRpcTest(unittest.IsolatedAsyncioTestCase):
         rpc = await fake('ok')
         await rpc.close()
         self.assertIsNotNone(rpc.proc.returncode)
+
+    async def spawn_with_child(self, worker_exits_on_eof):
+        """A worker whose tool started a long-running process: it writes that child's pid, then either exits when
+        its stdin closes or keeps running."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        pidfile = os.path.join(tmp, 'child.pid')
+        script = (
+            'import subprocess, sys, time\n'
+            'c = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])\n'
+            f'open({pidfile!r}, "w").write(str(c.pid))\n'
+            + ('sys.stdin.read()\n' if worker_exits_on_eof else 'time.sleep(120)\n'))
+        rpc = PiRpc()
+        await rpc.start([sys.executable, '-c', script], cwd=None, env=dict(os.environ))
+        for _ in range(200):
+            if os.path.exists(pidfile) and open(pidfile).read():
+                break
+            await asyncio.sleep(0.05)
+        return rpc, int(open(pidfile).read())
+
+    async def assert_gone(self, pid):
+        for _ in range(100):
+            if not process_alive(pid):
+                return
+            await asyncio.sleep(0.05)
+        self.fail(f'process {pid} is still running')
+
+    async def test_stopping_a_stuck_worker_ends_the_processes_its_tools_started(self):
+        rpc, child = await self.spawn_with_child(worker_exits_on_eof=False)
+        await rpc.close(grace=0.5)
+        self.assertIsNotNone(rpc.proc.returncode)
+        await self.assert_gone(child)
+
+    @unittest.skipIf(os.name == 'nt', 'a Windows process tree loses children whose parent already exited')
+    async def test_a_worker_that_exits_leaves_no_process_behind(self):
+        rpc, child = await self.spawn_with_child(worker_exits_on_eof=True)
+        await rpc.close()
+        self.assertIsNotNone(rpc.proc.returncode)
+        await self.assert_gone(child)
 
 
 class WorkerTest(unittest.IsolatedAsyncioTestCase):

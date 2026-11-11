@@ -11,6 +11,8 @@ import logging
 from collections import deque
 from dataclasses import dataclass
 
+from .proctree import group_options, kill_tree
+
 log = logging.getLogger('superagent.pi')
 
 STREAM_LIMIT = 16 * 1024 * 1024  # one record can carry a whole file read by a tool
@@ -52,7 +54,7 @@ class PiRpc:
 
     async def start(self, argv, cwd, env):
         self.proc = await asyncio.create_subprocess_exec(
-            *argv, cwd=cwd, env=env, limit=STREAM_LIMIT,
+            *argv, cwd=cwd, env=env, limit=STREAM_LIMIT, **group_options(),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         err = asyncio.create_task(self._read_stderr())
         self._tasks = [err, asyncio.create_task(self._read_stdout(err))]
@@ -205,8 +207,12 @@ class PiRpc:
             try:
                 await asyncio.wait_for(self.proc.wait(), grace)
             except asyncio.TimeoutError:
-                self.proc.kill()
+                kill_tree(self.proc.pid)
+                if self.proc.returncode is None:
+                    self.proc.kill()
                 await self.proc.wait()
+        # Whatever the worker's tools started (a dev server, a watcher) ends with it, even after a clean exit.
+        kill_tree(self.proc.pid)
         for t in self._tasks:
             try:
                 await asyncio.wait_for(t, grace)

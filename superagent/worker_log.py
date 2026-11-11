@@ -113,7 +113,8 @@ def _texts(content):
         return content
     if not isinstance(content, list):
         return ''
-    return '\n'.join(c.get('text', '') for c in content if isinstance(c, dict) and c.get('type') == 'text')
+    return '\n'.join(str(c['text']) for c in content
+                     if isinstance(c, dict) and c.get('type') == 'text' and c.get('text') is not None)
 
 
 def _call_summary(name, args):
@@ -139,7 +140,8 @@ def _copilot_steps(e):
     elif kind == 'assistant.message':
         if d.get('content'):
             yield Step(at, 'said', 'Agent', str(d['content']))
-        for call in d.get('toolRequests') or []:
+        calls = d.get('toolRequests')
+        for call in calls if isinstance(calls, list) else []:
             if isinstance(call, dict):
                 name = call.get('name', 'tool')
                 yield Step(at, 'tool', name, _call_summary(name, call.get('arguments')))
@@ -232,7 +234,8 @@ def _usage_of(e):
     """(timestamp, {input, output, cacheRead, cacheWrite, cost}) of a model call's entry, else None. Copilot bills
     premium requests, not dollars: its calls cost 0 here."""
     if e.get('type') == 'session.usage_record':
-        u = (e.get('data') or {}).get('usage')
+        d = e.get('data')
+        u = d.get('usage') if isinstance(d, dict) else None
         if isinstance(u, dict):
             return e.get('timestamp'), {'input': u.get('inputTokens'), 'output': u.get('outputTokens'),
                                         'cacheRead': u.get('cacheReadTokens'), 'cacheWrite': u.get('cacheWriteTokens')}
