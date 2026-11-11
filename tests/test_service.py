@@ -169,8 +169,10 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         await self.svc.run_effects()
         await self.round()  # a second poll sees the same issue and the agent's own ack: nothing new
         self.assertEqual(len(self.store.tickets()), 1)
-        self.assertEqual(len(self.gh.posted(n)), 1)
-        self.assertNotIn('\n\n', self.gh.posted(n)[0].split('<!--')[0].strip())  # one short sentence
+        # The worker may already have delivered on a loaded machine: count the acks, not its PR-link reply.
+        acks = [p for p in self.gh.posted(n) if '-ack -->' in p]
+        self.assertEqual(len(acks), 1)
+        self.assertNotIn('\n\n', acks[0].split('<!--')[0].strip())  # one short sentence
         await until(lambda: pi.runs and pi.runs[0].messages)
         t = self.store.ticket(t.id)
         self.assertEqual(pi.runs[0].session_id(), t.id)
@@ -182,6 +184,11 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         pr = next(iter(self.gh.pulls.values()))
         self.assertEqual((pr['head'], pr['base'], pr['title']), ('agent/fix-the-login-bug', 'main', 'Fix the login bug'))
         self.assertIn('Fixed the login bug.', pr['body'])
+        self.assertIn('## Summary\n\nFixed the login bug.', pr['body'])
+        self.assertRegex(pr['body'], r'## Commits\n\n- [0-9a-f]+ fix')
+        self.assertIn('## Tests\n\n', pr['body'])
+        self.assertIn(f'Agent: `{self.cfg.provider}/{self.cfg.model}`, thinking `{self.cfg.thinking}`.', pr['body'])
+        self.assertNotIn('## Details', pr['body'])  # the worker sent none
         self.assertIn(f'Closes #{n}', pr['body'])
         self.assertEqual(self.git.pushes[0][0][-2:], ['https://github.com/o/r.git',
                                                       '+refs/heads/agent/fix-the-login-bug:refs/heads/agent/fix-the-login-bug'])
@@ -197,6 +204,17 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         t = self.store.ticket(t.id)
         self.assertEqual((t.state, t.outcome, stage(t)), ('ended', 'merged', 'ended'))
         self.assertEqual(self.svc.workers, {})
+
+    async def test_the_workers_details_go_into_the_pr_body(self):
+        self.gh.add_issue('Fix it', '@bot fix')
+        details = '### Problem\n\nNav was hidden.\n\n### Changes\n\n- web.py: keep the row.'
+        self.service(Pi({'commit': True, 'report': {'status': 'ready', 'summary': 'Done.', 'details': details}}))
+        await self.round()
+        await self.settle()
+        t = self.only_ticket()
+        body = self.gh.pulls[t.pr_number]['body']
+        self.assertIn(f'## Summary\n\nDone.\n\n## Details\n\n{details}\n\n## Commits', body)
+        self.assertEqual(t.details, details)
 
     async def test_pull_request_thread_body_has_no_closes_line(self):
         pr_thread = self.gh.add_issue('Tweak docs', '@bot tidy this PR')
@@ -522,8 +540,8 @@ class CliTest(unittest.TestCase):
         with open(self.config, 'w') as f:
             f.write(f'[github]\nrepo = "o/r"\nagent_login = "bot"\ntoken_env = "SA_TEST_TOKEN"\n'
                     f'[policy]\nallowed = ["alice"]\n'
-                    f'[executor]\ncheckout = "{self.tmp}/checkout"\npi = "{self.tmp}/no-pi"\n'
-                    f'[service]\nstate_dir = "{self.tmp}/state"\nreport_port = 0\n')
+                    f'[executor]\ncheckout = \'{self.tmp}/checkout\'\npi = \'{self.tmp}/no-pi\'\n'
+                    f'[service]\nstate_dir = \'{self.tmp}/state\'\nreport_port = 0\n')
 
     def cli(self, *argv, env=None):
         out, err = io.StringIO(), io.StringIO()

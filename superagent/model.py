@@ -35,13 +35,21 @@ def ticket_title(text, limit=TITLE_MAX):
     return cut.rstrip(' ,;:.-') + '…'
 
 
+NAME_WORDS, NAME_MAX = 8, 48
+
+
 def short_name(title, taken=()):
-    """1-4 kebab-case words, at most 32 characters, unique among `taken` (the Ticket's branch is agent/<name>)."""
-    words = re.findall(r'[a-z0-9]+', title.lower())[:4] or ['task']
-    base = '-'.join(words)[:32].strip('-') or 'task'
+    """Up to 8 kebab-case words, at most 48 characters cut at a whole word, unique among `taken` (the Ticket's
+    branch is agent/<name>)."""
+    words = re.findall(r'[a-z0-9]+', title.lower())[:NAME_WORDS] or ['task']
+    base = words[0][:NAME_MAX]
+    for w in words[1:]:
+        if len(base) + 1 + len(w) > NAME_MAX:
+            break
+        base = f'{base}-{w}'
     name, n = base, 2
     while name in taken:
-        name = f'{base[:29]}-{n}'
+        name = f'{base[:NAME_MAX - 3]}-{n}'
         n += 1
     return name
 
@@ -116,6 +124,16 @@ class Ticket:
     # {repo, worktree, pr_number, test_result, pushed}; `worktree` above is then the ticket folder holding them.
     # Empty for a single-repo Ticket, which keeps using worktree, pr_number and test_result above.
     parts: list = field(default_factory=list)
+    # A branch that already exists on GitHub to work on (a local request's choice): the worktree starts from it,
+    # commits are pushed onto it without force, and its open PR is reused. Empty: a new branch agent/<name>.
+    existing_branch: str = ''
+    # Skill folders (or files) the request chose for its worker, given to Pi with --skill besides the worker's own.
+    skills: list = field(default_factory=list)
+    # The worker's model ('provider/model' or a model of the config's provider) and thinking level; '' = config's.
+    model: str = ''
+    thinking: str = ''
+    # The worker's markdown description of its change, from its last `ready` report; goes into the PR body.
+    details: str = ''
 
     @property
     def repos(self):
@@ -137,7 +155,10 @@ class Ticket:
 
 
 # Ticket fields added after the first release, with the value meaning "not used".
-LATER_FIELDS = {'test_failures': 0, 'test_output': '', 'test_result': '', 'parts': []}
+LATER_FIELDS = {'test_failures': 0, 'test_output': '', 'test_result': '', 'parts': [], 'existing_branch': '',
+                'skills': [], 'model': '', 'thinking': '', 'details': ''}
+
+THINKING_LEVELS = ('off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
 
 
 def stage(t):

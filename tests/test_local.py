@@ -5,8 +5,11 @@ import getpass
 import io
 import json
 import os
+import re
+import shlex
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -21,7 +24,12 @@ from superagent.store import Store
 from tests.fake_github import FakeGitHub, FakeGitHubs
 from tests.test_crossrepo import commit_in
 from tests.test_multirepo import ServiceBase, make_clone, write
-from tests.test_service import GIT_ENV, Pi, until
+from tests.test_service import GIT_ENV, Pi, git, until
+
+def write_skill(folder, text):
+    os.makedirs(folder, exist_ok=True)
+    return write(os.path.join(folder, 'SKILL.md'), text)
+
 
 WAITING = {'report': {'status': 'waiting', 'summary': 'Need a choice.', 'question': 'Which database?'}}
 
@@ -40,18 +48,23 @@ class CliBase(unittest.TestCase):
     def write_config(self, repos, local_user=None):
         text = (f'[github]\nagent_login = "bot"\ntoken_env = "SA_LOCAL_TOKEN"\n[policy]\nallowed = ["alice"]\n'
                 + (f'local_user = "{local_user}"\n' if local_user else '')
-                + f'[service]\nstate_dir = "{self.state}"\nreport_port = 0\n'
-                + ''.join(f'[[repos]]\nname = "{r}"\ncheckout = "{self.tmp}/{r.split("/")[1]}"\n' for r in repos))
+                + f"[service]\nstate_dir = '{self.state}'\nreport_port = 0\n"
+                + ''.join(f"[[repos]]\nname = \"{r}\"\ncheckout = '{self.tmp}/{r.split('/')[1]}'\n" for r in repos))
         return write(os.path.join(self.tmp, 'config.toml'), text)
 
     def cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            code = cli.main(['--config', self.config, *argv])
+            try:
+                code = cli.main(['--config', self.config, *argv])
+            except SystemExit as e:  # argparse rejects bad arguments by exiting
+                code = e.code
         return code, out.getvalue(), err.getvalue()
 
     def store(self):
-        return Store(os.path.join(self.state, 'superagent.sqlite'))
+        store = Store(os.path.join(self.state, 'superagent.sqlite'))
+        self.addCleanup(store.close)
+        return store
 
 
 class AskTest(CliBase):
@@ -67,6 +80,27 @@ class AskTest(CliBase):
         code, out, _ = self.cli('ask', '--repo', 'a/one', 'Another one')
         self.assertTrue(out.startswith('queued request 2 for a/one'))
         self.assertEqual(len(self.store().local_requests()), 2)
+
+    def test_ask_takes_a_title_and_skills_and_either_a_new_or_an_existing_branch(self):
+        skill = os.path.join(self.tmp, 'skills', 'tdd')
+        write_skill(skill, 'x\n')
+        code, out, err = self.cli('ask', '--repo', 'a/one', '--title', 'Flaky test', '--skill', skill, 'Fix it')
+        self.assertEqual((code, err), (0, ''))
+        (r,) = self.store().local_requests()
+        self.assertEqual(self.store().ask_options(r['id']), {'title': 'Flaky test', 'new_branch': '', 'skills': [skill],
+                                                             'model': '', 'thinking': ''})
+        code, _, err = self.cli('ask', '--repo', 'a/one', '--branch', 'x', '--new-branch', 'y', 'Fix it')
+        self.assertEqual(code, 2)
+        self.assertIn('not allowed with argument', err)
+        code, _, err = self.cli('ask', '--repo', 'a/one', '--model', 'github-copilot/gpt-6-sol', '--thinking', 'xhigh',
+                                'Fix it')
+        self.assertEqual((code, err), (0, ''))
+        r = self.store().local_requests()[-1]
+        self.assertEqual({k: self.store().ask_options(r['id'])[k] for k in ('model', 'thinking')},
+                         {'model': 'github-copilot/gpt-6-sol', 'thinking': 'xhigh'})
+        code, _, err = self.cli('ask', '--repo', 'a/one', '--thinking', 'huge', 'Fix it')
+        self.assertEqual(code, 2)
+        self.assertIn('invalid choice', err)
 
     def test_ask_says_the_service_looks_running_after_a_recent_poll(self):
         self.store().put('last-poll', datetime.now(timezone.utc).isoformat(timespec='seconds'))
@@ -225,7 +259,7 @@ class LocalServiceTest(ServiceBase):
         t = self.ticket()
         (pr,) = list(self.one.pulls)
         body = self.one.pulls[pr]['body']
-        self.assertIn('Requested locally by wei', body)
+        self.assertIn('Code change requested by super agent on behalf of wei.', body)
         self.assertNotIn('Closes', body)
         self.assertEqual(t.pr_number, pr)
         self.assertIn(f'https://github.com/a/one/pull/{pr}', self.outbox(t)[-1])
@@ -243,7 +277,7 @@ class LocalServiceTest(ServiceBase):
         (a_pr,), (b_pr,) = list(self.one.pulls), list(self.two.pulls)
         for fake, pr in ((self.one, a_pr), (self.two, b_pr)):
             body = fake.pulls[pr]['body']
-            self.assertIn('Requested locally by wei', body)
+            self.assertIn('Code change requested by super agent on behalf of wei.', body)
             self.assertNotIn('Closes', body)
             self.assertNotIn('/issues/', body)
             self.assertIn('Part of a cross-repo change:', body)
@@ -262,8 +296,248 @@ class LocalServiceTest(ServiceBase):
         t = self.store.ticket(t.id)
         self.assertEqual((t.state, t.outcome), ('ended', 'stopped'))
         self.assertEqual(self.outbox(t)[-1], 'Stopped by the operator.')
-        with self.assertRaisesRegex(RuntimeError, f'ticket {t.name} already ended \\(stopped\\)'):
-            cli.answer_request(self.cfg, self.store, t.name, 'More')
+
+    def test_ask_on_an_existing_branch_records_it_with_the_request(self):
+        self.start()
+        rid, out = cli.ask_request(self.cfg, self.store, 'Raise the PR', ['a/one'], branch=' feature/memory-history ')
+        self.assertEqual(out.splitlines()[0], f'queued request {rid} for a/one on existing branch feature/memory-history')
+        self.assertEqual(self.store.ask_branch(rid), 'feature/memory-history')
+        rid, _ = cli.ask_request(self.cfg, self.store, 'New work', ['a/one'])
+        self.assertEqual(self.store.ask_branch(rid), '')
+
+    def test_an_existing_branch_needs_one_repo_a_valid_name_and_not_the_base_branch(self):
+        self.start()
+        for repos, branch, error in (
+                (['a/one', 'b/two'], 'feature/x', 'an existing branch works with one repo'),
+                (['a/one'], '-x', 'is not a valid branch name'),  # never an option to git
+                (['a/one'], 'a..b', 'is not a valid branch name'),
+                (['a/one'], 'a b', 'is not a valid branch name'),
+                (['a/one'], 'HEAD', 'is not a valid branch name'),
+                (['a/one'], 'refs/heads/main', 'is not a valid branch name'),
+                (['a/one'], 'Main', 'Main is the base branch of a/one'),
+                (['a/one'], 'main', 'main is the base branch of a/one')):
+            with self.subTest(branch=branch), self.assertRaisesRegex(RuntimeError, re.escape(error)):
+                cli.ask_request(self.cfg, self.store, 'Do it', repos, branch=branch)
+        self.assertEqual(self.store.local_requests(), [])
+
+    async def test_a_request_on_an_existing_branch_works_on_it_and_pushes_onto_it_without_force(self):
+        # The branch exists on GitHub with a PR, and the user's own checkout is on it.
+        git('checkout', '-b', 'feature/memory-history', cwd=self.one_co)
+        write(os.path.join(self.one_co, 'history.txt'), 'history\n')
+        git('add', 'history.txt', cwd=self.one_co)
+        git('commit', '-m', 'history', cwd=self.one_co)
+        git('push', 'origin', 'feature/memory-history', cwd=self.one_co)
+        existing = self.one.pulls[7] = {'number': 7, 'state': 'open', 'merged': False, 'head': 'feature/memory-history',
+                                        'base': 'main', 'title': 'Memory history', 'body': ''}
+        self.start({'commit': True, 'report': {'status': 'ready', 'summary': 'Added the test.'}})
+        rid, _ = cli.ask_request(self.cfg, self.store, 'Add a unit test', ['a/one'], branch='feature/memory-history')
+        await self.round()
+        await self.drain()
+        t = self.ticket()
+        self.assertEqual((t.existing_branch, t.branch), ('feature/memory-history', 'feature/memory-history'))
+        self.assertTrue(os.path.exists(os.path.join(t.worktree, 'history.txt')))  # started from the branch
+        self.assertIn('feature/memory-history', self.pi.runs[0].messages[0])
+        (argv, _), = self.git.pushes
+        self.assertEqual(argv[-1], 'refs/heads/feature/memory-history:refs/heads/feature/memory-history')
+        self.assertEqual(list(self.one.pulls), [7])  # the open PR of the branch, no new one
+        self.assertIs(self.one.pulls[7], existing)
+        self.assertEqual(t.pr_number, 7)
+        self.assertEqual(self.outbox(t)[-1],
+                         'Pushed to `feature/memory-history`: https://github.com/a/one/pull/7')
+
+    async def test_a_request_with_a_title_and_a_new_branch_name_uses_them_and_pushes_to_that_branch(self):
+        self.start({'commit': True, 'report': {'status': 'ready', 'summary': 'Added the page.'}})
+        rid, out = cli.ask_request(self.cfg, self.store, 'Show the memory history\nwith paging', ['a/one'],
+                                   title=' Memory history page ', new_branch=' feature/memory-page ')
+        self.assertEqual(out.splitlines()[0], f'queued request {rid} for a/one on new branch feature/memory-page')
+        self.assertEqual(self.store.ask_options(rid), {'title': 'Memory history page',
+                                                       'new_branch': 'feature/memory-page', 'skills': [],
+                                                       'model': '', 'thinking': ''})
+        await self.round()
+        await self.drain()
+        t = self.ticket()
+        self.assertEqual((t.title, t.name, t.branch, t.existing_branch),
+                         ('Memory history page', 'memory-history-page', 'feature/memory-page', ''))
+        self.assertIn('"request": "Show the memory history\\nwith paging"', self.pi.runs[0].messages[0])
+        (argv, _), = self.git.pushes
+        self.assertEqual(argv[-1], '+refs/heads/feature/memory-page:refs/heads/feature/memory-page')  # new: force
+        (pr,) = list(self.one.pulls)
+        self.assertEqual(self.one.pulls[pr]['head'], 'feature/memory-page')
+
+    async def test_without_a_branch_name_the_new_branch_is_named_after_the_title(self):
+        self.start({'mode': 'hang'})
+        rid, out = cli.ask_request(self.cfg, self.store, 'Fix it', ['a/one'], title='Flaky login test')
+        self.assertEqual(out.splitlines()[0], f'queued request {rid} for a/one')
+        await self.round()
+        await until(lambda: self.pi.runs and self.pi.runs[0].messages)
+        t = self.ticket()
+        self.assertEqual((t.title, t.name, t.branch), ('Flaky login test', 'flaky-login-test', 'agent/flaky-login-test'))
+        rid, _ = cli.ask_request(self.cfg, self.store, 'Other work', ['b/two'])
+        self.assertEqual(self.store.ask_options(rid), {'title': '', 'new_branch': '', 'skills': [], 'model': '',
+                                                       'thinking': ''})
+
+    def test_a_new_branch_name_must_be_valid_new_and_not_in_use(self):
+        self.start()
+        git('branch', 'feature/local', cwd=self.one_co)
+        git('checkout', '-b', 'feature/pushed', cwd=self.one_co)
+        git('push', 'origin', 'feature/pushed', cwd=self.one_co)
+        git('checkout', 'main', cwd=self.one_co)
+        git('branch', '-D', 'feature/pushed', cwd=self.one_co)  # only on GitHub now
+        self.svc.open_ticket(self.store_trigger('busy'), 'Busy', ['b/two'], 0, new_branch='feature/busy')
+        for repos, kw, error in (
+                (['a/one'], {'new_branch': '-x'}, 'is not a valid branch name'),
+                (['a/one'], {'new_branch': 'a b'}, 'is not a valid branch name'),
+                (['a/one'], {'new_branch': 'main'}, 'main is the base branch of a/one'),
+                (['a/one'], {'new_branch': 'feature/local'}, 'feature/local already exists in a/one'),
+                (['a/one'], {'new_branch': 'Feature/Pushed'}, 'Feature/Pushed already exists in a/one'),
+                (['a/one'], {'new_branch': 'feature/busy'}, 'ticket busy already works on feature/busy'),
+                (['a/one'], {'new_branch': 'x', 'branch': 'feature/local'}, 'an existing branch or a new branch name')):
+            with self.subTest(kw=kw), self.assertRaisesRegex(RuntimeError, re.escape(error)):
+                cli.ask_request(self.cfg, self.store, 'Do it', repos, title='T', **kw)
+        self.assertEqual(self.store.local_requests(), [])
+        # A chosen agent/<name> branch is never handed out again as another ticket's default.
+        self.svc.open_ticket(self.store_trigger('chose'), 'Chose', ['b/two'], 0, new_branch='agent/later')
+        self.assertEqual(self.svc.open_ticket(self.store_trigger('later'), 'Later', ['b/two'], 0).name, 'later-2')
+
+    def store_trigger(self, key):
+        from superagent.model import Trigger
+        trig = Trigger(id=f'local|{key}', thread_key=f'local:{key}', actor='wei', human=True, addressed=True,
+                       at='2026-01-01T00:00:00+00:00', text=key, kind='local')
+        self.store.add_trigger(trig, 'accept', 'test')
+        return trig
+
+    async def test_chosen_skills_are_given_to_the_worker_besides_its_own(self):
+        skill = os.path.join(self.tmp, 'skills', 'grilling')
+        write_skill(skill, '---\nname: grilling\n---\n')
+        os.makedirs(os.path.join(self.tmp, 'skills', 'empty'))
+        self.start({'mode': 'hang'})
+        with self.assertRaisesRegex(RuntimeError, 'no skill'):
+            cli.ask_request(self.cfg, self.store, 'Do it', ['a/one'], skills=[os.path.join(self.tmp, 'skills', 'empty')])
+        rid, _ = cli.ask_request(self.cfg, self.store, 'Do it', ['a/one'], skills=[skill, skill])
+        self.assertEqual(self.store.ask_options(rid)['skills'], [os.path.abspath(skill)])
+        await self.round()
+        await until(lambda: self.pi.runs and self.pi.runs[0].messages)
+        t = self.ticket()
+        self.assertEqual(t.skills, [os.path.abspath(skill)])
+        argv = self.pi.runs[0].argv
+        given = [argv[i + 1] for i, a in enumerate(argv) if a == '--skill']
+        self.assertEqual(given[1:], [os.path.abspath(skill)])
+        self.assertTrue(given[0].endswith('superagent-worker'))
+        self.assertIn('-ns', argv)
+
+    async def test_the_chosen_model_and_thinking_start_the_worker_and_are_named_in_the_pr(self):
+        self.start({'commit': True, 'report': {'status': 'ready', 'summary': 'Fixed.'}})
+        for kw, error in (({'model': 'a model'}, 'is not a model'), ({'thinking': 'huge'}, 'thinking must be one of')):
+            with self.subTest(kw=kw), self.assertRaisesRegex(RuntimeError, error):
+                cli.ask_request(self.cfg, self.store, 'Do it', ['a/one'], **kw)
+        cli.ask_request(self.cfg, self.store, 'Do it', ['a/one'], model=' github-copilot/claude-opus-5.5 ',
+                        thinking='High')
+        await self.round()
+        await self.drain()
+        t = self.ticket()
+        self.assertEqual((t.model, t.thinking), ('github-copilot/claude-opus-5.5', 'high'))
+        argv = self.pi.runs[0].argv
+        self.assertEqual([argv[argv.index(f) + 1] for f in ('--provider', '--model', '--thinking')],
+                         ['github-copilot', 'claude-opus-5.5', 'high'])
+        (pr,) = list(self.one.pulls)
+        self.assertIn('Agent: `github-copilot/claude-opus-5.5`, thinking `high`.', self.one.pulls[pr]['body'])
+
+    def test_the_models_to_choose_from_are_pis(self):
+        self.start()
+        out = ('provider        model               context\n'
+               'github-copilot  claude-opus-5.5     1M\n'
+               'ollama          minimax-m2.7:cloud  204.8K\n')
+        run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, 'Warning: something\n' + out, ''))
+        self.assertEqual(cli.list_models(self.cfg, run=run),
+                         ['github-copilot/claude-opus-5.5', 'ollama/minimax-m2.7:cloud'])
+        self.assertEqual(run.call_args[0][0], [self.cfg.pi, '--list-models'])
+        self.assertEqual(cli.list_models(self.cfg, run=mock.Mock(side_effect=OSError('no pi'))), [])
+
+    def test_the_skills_to_choose_from_are_the_users_and_the_chosen_repos(self):
+        self.start()
+        home, agent = os.path.join(self.tmp, 'home'), os.path.join(self.tmp, 'pi-agent')
+        for path in (os.path.join(agent, 'skills', 'pi-one'), os.path.join(home, '.agents', 'skills', 'tdd'),
+                     os.path.join(self.one_co, '.claude', 'skills', 'repo-skill'),
+                     os.path.join(self.two_co, '.agents', 'skills', 'other-repo')):
+            write_skill(path, 'x\n')
+        write_skill(os.path.join(agent, 'skills', 'superagent'), f'{cli.PI_MARKER}\n')  # the operator skill
+        os.makedirs(os.path.join(home, '.agents', 'skills', '_shared'))  # no SKILL.md
+        with mock.patch.dict(os.environ, {'PI_CODING_AGENT_DIR': agent, 'HOME': home, 'USERPROFILE': home}):
+            found = cli.list_skills(self.cfg, ['a/one'])
+        self.assertEqual([(name, where) for _, name, where in found],
+                         [('pi-one', 'Pi'), ('repo-skill', 'a/one'), ('tdd', '~/.agents')])
+        self.assertEqual(found[0][0], os.path.join(agent, 'skills', 'pi-one'))
+
+    def test_the_branches_to_choose_from_are_read_from_the_checkout_and_refreshed_from_github(self):
+        self.start()
+        git('checkout', '-b', 'feature/pushed', cwd=self.one_co)
+        git('push', 'origin', 'feature/pushed', cwd=self.one_co)
+        git('branch', 'feature/local-only', cwd=self.one_co)
+        git('branch', 'agent/old-ticket', cwd=self.one_co)  # a worker's own branch, never pushed
+        git('branch', 'from-github', 'main', cwd=os.path.join(self.tmp, 'one.git'))  # someone else pushed it
+        self.assertEqual(cli.list_branches(self.cfg, 'a/one'),
+                         [('feature/local-only', 'local'), ('feature/pushed', 'GitHub and local')])
+        self.assertIn('a/one', cli.fetch_branches(self.cfg, 'a/one'))
+        self.assertEqual(cli.list_branches(self.cfg, 'a/one'),
+                         [('feature/local-only', 'local'), ('feature/pushed', 'GitHub and local'),
+                          ('from-github', 'GitHub')])
+
+    async def test_a_request_on_a_local_only_branch_starts_from_it_and_its_delivery_publishes_it(self):
+        git('checkout', '-b', 'feature/not-pushed', cwd=self.one_co)
+        write(os.path.join(self.one_co, 'draft.txt'), 'draft\n')
+        git('add', 'draft.txt', cwd=self.one_co)
+        git('commit', '-m', 'draft', cwd=self.one_co)
+        self.start({'commit': True, 'report': {'status': 'ready', 'summary': 'Finished the draft.'}})
+        cli.ask_request(self.cfg, self.store, 'Finish the draft', ['a/one'], branch='feature/not-pushed')
+        await self.round()
+        await self.drain()
+        t = self.ticket()
+        self.assertEqual(t.delivery_error, '')
+        self.assertTrue(os.path.exists(os.path.join(t.worktree, 'draft.txt')))  # started from the local branch
+        (argv, _), = self.git.pushes
+        self.assertEqual(argv[-1], 'refs/heads/feature/not-pushed:refs/heads/feature/not-pushed')
+        (pr,) = list(self.one.pulls)
+        self.assertEqual(self.outbox(t)[-1], f'Pushed to `feature/not-pushed`: https://github.com/a/one/pull/{pr}')
+
+    async def test_an_instruction_reopens_an_ended_ticket_and_resumes_its_session(self):
+        self.start({'mode': 'hang'}, {'mode': 'hang'})
+        self.ask('Fix it', 'b/two')
+        await self.round()
+        await until(lambda: self.pi.runs and self.pi.runs[0].messages)
+        t = self.ticket()
+        cli.request_action(self.store, t.name, 'stop')
+        await self.round()
+        self.assertEqual(self.store.ticket(t.id).state, 'ended')
+
+        line = cli.answer_request(self.cfg, self.store, t.name, 'Also fix the README.')
+        self.assertIn('reopens', line)
+        await self.svc.poll_once()
+        await self.svc.run_effects()
+        await until(lambda: len(self.pi.runs) == 2 and self.pi.runs[1].messages)
+        t = self.store.ticket(t.id)
+        self.assertEqual((t.state, t.outcome, len(t.assignments), t.current.state), ('open', None, 2, 'running'))
+        self.assertEqual(self.pi.runs[1].session_id(), self.pi.runs[0].session_id())
+        self.assertEqual(self.pi.runs[1].messages[0], followup_message([{'text': 'Also fix the README.'}]))
+        await self.svc.run_effects()
+        self.assertEqual(self.outbox(t)[-1], 'Reopened by wei.')
+
+    async def test_an_instruction_after_a_failed_delivery_reruns_the_worker_and_its_delivery_clears_the_error(self):
+        self.start({'commit': True, 'report': {'status': 'ready', 'summary': 'Fixed.'}},
+                   {'report': {'status': 'ready', 'summary': 'Pushed again.'}})
+        self.ask('Fix it', 'a/one')
+        await self.round()
+        await self.drain()
+        t = self.ticket()
+        t.delivery_error = 'git push failed'
+        self.store.save_ticket(t)
+        self.assertEqual(stage(t), 'person/delivery')
+
+        cli.answer_request(self.cfg, self.store, t.name, 'Rebase and push again.')
+        await self.round()
+        await self.drain()
+        t = self.store.ticket(t.id)
+        self.assertEqual((len(t.assignments), t.delivery_error, stage(t)), (2, '', 'person/review'))
+        self.assertEqual(self.pi.runs[1].messages[0], followup_message([{'text': 'Rebase and push again.'}]))
 
 
 class LocalCliTest(CliBase):
@@ -314,14 +588,29 @@ class LocalCliTest(CliBase):
         self.assertEqual(store.local_messages(self.ticket.id)[-1]['body'], 'Use SQLite.')
         self.assertEqual(store.inputs(self.ticket.id), [])  # the running service applies it
 
-    def test_answer_on_an_ended_ticket_is_a_clear_error(self):
+    def test_answer_on_an_ended_ticket_queues_it_to_reopen_the_ticket(self):
         store = self.store()
         t = store.ticket(self.ticket.id)
         t.state, t.outcome = 'ended', 'merged'
         store.save_ticket(t)
+        code, out, err = self.cli('answer', t.name, 'More')
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn(f'instruction queued for {t.name}', out)
+        self.assertIn('reopens', out)
+        (r,) = store.local_requests()
+        self.assertEqual((r['kind'], r['ticket_id'], r['text']), ('answer', t.id, 'More'))
+
+    def test_answer_cannot_reopen_a_ticket_while_another_is_open_on_its_thread(self):
+        store = self.store()
+        t = store.ticket(self.ticket.id)
+        t.state, t.outcome = 'ended', 'merged'
+        store.save_ticket(t)
+        newer = store.ticket(self.ticket.id)
+        newer.id, newer.name, newer.state, newer.outcome = 'tk-newer', 'newer-work', 'open', None
+        store.save_ticket(newer)
         code, _, err = self.cli('answer', t.name, 'More')
         self.assertEqual(code, 1)
-        self.assertIn(f'ticket {t.name} already ended (merged)', err)
+        self.assertIn(f'cannot reopen {t.name}: newer-work is open on the same thread', err)
         self.assertEqual(store.local_requests(), [])
 
 
@@ -413,7 +702,7 @@ class PiInstallTest(unittest.TestCase):
         code, out, err = self.run_cli('pi-install', '--agent-dir', self.agent)
         self.assertEqual((code, err), (0, ''))
         command = cli.superagent_command()
-        self.assertTrue(os.path.isabs(command.split()[0]))
+        self.assertTrue(os.path.isabs(shlex.split(command)[0]))
         skill, prompt = self.read(self.skill), self.read(self.prompt)
         for text in (skill, prompt):
             self.assertIn(command, text)
@@ -476,7 +765,7 @@ class CliCloseTest(unittest.TestCase):
         config = os.path.join(tmp, 'config.toml')
         with open(config, 'w') as f:
             f.write(f'[github]\nrepo = "o/r"\nagent_login = "bot"\n[policy]\nallowed = ["alice"]\n'
-                    f'[executor]\ncheckout = "{tmp}/co"\n[service]\nstate_dir = "{tmp}/state"\n')
+                    f'[executor]\ncheckout = \'{tmp}/co\'\n[service]\nstate_dir = \'{tmp}/state\'\n')
         opened = []
         real = cli.open_store
 

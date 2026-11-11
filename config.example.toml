@@ -25,8 +25,14 @@ checkout = "~/src/your-repo"
 # work_dir = "~/.local/share/pi-superagent/work"
 # Branch pull requests target, and the worktrees start from (origin/<base_branch>).
 base_branch = "main"
+# What runs each worker: "pi" (the Pi coding agent) or "copilot" (GitHub Copilot CLI, signed in with
+# `copilot login`). Copilot uses `model` (as Copilot names it, for example "claude-sonnet-5.5") and `thinking`,
+# not `provider` or `tools`.
+agent = "pi"
 # The Pi binary.
 pi = "~/.pi/agent/bin/pi"
+# The Copilot CLI, by path or on PATH (agent = "copilot").
+# copilot = "copilot"
 # Model for workers. Always explicit: the user's Pi defaults are never used.
 provider = "anthropic"
 model = "claude-sonnet-5-5"

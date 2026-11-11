@@ -13,13 +13,15 @@ import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from superagent import executor, report
-from superagent.github import GIT_HARDEN
+from superagent import executor, report, worker_log
 from superagent.config import Config
+from superagent.copilot_acp import CopilotAcp, offered_models
+from superagent.github import GIT_HARDEN
 from superagent.model import Ticket
 from superagent.pi_rpc import PiRpc, RpcError
 
 FAKE = os.path.join(os.path.dirname(__file__), 'fake_pi.py')
+FAKE_COPILOT = os.path.join(os.path.dirname(__file__), 'fake_copilot.py')
 
 
 def cfg(tmp, **kw):
@@ -197,6 +199,18 @@ class ArgvEnvTest(unittest.TestCase):
         with open(os.path.join(opt('--skill'), 'SKILL.md')) as f:
             self.assertIn('name: superagent-worker', f.read())
 
+    def test_pi_argv_uses_the_requests_model_and_thinking_else_the_configs(self):
+        def opts(t):
+            argv = executor.pi_argv(self.cfg, t)
+            return tuple(argv[argv.index(f) + 1] for f in ('--provider', '--model', '--thinking'))
+
+        self.assertEqual(opts(ticket()), ('anthropic', 'claude-x', self.cfg.thinking))
+        self.assertEqual(opts(ticket(model='github-copilot/claude-opus-5.5', thinking='high')),
+                         ('github-copilot', 'claude-opus-5.5', 'high'))
+        self.assertEqual(opts(ticket(model='claude-y')), ('anthropic', 'claude-y', self.cfg.thinking))
+        self.assertEqual(opts(ticket(model='openrouter/anthropic/claude-z')),
+                         ('openrouter', 'anthropic/claude-z', self.cfg.thinking))
+
     def test_worker_env_strips_secrets_and_adds_report_vars(self):
         base = {'PATH': '/usr/bin', 'SUPERAGENT_GITHUB_TOKEN': 'x', 'GH_TOKEN': 'y', 'GITHUB_TOKEN': 'z', 'HOME': '/h'}
         with mock.patch.dict(os.environ, base, clear=True):
@@ -251,8 +265,11 @@ class PrepareWorktreeTest(unittest.TestCase):
         self.cfg = cfg(self.tmp, base_branch='dev')
         self.calls, self.envs = [], []
 
-    def run_ok(self, branch_exists=False, fail=None):
+    def run_ok(self, branch_exists=False, fail=None, origin_url=''):
         def run(cmd, **kw):
+            if cmd[1].startswith('--git-dir='):  # the fresh repo of a fetch from GitHub
+                self.calls.append((cmd, kw.get('cwd')))
+                return subprocess.CompletedProcess(cmd, 0, '', '')
             self.assertEqual(cmd[1:1 + len(GIT_HARDEN)], GIT_HARDEN)
             self.envs.append(kw.get('env'))
             cmd = [cmd[0], *cmd[1 + len(GIT_HARDEN):]]
@@ -260,6 +277,8 @@ class PrepareWorktreeTest(unittest.TestCase):
             code = 0
             if cmd[1:3] == ['rev-parse', '--verify']:
                 code = 0 if branch_exists else 1
+            if cmd[-1] == 'remote.origin.url':
+                return subprocess.CompletedProcess(cmd, 0, origin_url, '')
             if fail and fail in cmd:
                 return subprocess.CompletedProcess(cmd, 128, '', 'fatal: no such remote')
             return subprocess.CompletedProcess(cmd, code, '', '')
@@ -269,7 +288,7 @@ class PrepareWorktreeTest(unittest.TestCase):
         path, branch = executor.prepare_worktree(self.cfg, ticket(), run=self.run_ok())
         self.assertEqual((path, branch), (os.path.join(self.cfg.work_dir, 'fix-bug'), 'agent/fix-bug'))
         cmds = [c for c, _ in self.calls]
-        self.assertEqual(cmds[0], ['git', 'fetch', 'origin', 'dev'])
+        self.assertEqual(cmds[:2], [['git', 'config', '--get', 'remote.origin.url'], ['git', 'fetch', 'origin', 'dev']])
         self.assertEqual(cmds[-1], ['git', 'worktree', 'add', '-b', 'agent/fix-bug', path, 'origin/dev'])
         self.assertTrue(all(cwd == self.cfg.checkout for _, cwd in self.calls))
 
@@ -300,6 +319,33 @@ class PrepareWorktreeTest(unittest.TestCase):
     def test_git_failure_raises_with_stderr(self):
         with self.assertRaisesRegex(executor.PrepareError, 'no such remote'):
             executor.prepare_worktree(self.cfg, ticket(), run=self.run_ok(fail='fetch'))
+
+    def test_an_origin_on_github_is_fetched_with_the_token_through_a_fresh_repo(self):
+        # A service started outside VS Code has no credential helper, so an anonymous fetch of a private repo fails.
+        with mock.patch.dict(os.environ, {'SUPERAGENT_GITHUB_TOKEN': 'tok-x'}):
+            path, _ = executor.prepare_worktree(self.cfg, ticket(),
+                                                run=self.run_ok(origin_url='https://github.com/O/r.git\n'))
+        cmds = [c for c, _ in self.calls]
+        remote = next(c for c in cmds if 'https://github.com/o/r.git' in c)
+        self.assertEqual(remote[-1], '+refs/heads/dev:refs/heads/dev')
+        self.assertNotIn(['git', 'fetch', 'origin', 'dev'], cmds)
+        self.assertEqual(cmds[-1], ['git', 'worktree', 'add', '-b', 'agent/fix-bug', path, 'origin/dev'])
+        self.assertFalse(any('tok-x' in ' '.join(c) for c in cmds))
+
+    def test_an_origin_on_github_without_a_token_is_fetched_as_before(self):
+        with mock.patch.dict(os.environ, {'SUPERAGENT_GITHUB_TOKEN': ''}):
+            executor.prepare_worktree(self.cfg, ticket(), run=self.run_ok(origin_url='https://github.com/o/r.git'))
+        self.assertIn(['git', 'fetch', 'origin', 'dev'], [c for c, _ in self.calls])
+
+    def test_fetching_every_branch_prunes_from_github_or_from_another_origin(self):
+        repo = self.cfg.repo_config('o/r')
+        with mock.patch.dict(os.environ, {'SUPERAGENT_GITHUB_TOKEN': 'tok-x'}):
+            self.assertEqual(executor.fetch_origin(self.cfg, repo, '*', self.run_ok(origin_url='/srv/r.git')), '')
+            self.assertEqual(self.calls[-1][0], ['git', 'fetch', '--prune', '--no-tags', 'origin'])
+            executor.fetch_origin(self.cfg, repo, '*', self.run_ok(origin_url='https://github.com/o/r'))
+        self.assertEqual(self.calls[-2][0][-1], '+refs/heads/*:refs/heads/*')
+        self.assertIn('--prune', self.calls[-1][0])
+        self.assertEqual(executor.fetch_origin(self.cfg, repo, '*', self.run_ok(fail='fetch')), 'fatal: no such remote')
 
 
 class MessagesTest(unittest.TestCase):
@@ -344,7 +390,30 @@ class ReportCliTest(unittest.TestCase):
             srv.close()
         self.assertEqual(code, 0)
         self.assertIn('ready', out)
-        self.assertEqual(seen, [('tk-abc', {'status': 'ready', 'summary': 'done', 'question': ''})])
+        self.assertEqual(seen, [('tk-abc', {'status': 'ready', 'summary': 'done', 'question': '', 'details': ''})])
+
+    def test_details_file_is_sent_with_the_report(self):
+        seen = []
+        srv = report.ReportServer(lambda tok: 'tk-abc', lambda tid, rep: seen.append(rep), port=0)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, 'pr.md')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('### Problem\n\nNav was hidden.\n')
+        try:
+            code, _, _ = self.call(['--status', 'ready', '--summary', 'done', '--details-file', path],
+                                   {'SUPERAGENT_URL': srv.url, 'SUPERAGENT_TICKET_TOKEN': 't'})
+        finally:
+            srv.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(seen[0]['details'], '### Problem\n\nNav was hidden.')
+
+    def test_missing_details_file_exits_2(self):
+        code, _, err = self.call(['--status', 'ready', '--summary', 'done', '--details-file',
+                                  os.path.join(tempfile.gettempdir(), 'superagent-no-such-file.md')],
+                                 {'SUPERAGENT_URL': 'http://127.0.0.1:1', 'SUPERAGENT_TICKET_TOKEN': 't'})
+        self.assertEqual(code, 2)
+        self.assertIn('--details-file', err)
 
     def test_missing_env_exits_2(self):
         code, _, err = self.call(['--status', 'ready', '--summary', 'done'], {})
@@ -393,7 +462,9 @@ class ReportServerTest(unittest.TestCase):
 
     def test_bad_body_is_400(self):
         for body in (b'not json', {'status': 'done', 'summary': 'x'}, {'status': 'ready', 'summary': ''},
-                     {'status': 'ready', 'summary': 'x' * 4001}, {'status': 'waiting', 'summary': 'x'}):
+                     {'status': 'ready', 'summary': 'x' * 4001}, {'status': 'waiting', 'summary': 'x'},
+                     {'status': 'ready', 'summary': 'x', 'details': 5},
+                     {'status': 'ready', 'summary': 'x', 'details': 'x' * 16001}):
             self.assertEqual(self.post(body)[0], 400, body)
         self.assertEqual(self.seen, [])
 
@@ -424,8 +495,127 @@ class ReportServerTest(unittest.TestCase):
     def test_good_report_calls_on_report(self):
         code, body = self.post({'status': 'waiting', 'summary': 'stuck', 'question': 'Which API?'})
         self.assertEqual((code, body['ok']), (200, True))
-        self.assertEqual(self.seen, [('tk-abc', {'status': 'waiting', 'summary': 'stuck', 'question': 'Which API?'})])
+        self.assertEqual(self.seen, [('tk-abc', {'status': 'waiting', 'summary': 'stuck', 'question': 'Which API?',
+                                                 'details': ''})])
         self.assertTrue(self.srv.url.startswith('http://127.0.0.1:'))
+
+
+class FakeCopilot(CopilotAcp):
+    """Runs tests/fake_copilot.py in place of the copilot binary, keeping every other argument."""
+
+    async def start(self, argv, cwd, env):
+        self.argv, self.env = argv, env
+        await super().start([sys.executable, FAKE_COPILOT, *argv[1:]], cwd, env)
+
+
+class CopilotTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        os.makedirs(os.path.join(self.tmp, 'work', 'fix-bug'))
+        self.fake_state = os.path.join(self.tmp, 'fake-copilot')
+        os.makedirs(self.fake_state)
+        self.cfg = cfg(self.tmp, agent='copilot', copilot='copilot', model='claude-sonnet-5.5', thinking='off')
+
+    async def start(self, mode, t=None):
+        t = t or ticket()
+        w = executor.Worker()
+        def spawn():
+            return FakeCopilot(worker_log.copilot_session_file(self.tmp, t.id), executor.copilot_preamble(t))
+        with mock.patch.dict(os.environ, {'FAKE_COPILOT_MODE': mode, 'FAKE_COPILOT_STATE': self.fake_state}):
+            await w.start(self.cfg, t, 'http://127.0.0.1:1', spawn=spawn)
+        return w
+
+    def turns(self, sid='s1'):
+        with open(os.path.join(self.fake_state, sid)) as f:
+            return f.read().splitlines()
+
+    async def test_a_new_session_gets_the_worker_prompt_once_and_a_later_process_resumes_it(self):
+        w = await self.start('ok')
+        try:
+            r = await w.run('hello', timeout=10)
+            r2 = await w.run('again', timeout=10)
+        finally:
+            await w.stop()
+        self.assertEqual((r.text, r.error, r.settled), ('turns 1: hello', '', True))  # the last message only
+        self.assertEqual(r2.text, 'turns 2: again')
+        self.assertEqual(w.rpc.env['COPILOT_HOME'], os.path.join(self.tmp, 'copilot-home'))  # not ~/.copilot
+        first, second = self.turns()
+        self.assertIn('You are a superagent worker', first)
+        self.assertIn('superagent-report --status', first)  # the worker skill, inlined
+        self.assertNotIn('superagent worker', second)
+        self.assertEqual(worker_log.session_files(self.tmp, 'tk-abc'), [])  # no Copilot events folder here
+        with open(worker_log.copilot_session_file(self.tmp, 'tk-abc')) as f:
+            self.assertEqual(f.read(), 's1')
+        w = await self.start('ok')  # a retry or an answer: a new process
+        try:
+            r = await w.run('answer', timeout=10)
+        finally:
+            await w.stop()
+        self.assertEqual(r.text, 'turns 3: answer')  # same session; the replayed history is not the result
+        self.assertNotIn('superagent worker', self.turns()[2])
+
+    async def test_a_lost_session_starts_a_new_one_with_the_prompt(self):
+        os.makedirs(os.path.join(self.tmp, 'copilot-sessions'))
+        with open(worker_log.copilot_session_file(self.tmp, 'tk-abc'), 'w') as f:
+            f.write('gone')
+        w = await self.start('ok')
+        try:
+            await w.run('hello', timeout=10)
+        finally:
+            await w.stop()
+        self.assertIn('You are a superagent worker', self.turns()[0])
+
+    async def test_a_message_during_a_run_is_queued_and_a_timeout_cancels_the_run(self):
+        w = await self.start('hang')
+        try:
+            run = asyncio.create_task(w.run('work', timeout=1))
+            while not w.running:
+                await asyncio.sleep(0.01)
+            self.assertEqual(await w.send('also this'), 'queued')  # copilot cannot be steered
+            r = await run
+        finally:
+            await w.stop()
+        self.assertEqual((r.error, r.aborted), ('timeout', True))
+        self.assertEqual(w.queued, ['also this'])
+
+    async def test_permission_requests_are_allowed_and_a_crash_is_an_error(self):
+        w = await self.start('permission')
+        try:
+            r = await w.run('work', timeout=10)
+        finally:
+            await w.stop()
+        self.assertEqual(r.text, 'permission yes')
+        w = await self.start('crash')
+        try:
+            r = await w.run('work', timeout=10)
+        finally:
+            await w.stop()
+        self.assertRegex(r.error, '^copilot exited')
+
+    def test_argv_keeps_the_users_setup_and_github_login_out(self):
+        t = ticket(skills=['/skills/a'], thinking='high', model='github-copilot/gpt-6')
+        argv = executor.copilot_argv(self.cfg, t)
+        self.assertEqual(argv[1:5], ['--acp', '--stdio', '--model', 'gpt-6'])
+        for flag in ('--disable-builtin-mcps', '--no-custom-instructions', '--allow-all-tools', '--no-ask-user'):
+            self.assertIn(flag, argv)
+        self.assertEqual(argv[argv.index('--reasoning-effort') + 1], 'high')
+        self.assertEqual(argv[-2:], ['--add-dir', '/skills/a'])
+        argv = executor.copilot_argv(self.cfg, ticket())
+        self.assertEqual((argv[argv.index('--model') + 1], argv[argv.index('--reasoning-effort') + 1]),
+                         ('claude-sonnet-5.5', 'none'))
+        self.assertIn('/skills/a/SKILL.md', executor.copilot_preamble(t).replace(os.sep, '/'))
+
+
+class CopilotModelsTest(unittest.TestCase):
+    def test_the_enabled_models_come_with_their_premium_request_cost(self):
+        state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, state, True)
+        env = {**os.environ, 'FAKE_COPILOT_STATE': state}
+        self.assertEqual(offered_models([sys.executable, FAKE_COPILOT], state, env),
+                         [('auto', 'Let Copilot pick'), ('gpt-6', '1x premium requests'),
+                          ('opus', '15x premium requests')])  # 'off' is disabled by policy
+        self.assertEqual(offered_models([os.path.join(state, 'no-copilot')], state, env), [])
 
 
 if __name__ == '__main__':

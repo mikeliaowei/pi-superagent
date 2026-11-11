@@ -202,12 +202,36 @@ class Store:
 
     # Local requests (S15): `superagent ask` and `answer` queue them; the running service applies each once.
     @_locked
-    def queue_ask(self, text, repos, actor):
-        """Queue a local request for a new Ticket in `repos`; returns its id (the thread is `local:<id>`)."""
+    def queue_ask(self, text, repos, actor, branch='', options=None):
+        """Queue a local request for a new Ticket in `repos`; returns its id (the thread is `local:<id>`). `branch`:
+        an existing branch to work on instead of a new one. `options`: {title, new_branch, skills} (see
+        ask_options)."""
         cur = self.db.execute('INSERT INTO local_requests (kind, repos, text, actor, at) VALUES (?, ?, ?, ?, ?)',
                               ('ask', json.dumps(list(repos)), text, actor, now_iso()))
+        # In kv, not new columns: tables are never altered (see _keep_column_reasons).
+        if branch:
+            self.db.execute('INSERT OR REPLACE INTO kv VALUES (?, ?)', (f'ask-branch:{cur.lastrowid}', json.dumps(branch)))
+        options = {k: v for k, v in (options or {}).items() if v}
+        if options:
+            self.db.execute('INSERT OR REPLACE INTO kv VALUES (?, ?)',
+                            (f'ask-options:{cur.lastrowid}', json.dumps(options)))
         self.db.commit()
         return cur.lastrowid
+
+    @_locked
+    def ask_branch(self, request_id):
+        """The existing branch a local request asked to work on; '' for a new branch."""
+        row = self.db.execute('SELECT v FROM kv WHERE k = ?', (f'ask-branch:{request_id}',)).fetchone()
+        return json.loads(row['v']) if row else ''
+
+    @_locked
+    def ask_options(self, request_id):
+        """What a local request chose for its Ticket: {title: the Ticket's title ('' = the request's first line),
+        new_branch: the name of its new branch ('' = agent/<name>), skills: skill paths for its worker, model and
+        thinking: its worker's ('' = the config's)}."""
+        row = self.db.execute('SELECT v FROM kv WHERE k = ?', (f'ask-options:{request_id}',)).fetchone()
+        return {'title': '', 'new_branch': '', 'skills': [], 'model': '', 'thinking': '',
+                **(json.loads(row['v']) if row else {})}
 
     @_locked
     def queue_answer(self, ticket_id, text, actor):

@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 import re
+import shlex
+import sys
 import unittest
 
 from superagent import cli
@@ -80,7 +82,7 @@ class CrossRepoTest(ServiceBase):
         msg = self.pi.runs[0].messages[0]
         for part in t.parts:
             self.assertIn(part['repo'], msg)
-            self.assertIn(part['worktree'], msg)
+            self.assertIn(json.dumps(part['worktree']), msg)
         self.assertIn('"base_branch": "main"', msg)
         self.assertIn('commit in each repo you change', msg)
         self.assertEqual(len(self.store.tickets()), 1)
@@ -107,14 +109,18 @@ class CrossRepoTest(ServiceBase):
     async def test_ready_with_commits_in_both_tests_both_and_opens_two_linked_prs_and_one_reply(self):
         seen = os.path.join(self.tmp, 'seen')
         os.makedirs(seen)
-        t = await self.deliver_both(one_test=f'pwd > {seen}/one; echo ok', two_test=f'pwd > {seen}/two; echo ok')
+        q = shlex.quote(seen)  # a Windows path's backslashes are escapes to sh
+        # os.getcwd, not pwd: Git Bash's pwd prints /c/... instead of C:\...
+        pwd = f'{shlex.quote(sys.executable)} -c "import os; print(os.getcwd())"'
+        one, two = f'{pwd} > {q}/one', f'{pwd} > {q}/two'
+        t = await self.deliver_both(one_test=f'{one}; echo ok', two_test=f'{two}; echo ok')
         for slug, part in zip(('one', 'two'), t.parts):
             self.assertEqual(os.path.realpath(open(f'{seen}/{slug}').read().strip()), os.path.realpath(part['worktree']))
         (a_pr,), (b_pr,) = list(self.one.pulls), list(self.two.pulls)
         self.assertEqual([p['pr_number'] for p in t.parts], [a_pr, b_pr])
         a_url, b_url = f'https://github.com/a/one/pull/{a_pr}', f'https://github.com/b/two/pull/{b_pr}'
         a_body, b_body = self.one.pulls[a_pr]['body'], self.two.pulls[b_pr]['body']
-        for body, other, command in ((a_body, b_url, f'pwd > {seen}/one'), (b_body, a_url, f'pwd > {seen}/two')):
+        for body, other, command in ((a_body, b_url, one), (b_body, a_url, two)):
             self.assertIn('Part of a cross-repo change:', body)
             self.assertIn(other, body)
             self.assertIn(f'Tests: `{command}; echo ok` passed in ', body)
@@ -130,7 +136,8 @@ class CrossRepoTest(ServiceBase):
         self.assertEqual(self.two.posted(), [])
         dirs = sorted(next(a for a in argv if a.startswith('--git-dir=')) for argv, _ in self.git.pushes)
         self.assertEqual([re.sub(r'\.git\.\w+$', '.git', d) for d in dirs],
-                         [f'--git-dir={self.state}/push/a__one.git', f'--git-dir={self.state}/push/b__two.git'])
+                         [f'--git-dir={os.path.join(self.state, "push", "a__one.git")}',
+                          f'--git-dir={os.path.join(self.state, "push", "b__two.git")}'])
         self.assertFalse(any(os.path.exists(d.split('=', 1)[1]) for d in dirs))  # each fresh push repo is removed
         self.assertEqual(len(self.effect_keys('test')), 1)
 
@@ -235,7 +242,8 @@ class CrossRepoTest(ServiceBase):
     async def test_the_token_never_reaches_test_commands_or_posted_bodies(self):
         seen = os.path.join(self.tmp, 'seen')
         os.makedirs(seen)
-        t = await self.deliver_both(one_test=f'env > {seen}/one', two_test=f'env > {seen}/two')
+        q = shlex.quote(seen)
+        t = await self.deliver_both(one_test=f'env > {q}/one', two_test=f'env > {q}/two')
         for slug in ('one', 'two'):
             env = open(f'{seen}/{slug}').read()
             for secret in (TOKEN, 'gh-secret-456', 'SUPERAGENT_GITHUB_TOKEN', 'GH_TOKEN', t.token):

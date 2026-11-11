@@ -38,6 +38,8 @@ def message_text(message):
 
 
 class PiRpc:
+    NAME = 'pi'  # in error messages and logs
+
     def __init__(self):
         self.proc = None
         self.exit_error = ''
@@ -60,7 +62,7 @@ class PiRpc:
         while line := await self.proc.stderr.readline():
             text = line.decode(errors='replace').rstrip()
             self._stderr.append(text)
-            log.debug('pi stderr: %s', text)
+            log.debug('%s stderr: %s', self.NAME, text)
 
     async def _read_stdout(self, stderr_task):
         # StreamReader.readline splits on b'\n' only, as the protocol requires (never on U+2028).
@@ -71,7 +73,7 @@ class PiRpc:
             try:
                 rec = json.loads(line)
             except ValueError:
-                log.warning('pi wrote a non-JSON line: %r', line[:200])
+                log.warning('%s wrote a non-JSON line: %r', self.NAME, line[:200])
                 continue
             await self._route(rec)
         code = await self.proc.wait()
@@ -80,7 +82,7 @@ class PiRpc:
         except asyncio.TimeoutError:
             pass
         tail = '\n'.join(self._stderr)[-800:]
-        self.exit_error = f'pi exited (code {code}): {tail}'.rstrip(': ')
+        self.exit_error = f'{self.NAME} exited (code {code}): {tail}'.rstrip(': ')
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(RpcError(self.exit_error))
@@ -110,12 +112,12 @@ class PiRpc:
     # Writing
     async def _send(self, obj):
         if self.exit_error or self.proc is None or self.proc.stdin.is_closing():
-            raise RpcError(self.exit_error or 'pi is not running')
+            raise RpcError(self.exit_error or f'{self.NAME} is not running')
         try:
             self.proc.stdin.write(json.dumps(obj).encode() + b'\n')
             await self.proc.stdin.drain()
         except (BrokenPipeError, ConnectionResetError) as e:
-            raise RpcError(self.exit_error or f'pi stdin closed: {e}') from e
+            raise RpcError(self.exit_error or f'{self.NAME} stdin closed: {e}') from e
 
     async def request(self, type, timeout=30, **fields):
         rid = f'sa-{next(self._ids)}'

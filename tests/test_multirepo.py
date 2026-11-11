@@ -5,7 +5,9 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
+import sys
 import tempfile
 import time
 import unittest
@@ -99,16 +101,16 @@ class CheckTest(unittest.TestCase):
             good = make_clone(tmp, 'one')
         config = write(os.path.join(tmp, 'c.toml'),
                        f'[github]\nagent_login = "bot"\ntoken_env = "SA_TEST_TOKEN"\n[policy]\nallowed = ["alice"]\n'
-                       f'[executor]\npi = "{tmp}/no-pi"\n[service]\nstate_dir = "{tmp}/state"\nreport_port = 0\n'
-                       f'[[repos]]\nname = "a/one"\ncheckout = "{good}"\n'
-                       f'[[repos]]\nname = "b/two"\ncheckout = "{tmp}/missing"\n')
+                       f'[executor]\npi = \'{tmp}/no-pi\'\n[service]\nstate_dir = \'{tmp}/state\'\nreport_port = 0\n'
+                       f'[[repos]]\nname = "a/one"\ncheckout = \'{good}\'\n'
+                       f'[[repos]]\nname = "b/two"\ncheckout = \'{tmp}/missing\'\n')
         out = io.StringIO()
         with mock.patch.dict(os.environ, {'SA_TEST_TOKEN': 'x'}), redirect_stdout(out), redirect_stderr(io.StringIO()):
             code = cli.main(['--config', config, 'check'])
         self.assertEqual(code, 1)
         lines = out.getvalue().splitlines()
         self.assertEqual(lines[0], 'ok    config loads: a/one, b/two as bot')
-        self.assertIn(f'ok    checkout: {good} is a git repo with origin {tmp}/one.git', lines)
+        self.assertIn(f'ok    checkout: {good} is a git repo with origin {os.path.join(tmp, "one.git")}', lines)
         self.assertIn(f'FAIL  checkout: {tmp}/missing is not a git clone with an origin remote; '
                       f'run `git clone https://github.com/b/two.git {tmp}/missing`', lines)
 
@@ -253,8 +255,8 @@ class MultiRepoServiceTest(ServiceBase):
         self.assertEqual(other.posted(), [])
         pushes = sorted((argv[-2], re.sub(r'\.git\.\w+$', '.git', next(a for a in argv if a.startswith('--git-dir='))))
                         for argv, _ in self.git.pushes)
-        self.assertEqual(pushes, [('https://github.com/a/one.git', f"--git-dir={self.state}/push/a__one.git"),
-                                  ('https://github.com/b/two.git', f"--git-dir={self.state}/push/b__two.git")])
+        self.assertEqual(pushes, [('https://github.com/a/one.git', '--git-dir=' + os.path.join(self.state, 'push', 'a__one.git')),
+                                  ('https://github.com/b/two.git', '--git-dir=' + os.path.join(self.state, 'push', 'b__two.git'))])
 
         two.merge(tb.pr_number)
         await self.svc.check_pulls()
@@ -267,7 +269,7 @@ class MultiRepoServiceTest(ServiceBase):
         self.assertEqual(cli.status_data(cfg, self.store)['repos'], ['a/one', 'b/two'])
         self.assertEqual(cli._row(self.store.ticket('tk-1'), cfg)['repo'], 'b/two')
         cfg_path = write(os.path.join(self.tmp, 'c.toml'),
-                         f'[github]\nagent_login = "bot"\n[policy]\nallowed = ["a"]\n[service]\nstate_dir = "{self.state}"\n'
+                         f'[github]\nagent_login = "bot"\n[policy]\nallowed = ["a"]\n[service]\nstate_dir = \'{self.state}\'\n'
                          f'[[repos]]\nname = "a/one"\ncheckout = "/x"\n[[repos]]\nname = "b/two"\ncheckout = "/y"\n')
         out = io.StringIO()
         with redirect_stdout(out), redirect_stderr(io.StringIO()):
@@ -360,7 +362,10 @@ class EnforcedTestsTest(ServiceBase):
     async def test_passing_tests_deliver_with_a_pr_line_and_run_with_the_worker_environment(self):
         seen = os.path.join(self.tmp, 'seen')
         os.makedirs(seen)
-        self.start(f'env > {seen}/env; pwd > {seen}/pwd; echo all good',
+        q = shlex.quote(seen)  # a Windows path's backslashes are escapes to sh
+        # os.getcwd, not pwd: Git Bash's pwd prints /c/... instead of C:\...
+        self.start(f'env > {q}/env; {shlex.quote(sys.executable)} -c "import os; print(os.getcwd())" > {q}/pwd; '
+                   'echo all good',
                    {'commit': True, 'report': {'status': 'ready', 'summary': 'Fixed.'}})
         await self.round()
         await self.drain()

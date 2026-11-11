@@ -69,9 +69,18 @@ class PolicyTest(unittest.TestCase):
 
 class ModelTest(unittest.TestCase):
     def test_short_name_is_kebab_and_unique(self):
-        self.assertEqual(short_name('Fix the login page crash on Safari!'), 'fix-the-login-page')
+        self.assertEqual(short_name('Fix the login page crash on Safari!'), 'fix-the-login-page-crash-on-safari')
         self.assertEqual(short_name('Fix the login page', taken={'fix-the-login-page'}), 'fix-the-login-page-2')
         self.assertEqual(short_name('!!!'), 'task')
+
+    def test_short_name_keeps_the_whole_title_up_to_8_words_and_48_characters(self):
+        self.assertEqual(short_name('Fix Nav manager not showing issue'), 'fix-nav-manager-not-showing-issue')
+        self.assertEqual(short_name('one two three four five six seven eight nine'), 'one-two-three-four-five-six-seven-eight')
+        long = short_name('Refactor authentication middleware configuration loader properly now')
+        self.assertEqual(long, 'refactor-authentication-middleware-configuration')
+        self.assertLessEqual(len(long), 48)
+        self.assertEqual(len(short_name('x' * 60)), 48)
+        self.assertEqual(short_name('a' * 48, taken={'a' * 48}), 'a' * 45 + '-2')
 
     def test_stage_rows_in_order(self):
         self.assertEqual(stage(ticket()), 'working/queued')
@@ -177,11 +186,130 @@ class ConfigTest(unittest.TestCase):
         finally:
             os.unlink(f.name)
         self.assertEqual((c.model, c.provider, c.poll_seconds), ('claude-haiku-5-5', 'anthropic', 60))
-        self.assertTrue(c.checkout.startswith('/'))
+        self.assertTrue(os.path.isabs(c.checkout))
         env = c.worker_env({'SUPERAGENT_GITHUB_TOKEN': 'x', 'GH_TOKEN': 'y', 'GITHUB_TOKEN': 'z', 'PATH': '/bin'})
         self.assertEqual(env, {'PATH': '/bin'})
         with self.assertRaisesRegex(ValueError, 'poll_seconds'):
             cfgmod.Config(repo='o/r', agent_login='b', allowed=[], checkout='.', poll_seconds=5)
+
+
+class ConfigUpdateTest(unittest.TestCase):
+    MULTI = ('# my config\n[github]\nagent_login = "bot"\n[policy]\nallowed = ["alice"]\n\n'
+             '[executor]\n# the worker model\nmodel = "m1"  # old\n\n'
+             "[[repos]]\nname = \"a/one\"\ncheckout = 'C:\\src\\one'\n\n"
+             '[[repos]]\nname = "b/two"\ncheckout = "/src/two"\ntest_command = "make test"\n')
+
+    def write_config(self, text):
+        d = tempfile.mkdtemp(prefix='superagent-cfg-')
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, 'config.toml')
+        with open(path, 'w', encoding='utf-8', newline='') as f:
+            f.write(text)
+        return path
+
+    def read(self, path):
+        with open(path, encoding='utf-8', newline='') as f:
+            return f.read()
+
+    def test_update_changes_settings_in_place_and_keeps_the_comments(self):
+        path = self.write_config(self.MULTI)
+        cfgmod.update(path, {'model': 'm2', 'thinking': 'high', 'poll_seconds': 120},
+                      {'B/Two': {'test_command': 'make "check"', 'test_timeout': 60},
+                       'a/one': {'checkout': 'D:\\work\\one'}})
+        text = self.read(path)
+        for kept in ('# my config', '# the worker model', '\n[[repos]]\nname = "a/one"\n'):
+            self.assertIn(kept, text)
+        self.assertIn('model = "m2"\n', text)  # replaced where it was
+        c = cfgmod.load(path)
+        self.assertEqual((c.model, c.thinking, c.poll_seconds), ('m2', 'high', 120))
+        self.assertEqual([(r.checkout, r.test_command, r.test_timeout) for r in c.repos],
+                         [('D:\\work\\one', '', 900), ('/src/two', 'make "check"', 60)])
+
+    def test_update_keeps_windows_line_endings_and_adds_a_missing_table(self):
+        no_executor = self.MULTI.replace('[executor]\n# the worker model\nmodel = "m1"  # old\n\n', '')
+        path = self.write_config(no_executor.replace('\n', '\r\n'))
+        cfgmod.update(path, {'model': 'm3', 'max_workers': 4})
+        self.assertNotIn('\n', self.read(path).replace('\r\n', ''))
+        c = cfgmod.load(path)
+        self.assertEqual((c.model, c.max_workers), ('m3', 4))
+
+    def test_update_writes_nothing_it_cannot_do_exactly(self):
+        path = self.write_config(self.MULTI)
+        cases = [({'token_env': 'X'}, None, 'token_env cannot be changed here'),
+                 ({'checkout': '/x'}, None, 'checkout cannot be changed here'),  # [[repos]] form: per repo
+                 ({'max_workers': 99}, None, 'max_workers must be between 1 and 16'),
+                 (None, {'x/y': {'checkout': '/x'}}, r'repo x/y is not a \[\[repos\]\] table'),
+                 (None, {'a/one': {'name': 'B/Two'}}, 'duplicate repo in'),
+                 (None, {'a/one': {'pi': '/x'}}, 'pi cannot be changed here')]
+        for values, repos, error in cases:
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                cfgmod.update(path, values, repos)
+        self.assertEqual(self.read(path), self.MULTI)
+        inline = self.write_config('repos = [{name = "a/one", checkout = "/a"}]\n'
+                                   '[github]\nagent_login = "bot"\n[policy]\nallowed = ["a"]\n')
+        with self.assertRaisesRegex(ValueError, 'edit the config file by hand'):
+            cfgmod.update(inline, None, {'a/one': {'checkout': '/b'}})
+
+    def test_update_edits_the_single_repo_forms_checkout(self):
+        path = self.write_config('[github]\nrepo = "o/r"\nagent_login = "bot"\n[policy]\nallowed = ["a"]\n'
+                                 '[executor]\ncheckout = "/old"\n')
+        cfgmod.update(path, {'checkout': '/new', 'base_branch': 'dev'})
+        c = cfgmod.load(path)
+        self.assertEqual((c.checkout, c.base_branch), ('/new', 'dev'))
+
+    def test_add_repo_appends_a_repos_table(self):
+        path = self.write_config(self.MULTI)
+        cfgmod.add_repo(path, ' c/three ', 'E:\\src\\three', test_command='npm test', test_timeout=60)
+        text = self.read(path)
+        self.assertTrue(text.startswith(self.MULTI))  # nothing else changed
+        c = cfgmod.load(path)
+        self.assertEqual(c.repo_names, ['a/one', 'b/two', 'c/three'])
+        r = c.repo_config('c/three')
+        self.assertEqual((r.checkout, r.base_branch, r.test_command, r.test_timeout),
+                         ('E:\\src\\three', 'main', 'npm test', 60))
+        with self.assertRaisesRegex(ValueError, 'duplicate repo'):
+            cfgmod.add_repo(path, 'A/One', '/x')
+        with self.assertRaisesRegex(ValueError, 'repo must be owner/name'):
+            cfgmod.add_repo(path, 'four', '/x')
+        self.assertEqual(self.read(path), text)
+
+    def test_the_worker_agent_is_pi_or_copilot_and_can_be_switched(self):
+        path = self.write_config(self.MULTI)
+        self.assertEqual(cfgmod.load(path).agent, 'pi')
+        cfgmod.update(path, {'agent': 'copilot'})
+        self.assertEqual(cfgmod.load(path).agent, 'copilot')
+        with self.assertRaisesRegex(ValueError, 'agent must be one of: pi, copilot'):
+            cfgmod.update(path, {'agent': 'codex'})
+
+    def test_remove_repo_drops_its_table_and_a_rename_keeps_the_rest(self):
+        path = self.write_config(self.MULTI)
+        cfgmod.update(path, repos={'b/two': {'name': 'c/three'}})
+        self.assertEqual(cfgmod.load(path).repo_config('c/three').test_command, 'make test')
+        cfgmod.remove_repo(path, 'A/ONE')
+        text = self.read(path)
+        self.assertNotIn('a/one', text)
+        self.assertIn('# the worker model', text)
+        self.assertEqual(cfgmod.load(path).repo_names, ['c/three'])
+        with self.assertRaisesRegex(ValueError, 'only repo'):
+            cfgmod.remove_repo(path, 'c/three')
+        with self.assertRaisesRegex(ValueError, 'not a \\[\\[repos\\]\\] table'):
+            cfgmod.remove_repo(path, 'x/y')
+        self.assertEqual(self.read(path), text)
+
+    def test_add_repo_moves_a_single_repo_config_to_repos_tables(self):
+        single = ('# mine\r\n[github]\r\nrepo = "o/r"  # the repo\r\nagent_login = "bot"\r\n[policy]\r\n'
+                  'allowed = ["a"]\r\n[executor]\r\n# my clone\r\ncheckout = "~/src/r"\r\nbase_branch = "dev"\r\n')
+        path = self.write_config(single)
+        cfgmod.add_repo(path, 'x/new', '/src/new')
+        text = self.read(path)
+        self.assertNotIn('\n', text.replace('\r\n', ''))
+        for kept in ('# mine', '# my clone', 'base_branch = "dev"'):
+            self.assertIn(kept, text)
+        self.assertNotIn('repo = "o/r"', text)
+        c = cfgmod.load(path)
+        self.assertFalse(c.legacy)
+        self.assertEqual([(r.name, r.checkout, r.base_branch) for r in c.repos],
+                         [('o/r', os.path.expanduser('~/src/r'), 'dev'), ('x/new', '/src/new', 'dev')])
 
 
 if __name__ == '__main__':
