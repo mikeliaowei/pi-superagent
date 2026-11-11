@@ -21,6 +21,7 @@ from superagent import config as config_mod
 from superagent import github as gh_mod
 from superagent.config import Config
 from superagent.model import Ticket
+from tests import toml_path
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200  # the Win32 value; subprocess only defines it on Windows
 
@@ -280,6 +281,15 @@ class PiPathOnWindowsTest(unittest.TestCase):
         which = mock.Mock(return_value='/usr/local/bin/pi')
         missing = os.path.join(self.tmp, 'pi')
         self.assertEqual(config_mod.resolve_pi(missing, default=True, windows=False, which=which), (missing, ''))
+
+    def test_a_copilot_path_is_normalized_and_a_bare_name_is_left_for_path_lookup(self):
+        def cfg(copilot):
+            return Config(agent_login='bot', allowed=['a'], repo='o/r', checkout=self.tmp, state_dir=self.tmp,
+                          agent='copilot', copilot=copilot)
+        self.assertEqual(cfg('copilot').copilot, 'copilot')
+        self.assertEqual(cfg(f'{toml_path(self.tmp)}/npm//copilot.cmd').copilot,
+                         os.path.join(self.tmp, 'npm', 'copilot.cmd'))
+        self.assertEqual(cfg('~/bin/copilot').copilot, os.path.join(os.path.expanduser('~'), 'bin', 'copilot'))
 
     def test_config_and_check_name_the_pi_in_use(self):
         found = os.path.join(self.tmp, 'npm', 'pi.cmd')

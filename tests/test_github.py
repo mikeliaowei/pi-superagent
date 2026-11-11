@@ -384,9 +384,9 @@ class FakeRun:
 NO_HOOKS = ('/dev/null' if os.name != 'nt'
             else os.path.join(os.environ.get('SystemRoot') or r'C:\Windows', 'System32', 'cmd.exe').replace('\\', '/'))
 HARDEN = ['-c', f'core.hooksPath={NO_HOOKS}', '-c', 'core.fsmonitor=false']
-# Windows networking needs a few more (secret-free) variables in the push env.
-PUSH_BASE = {'PATH', 'HOME'} | ({'SYSTEMROOT', 'WINDIR', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'TEMP', 'TMP',
-                                 'PATHEXT', 'COMSPEC'} if os.name == 'nt' else set())
+# Windows networking needs SYSTEMROOT (always kept) and, on Windows, a few more secret-free variables in the push env.
+PUSH_BASE = {'PATH', 'HOME', 'SYSTEMROOT'} | ({'WINDIR', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'TEMP', 'TMP',
+                                              'PATHEXT', 'COMSPEC'} if os.name == 'nt' else set())
 AUTH = base64.b64encode(f'x-access-token:{TOKEN}'.encode()).decode()
 
 
@@ -399,7 +399,8 @@ class GitTest(unittest.TestCase):
     def test_push_goes_through_a_fresh_private_bare_repo_with_the_token_only_in_the_push_env(self):
         run = FakeRun()
         with mock.patch.dict(os.environ, {'SUPERAGENT_GITHUB_TOKEN': TOKEN, 'GIT_CONFIG_COUNT': '1',
-                                          'GIT_CONFIG_KEY_0': 'core.hooksPath', 'GIT_CONFIG_VALUE_0': '/evil'}):
+                                          'GIT_CONFIG_KEY_0': 'core.hooksPath', 'GIT_CONFIG_VALUE_0': '/evil',
+                                          'HTTPS_PROXY': 'http://proxy:9000', 'SYSTEMROOT': r'C:\Windows'}):
             gh_mod.push_branch('/w/t', 'agent/fix', TOKEN, REPO, self.push_dir, run=run)
         (init, init_kw), (fetch, fetch_kw), (push, push_kw) = run.calls
         git_dir = init[-1]
@@ -411,8 +412,9 @@ class GitTest(unittest.TestCase):
         self.assertEqual(fetch, ['git', f'--git-dir={git_dir}', *HARDEN, 'fetch', '--no-tags', '/w/t',
                                  '+HEAD:refs/heads/agent/fix'])
         self.assertEqual(push, ['git', f'--git-dir={git_dir}', *HARDEN,
-                                '-c', 'http.proxy=', '-c', 'http.sslVerify=true',
-                                '-c', 'http.https://github.com/.proxy=', '-c', 'http.https://github.com/.sslVerify=true',
+                                '-c', 'http.proxy=http://proxy:9000', '-c', 'http.sslVerify=true',
+                                '-c', 'http.https://github.com/.proxy=http://proxy:9000',
+                                '-c', 'http.https://github.com/.sslVerify=true',
                                 'push', '--no-verify',
                                 'https://github.com/o/r.git', '+refs/heads/agent/fix:refs/heads/agent/fix'])
         for argv, kw in run.calls:
@@ -422,6 +424,7 @@ class GitTest(unittest.TestCase):
             self.assertNotIn('GIT_CONFIG_KEY_0', kw['env'])
             self.assertEqual((kw['env']['GIT_CONFIG_NOSYSTEM'], kw['env']['GIT_CONFIG_GLOBAL']), ('1', os.devnull))
         env = push_kw['env']
+        self.assertEqual(env['SYSTEMROOT'], r'C:\Windows')  # Windows networking needs it
         self.assertLessEqual(set(env), PUSH_BASE | {'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_TERMINAL_PROMPT',
                                                     'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'})
         self.assertEqual(env['GIT_CONFIG_COUNT'], '1')
@@ -429,6 +432,12 @@ class GitTest(unittest.TestCase):
         self.assertEqual(env['GIT_CONFIG_VALUE_0'], f'AUTHORIZATION: basic {AUTH}')
         self.assertEqual((env['GIT_TERMINAL_PROMPT'], env['GIT_CONFIG_NOSYSTEM'], env['GIT_CONFIG_GLOBAL']),
                          ('0', '1', os.devnull))
+
+    def test_a_push_onto_an_existing_branch_never_forces(self):
+        run = FakeRun()
+        gh_mod.push_branch('/w/t', 'feature/x', TOKEN, REPO, self.push_dir, run=run, force=False)
+        push = run.calls[-1][0]
+        self.assertEqual(push[-1], 'refs/heads/feature/x:refs/heads/feature/x')
 
     def test_a_planted_push_repo_config_is_never_used(self):
         # A path-specific key such as http.https://github.com/o/r.git.proxy beats any command-line pin, so the
@@ -455,6 +464,62 @@ class GitTest(unittest.TestCase):
         self.assertIn('fatal: denied', str(cm.exception))
         self.assertNotIn(TOKEN, str(cm.exception))
         self.assertNotIn(AUTH, str(cm.exception))
+
+    def test_fetch_from_github_goes_through_a_fresh_bare_repo_with_the_token_only_in_its_github_fetch(self):
+        run = FakeRun()
+        checkout_env = {'PATH': '/usr/bin', 'GIT_CONFIG_GLOBAL': os.devnull}
+        with mock.patch.dict(os.environ, {'SUPERAGENT_GITHUB_TOKEN': TOKEN, 'HTTPS_PROXY': 'http://proxy:9000'}):
+            gh_mod.fetch_from_github('/repo', REPO, TOKEN, 'dev', self.tmp, run=run, env=checkout_env)
+        (init, init_kw), (remote, remote_kw), (local, local_kw) = run.calls
+        git_dir = init[-1]
+        self.assertEqual(os.path.dirname(git_dir), self.tmp)
+        self.assertFalse(os.path.exists(git_dir))  # removed after the fetch
+        self.assertEqual(init, ['git', *HARDEN, 'init', '--bare', '-q', git_dir])
+        self.assertEqual(remote, ['git', f'--git-dir={git_dir}', *HARDEN,
+                                  '-c', 'http.proxy=http://proxy:9000', '-c', 'http.sslVerify=true',
+                                  '-c', 'http.https://github.com/.proxy=http://proxy:9000',
+                                  '-c', 'http.https://github.com/.sslVerify=true',
+                                  'fetch', '--no-tags', 'https://github.com/o/r.git', '+refs/heads/dev:refs/heads/dev'])
+        self.assertEqual(remote_kw['env']['GIT_CONFIG_VALUE_0'], f'AUTHORIZATION: basic {AUTH}')
+        # The checkout (worker-writable config) then fetches from the fresh repo, never with the token.
+        self.assertEqual(local, ['git', *HARDEN, 'fetch', '--no-tags', git_dir, '+refs/heads/dev:refs/remotes/origin/dev'])
+        self.assertEqual((local_kw['cwd'], local_kw['env']), ('/repo', checkout_env))
+        for argv, _ in run.calls:
+            self.assertNotIn(TOKEN, ' '.join(argv))
+        self.assertFalse(any(TOKEN in v or AUTH in v for v in init_kw['env'].values()))
+
+    def test_fetch_from_github_of_every_branch_prunes_the_checkouts_copy(self):
+        run = FakeRun()
+        gh_mod.fetch_from_github('/repo', REPO, TOKEN, '*', self.tmp, run=run, env={}, prune=True)
+        init, remote, local = (argv for argv, _ in run.calls)
+        self.assertEqual(remote[-1], '+refs/heads/*:refs/heads/*')
+        self.assertEqual(local, ['git', *HARDEN, 'fetch', '--no-tags', '--prune', init[-1],
+                                 '+refs/heads/*:refs/remotes/origin/*'])
+
+    def test_fetch_from_github_failure_raises_with_redacted_stderr_and_removes_the_fresh_repo(self):
+        run = FakeRun(128, stderr=f"fatal: couldn't find remote ref dev ({TOKEN} {AUTH})")
+        with self.assertRaises(GitHubError) as cm:
+            gh_mod.fetch_from_github('/repo', REPO, TOKEN, 'dev', self.tmp, run=run, env={})
+        self.assertIn("couldn't find remote ref dev", str(cm.exception))
+        self.assertNotIn(TOKEN, str(cm.exception))
+        self.assertNotIn(AUTH, str(cm.exception))
+        self.assertEqual(os.listdir(self.tmp), [])
+
+    def test_the_fresh_repo_is_removed_even_with_read_only_pack_files(self):
+        # git writes its pack files read-only, which a plain rmtree cannot delete on Windows.
+        class PackWriter(FakeRun):
+            def __call__(self, argv, **kw):
+                git_dir = next((a[len('--git-dir='):] for a in argv if a.startswith('--git-dir=')), None)
+                if git_dir and not os.path.exists(os.path.join(git_dir, 'objects', 'pack', 'pack-1.pack')):
+                    pack = os.path.join(git_dir, 'objects', 'pack', 'pack-1.pack')
+                    os.makedirs(os.path.dirname(pack), exist_ok=True)
+                    open(pack, 'w').close()
+                    os.chmod(pack, 0o444)
+                return super().__call__(argv, **kw)
+
+        gh_mod.push_branch('/w/t', 'agent/fix', TOKEN, REPO, self.push_dir, run=PackWriter())
+        gh_mod.fetch_from_github('/repo', REPO, TOKEN, 'dev', self.tmp, run=PackWriter(), env={})
+        self.assertEqual(os.listdir(self.tmp), [])
 
     def test_has_new_commits_runs_hardened_without_secrets(self):
         run = FakeRun(stdout='2\n')

@@ -12,6 +12,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -23,7 +24,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 from . import config as config_mod
-from .model import named_repos, stage
+from .model import THINKING_LEVELS, named_repos, stage
 
 DEFAULT_CONFIG = '~/.config/pi-superagent/config.toml'
 WINDOWS = os.name == 'nt'
@@ -268,16 +269,208 @@ def _ask_repos(cfg, repos, text):
     return chosen
 
 
-def ask_request(cfg, store, text, repos=()):
+BRANCH_NAME = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._/-]*')
+
+
+def _valid_branch(name):
+    return bool(BRANCH_NAME.fullmatch(name)) and '..' not in name and '//' not in name and not (
+        name.endswith(('/', '.lock', '.')) or name == 'HEAD' or name.startswith('refs/'))
+
+
+def _checkout_git(cfg, repo, *args, timeout=None):
+    # The service's own git environment: no token, no secrets, no global config, hooks off.
+    from .executor import git_env
+    from .github import GIT_HARDEN
+    try:
+        p = subprocess.run(['git', *GIT_HARDEN, *args], cwd=cfg.repo_config(repo).checkout, env=git_env(cfg),
+                           capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f'git {args[0]} failed in the checkout of {repo}: {e}') from e
+    if p.returncode != 0:
+        raise RuntimeError(f'git {args[0]} failed in the checkout of {repo}: {(p.stderr or p.stdout).strip()}')
+    return p.stdout
+
+
+def list_branches(cfg, repo):
+    """The branches a request on `repo` can work on, read from its checkout: [(name, where)] with where 'GitHub',
+    'local' or 'GitHub and local'. GitHub branches are as of the checkout's last fetch (see fetch_branches). The
+    base branch and the workers' own local agent/* branches are left out."""
+    places = _branch_places(cfg, repo)
+    base = cfg.repo_config(repo).base_branch.lower()
+    names = [n for n, where in places.items() if _valid_branch(n) and n.lower() != base
+             and not (where == ['local'] and n.startswith('agent/'))]
+    return [(n, ' and '.join(sorted(places[n]))) for n in sorted(names, key=str.lower)]
+
+
+def _branch_places(cfg, repo):
+    """Every branch the checkout of `repo` knows: {name: ['GitHub' and/or 'local']}."""
+    places = {}
+    for ref in _checkout_git(cfg, repo, 'for-each-ref', '--format=%(refname)', 'refs/remotes/origin',
+                             'refs/heads').split():
+        for prefix, place in (('refs/remotes/origin/', 'GitHub'), ('refs/heads/', 'local')):
+            if ref.startswith(prefix):
+                places.setdefault(ref[len(prefix):], []).append(place)
+    return places
+
+
+def fetch_branches(cfg, repo):
+    """Bring the checkout's copy of the GitHub branches of `repo` up to date (git fetch --prune origin)."""
+    from .executor import fetch_origin
+    try:
+        error = fetch_origin(cfg, cfg.repo_config(repo), '*', timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        error = str(e)
+    if error:
+        raise RuntimeError(f'git fetch failed in the checkout of {repo}: {error}')
+    return f'fetched the branches of {repo} from GitHub'
+
+
+def _existing_branch(cfg, branch, repos):
+    """Check an existing branch named for a request; returns it stripped ('' for a new branch)."""
+    branch = (branch or '').strip()
+    if not branch:
+        return ''
+    if len(repos) != 1:
+        raise RuntimeError('an existing branch works with one repo; name one with --repo')
+    if not _valid_branch(branch):
+        raise RuntimeError(f'{branch!r} is not a valid branch name')
+    base = cfg.repo_config(repos[0]).base_branch
+    if branch.lower() == base.lower():
+        raise RuntimeError(f'{branch} is the base branch of {repos[0]}; name a feature branch, or leave it out for a '
+                           'new branch')
+    return branch
+
+
+def _new_branch(cfg, store, name, repos):
+    """Check the name chosen for a request's new branch; returns it stripped ('' for the default agent/<name>).
+    The service creates it and force-pushes it, so it must not be a branch that exists already."""
+    name = (name or '').strip()
+    if not name:
+        return ''
+    if not _valid_branch(name):
+        raise RuntimeError(f'{name!r} is not a valid branch name')
+    for repo in repos:
+        if name.lower() == cfg.repo_config(repo).base_branch.lower():
+            raise RuntimeError(f'{name} is the base branch of {repo}; name a new branch')
+        if name.lower() in {b.lower() for b in _branch_places(cfg, repo)}:
+            raise RuntimeError(f'{name} already exists in {repo}; to work on it choose it as an existing branch '
+                               '(--branch), or name a new one')
+    busy = next((t for t in store.tickets(state='open') if t.branch.lower() == name.lower()), None)
+    if busy:
+        raise RuntimeError(f'ticket {busy.name} already works on {busy.branch}; name another branch')
+    return name
+
+
+def _skill_paths(skills):
+    """The chosen skills as absolute paths, each a folder with a SKILL.md or a .md file, without repeats."""
+    paths = []
+    for s in skills or ():
+        path = os.path.abspath(os.path.expanduser(s.strip()))
+        if not (os.path.isfile(os.path.join(path, 'SKILL.md')) or (os.path.isfile(path) and path.endswith('.md'))):
+            raise RuntimeError(f'no skill at {path}: a skill is a folder with a SKILL.md, or a .md file')
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def pi_agent_dir():
+    return os.path.abspath(os.path.expanduser(os.environ.get('PI_CODING_AGENT_DIR') or '~/.pi/agent'))
+
+
+REPO_SKILL_DIRS = ('.agents/skills', '.pi/skills', '.claude/skills')
+
+
+def list_skills(cfg, repos=()):
+    """The skills a request can give its worker: [(path, name, where)], sorted by name. From the user's Pi skills
+    ('Pi'), ~/.agents/skills ('~/.agents') and each of `repos`' checkout (.agents, .pi and .claude skills, where =
+    the repo). A skill is a folder with a SKILL.md; superagent's own operator skill (pi-install) is left out."""
+    roots = [(os.path.join(pi_agent_dir(), 'skills'), 'Pi'),
+             (os.path.join(os.path.expanduser('~'), '.agents', 'skills'), '~/.agents')]
+    for repo in repos:
+        checkout = cfg.repo_config(repo).checkout
+        roots += [(os.path.join(checkout, *d.split('/')), cfg.repo_config(repo).name) for d in REPO_SKILL_DIRS]
+    found = []
+    for root, where in roots:
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in names:
+            skill = os.path.join(root, name, 'SKILL.md')
+            try:
+                with open(skill, encoding='utf-8', errors='replace') as f:
+                    if PI_MARKER in f.read():
+                        continue  # the operator's skill: it drives superagent, not a worker's task
+            except OSError:
+                continue
+            found.append((os.path.join(root, name), name, where))
+    return sorted(found, key=lambda s: (s[1].lower(), s[2]))
+
+
+def list_models(cfg, run=subprocess.run):
+    """The models Pi can run, as 'provider/model', from `pi --list-models`; [] when Pi cannot list them, and for a
+    Copilot worker (typed by name; `copilot` lists its models only inside a session)."""
+    if cfg.agent == 'copilot':
+        return []
+    try:
+        p = run([cfg.pi, '--list-models'], capture_output=True, text=True, timeout=60,
+                env={**cfg.worker_env(), 'PI_SKIP_VERSION_CHECK': '1'})  # never the token
+    except (OSError, subprocess.SubprocessError):
+        return []
+    models, header = [], False
+    for line in (p.stdout or '').splitlines():
+        cols = line.split()
+        if cols[:2] == ['provider', 'model']:
+            header = True
+        elif header and len(cols) >= 2:
+            models.append(f'{cols[0]}/{cols[1]}')
+    return models
+
+
+def copilot_models(cfg):
+    """[(model, note)] the GitHub Copilot CLI offers this user, asked the way a worker runs it (its own COPILOT_HOME,
+    no GitHub MCP server); no prompt is sent, so no premium request is used. [] when Copilot cannot be asked."""
+    from .copilot_acp import offered_models
+    from .worker_log import copilot_home
+    argv = [shutil.which(cfg.copilot) or cfg.copilot, '--acp', '--stdio', '--disable-builtin-mcps',
+            '--no-custom-instructions', '--no-auto-update']
+    env = {**cfg.worker_env(), 'COPILOT_HOME': copilot_home(cfg.state_dir), 'COPILOT_PLUGIN_DIR_ONLY': 'true',
+           'COPILOT_AUTO_UPDATE': 'false'}
+    try:
+        os.makedirs(cfg.state_dir, exist_ok=True)  # the session's working folder
+    except OSError:
+        return []
+    return offered_models(argv, cfg.state_dir, env)
+
+
+def ask_request(cfg, store, text, repos=(), branch='', title='', new_branch='', skills=(), model='', thinking=''):
     """Queue a local request for the running service. Returns (request id, the lines to print).
 
-    Shared by `superagent ask` and the web panel; raises RuntimeError for an empty text or an unknown repo."""
+    `branch`: an existing branch to work on instead of a new agent/<name> branch (one repo only): on GitHub, or only
+    in the repo's checkout, which the first delivery then publishes. `new_branch`: the name of the new branch
+    instead of agent/<name>; it must not exist yet. `title`: the Ticket's title, which its name is made from
+    (default: the first line of `text`). `skills`: skill folders or files the worker gets besides its own.
+    `model` ('provider/model', or a model of the config's provider) and `thinking`: the worker's ('' = the config's).
+    Shared by `superagent ask` and the web panel; raises RuntimeError for an empty text, an unknown repo, a bad
+    branch or a missing skill."""
     text = (text or '').strip()
     if not text:
         raise RuntimeError('the request is empty: say what to do')
+    if (branch or '').strip() and (new_branch or '').strip():
+        raise RuntimeError('choose an existing branch or a new branch name, not both')
     chosen = _ask_repos(cfg, repos, text)
-    rid = store.queue_ask(text, chosen, cfg.local_user)
-    lines = [f'queued request {rid} for {", ".join(chosen)}']
+    branch = _existing_branch(cfg, branch, chosen)
+    new_branch = _new_branch(cfg, store, new_branch, chosen)
+    model, thinking = (model or '').strip(), (thinking or '').strip().lower()
+    if model and not re.fullmatch(r'[\w.:@+-]+(/[\w.:@+/-]+)?', model):
+        raise RuntimeError(f'{model!r} is not a model: use provider/model, as `pi --list-models` shows')
+    if thinking and thinking not in THINKING_LEVELS:
+        raise RuntimeError(f'thinking must be one of {", ".join(THINKING_LEVELS)}')
+    options = {'title': ' '.join((title or '').split()), 'new_branch': new_branch, 'skills': _skill_paths(skills),
+               'model': model, 'thinking': thinking}
+    rid = store.queue_ask(text, chosen, cfg.local_user, branch, options)
+    lines = [f'queued request {rid} for {", ".join(chosen)}' + (f' on existing branch {branch}' if branch else '')
+             + (f' on new branch {new_branch}' if new_branch else '')]
     if service_running(cfg, store):
         lines.append(f"the running service (last poll {store.get('last-poll')}) picks it up within one poll round "
                      f'(about {cfg.poll_seconds} s)')
@@ -289,17 +482,23 @@ def ask_request(cfg, store, text, repos=()):
 
 
 def answer_request(cfg, store, ref, text):
-    """Queue the operator's answer for a Ticket (applied by the running service like a human follow-up) and record it
-    in the Ticket's conversation. Returns the confirmation line. Shared by `superagent answer` and the web panel."""
+    """Queue the operator's answer or instruction for a Ticket (applied by the running service like a human follow-up)
+    and record it in the Ticket's conversation. For an ended Ticket the service reopens it first. Returns the
+    confirmation line. Shared by `superagent answer` and the web panel."""
     t = find_ticket(store, ref)
     if not t:
         raise RuntimeError(f'no ticket {ref!r} (see `superagent tickets --all`)')
     if t.state == 'ended':
-        raise RuntimeError(f'ticket {t.name} already ended ({t.outcome})')
+        other = next((o for o in store.tickets(state='open', thread_key=t.thread_key) if o.id != t.id), None)
+        if other:
+            raise RuntimeError(f'cannot reopen {t.name}: {other.name} is open on the same thread')
     text = (text or '').strip()
     if not text:
         raise RuntimeError('the answer is empty')
     store.queue_answer(t.id, text, cfg.local_user)
+    if t.state == 'ended':
+        return (f'instruction queued for {t.name} ({t.id}); the running service reopens the ticket and resumes its '
+                'worker within one poll round')
     return f'answer queued for {t.name} ({t.id}); the running service delivers it within one poll round'
 
 
@@ -359,7 +558,8 @@ def show_text(data):
 
 
 def cmd_ask(cfg, args):
-    _, message = ask_request(cfg, open_store(cfg), ' '.join(args.text), args.repo)
+    _, message = ask_request(cfg, open_store(cfg), ' '.join(args.text), args.repo, args.branch, args.title,
+                             args.new_branch, args.skill, args.model, args.thinking)
     print(message)
     return 0
 
@@ -508,17 +708,23 @@ def cmd_check(cfg, args):
         check(bool(origin), f'checkout: {repo.checkout} is a git repo with origin {origin}',
               f'checkout: {repo.checkout} is not a git clone with an origin remote; '
               f'run `git clone https://github.com/{repo.name}.git {repo.checkout}`')
+    exe = shutil.which(cfg.copilot) if cfg.agent == 'copilot' else cfg.pi
     version = None
-    if os.path.isfile(cfg.pi) and os.access(cfg.pi, os.X_OK):
+    if exe and os.path.isfile(exe) and os.access(exe, os.X_OK):
         try:
-            r = subprocess.run([cfg.pi, '--version'], capture_output=True, text=True, timeout=30)
+            r = subprocess.run([exe, '--version'], capture_output=True, text=True, timeout=30)
             version = (r.stdout or r.stderr).strip().splitlines()[0] if r.returncode == 0 else None
         except (OSError, subprocess.TimeoutExpired, IndexError):
             version = None
-    note = getattr(cfg, 'pi_note', '')  # Windows: the pi found on PATH instead of the configured path
-    check(bool(version), f'pi: {cfg.pi} ({version}' + (f'; {note})' if note else ')'),
-          f'pi: {cfg.pi}' + (f' ({note})' if note else '')
-          + ' is missing or `pi --version` fails; install Pi or set executor.pi in the config')
+    if cfg.agent == 'copilot':
+        check(bool(version), f'copilot: {exe} ({version})',
+              f'copilot: {cfg.copilot} is missing or `copilot --version` fails; install GitHub Copilot CLI '
+              '(npm install -g @github/copilot), run `copilot login`, or set executor.copilot in the config')
+    else:
+        note = getattr(cfg, 'pi_note', '')  # Windows: the pi found on PATH instead of the configured path
+        check(bool(version), f'pi: {cfg.pi} ({version}' + (f'; {note})' if note else ')'),
+              f'pi: {cfg.pi}' + (f' ({note})' if note else '')
+              + ' is missing or `pi --version` fails; install Pi or set executor.pi in the config')
     free = True
     if cfg.report_port:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -554,18 +760,36 @@ def parser():
     for name, text in (('stop', 'stop a ticket and its worker'), ('retry', 'relaunch or redeliver a ticket')):
         s = sub.add_parser(name, help=text)
         s.add_argument('ticket', help='ticket id or name')
-    sub.add_parser('check', help='preflight: config, token, checkout, pi, report port')
+    sub.add_parser('check', help='preflight: config, token, checkout, pi or copilot, report port')
     pn = sub.add_parser('panel', help='local web panel (needs the panel extra)')
     pn.add_argument('--port', type=int, default=8742, help='port on 127.0.0.1 (default 8742)')
     a = sub.add_parser('ask', help='queue a request from this machine (a local Ticket, thread local:<id>)')
     a.add_argument('--repo', action='append', default=[],
                    help='configured owner/name to work in (repeat for a cross-repo request; default: the only '
                         'configured repo, or the configured repos the text names)')
-    a.add_argument('text', nargs='+', help='what to do')
+    a.add_argument('--title', default='',
+                   help="the ticket's title, which its name and default branch agent/<name> are made from "
+                        '(default: the first line of the requirements)')
+    which = a.add_mutually_exclusive_group()
+    which.add_argument('--branch', default='',
+                       help='work on this existing branch (one repo): start from it, push onto it without force, and '
+                            'reuse its open PR; default: a new branch agent/<name>')
+    which.add_argument('--new-branch', default='',
+                       help='name the new branch (it must not exist yet); default: agent/<name>')
+    a.add_argument('--skill', action='append', default=[], metavar='PATH',
+                   help='a skill folder (with a SKILL.md) or .md file the worker gets besides its own (repeat for '
+                        'more)')
+    a.add_argument('--model', default='',
+                   help="the worker's model, as provider/model (or a model of the config's provider); default: the "
+                        "config's")
+    a.add_argument('--thinking', default='', choices=['', *THINKING_LEVELS],
+                   help="the worker's thinking level; default: the config's")
+    a.add_argument('text', nargs='+', help='the requirements: what to do')
     sh = sub.add_parser('show', help="a ticket's stage, PR links and conversation")
     sh.add_argument('ticket', help='ticket id, name, or local:<request id>')
     sh.add_argument('--json', action='store_true', help='JSON output')
-    an = sub.add_parser('answer', help="answer a ticket's question, or add an instruction (resumes its worker)")
+    an = sub.add_parser('answer', help="answer a ticket's question, or add an instruction (resumes its worker; "
+                                       'reopens an ended ticket)')
     an.add_argument('ticket', help='ticket id, name, or local:<request id>')
     an.add_argument('text', nargs='+', help='the answer')
     pi = sub.add_parser('pi-install', help='install the superagent skill and /superagent prompt template into Pi')

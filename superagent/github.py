@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import stat
 import subprocess
 import sys
@@ -48,15 +49,25 @@ def git_harden(windows=WINDOWS):
 
 
 GIT_HARDEN = git_harden()
-# The push runs with a nearly empty environment. Windows also needs these (no secrets in them): without SYSTEMROOT
-# Winsock cannot start, and git finds the user's home and temp directory through the others.
-PUSH_ENV_KEYS = ('PATH', 'HOME')
-PUSH_ENV_KEYS_WINDOWS = ('SYSTEMROOT', 'WINDIR', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'TEMP', 'TMP', 'PATHEXT',
-                         'COMSPEC')
-# A worker runs as the same user and could edit push.git/config, so the token-bearing push pins its network
-# settings on the command line. URL-specific keys are pinned too: they win over the plain ones.
-PUSH_PINS = ['-c', 'http.proxy=', '-c', 'http.sslVerify=true',
-             '-c', 'http.https://github.com/.proxy=', '-c', 'http.https://github.com/.sslVerify=true']
+# A token-bearing git command runs with a nearly empty environment (see _token_env). SYSTEMROOT is always kept:
+# without it Windows networking fails ("getaddrinfo() thread failed to start"). Windows also needs the others (no
+# secrets in them): git finds the user's home and temp directory through them.
+PUSH_ENV_KEYS = ('PATH', 'HOME', 'SYSTEMROOT')
+PUSH_ENV_KEYS_WINDOWS = ('WINDIR', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'TEMP', 'TMP', 'PATHEXT', 'COMSPEC')
+
+
+def push_pins():
+    """A worker runs as the same user and could edit push.git/config, so every token-bearing git command pins its
+    network settings on the command line. URL-specific keys are pinned too: they win over the plain ones.
+
+    The proxy is the service's own HTTPS_PROXY (empty: none), read from the environment `superagent run` was started
+    with, which no worker can change; nothing a worker can write (a push or fetch repo's config, a worktree's config,
+    the global or system config, which these commands never read) decides the proxy or turns TLS verification off."""
+    proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy') or ''
+    return ['-c', f'http.proxy={proxy}', '-c', 'http.sslVerify=true',
+            '-c', f'http.https://github.com/.proxy={proxy}', '-c', 'http.https://github.com/.sslVerify=true']
+
+
 NETWORK_ERRORS = (urllib.error.URLError, ConnectionError, TimeoutError, http.client.HTTPException)
 
 
@@ -75,11 +86,19 @@ class Gone(GitHubError):
     pass
 
 
+def _tls_context():
+    # Python 3.13+ rejects the corporate TLS-inspecting proxy's CA ("Basic Constraints ... not marked critical").
+    # Drop only that strict RFC 5280 check; the chain and hostname are still verified.
+    ctx = ssl.create_default_context()
+    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    return ctx
+
+
 class GitHub:
     def __init__(self, token, repo, opener=None, api='https://api.github.com'):
         self._token = token
         self.repo = repo
-        self.opener = opener or (lambda req: urllib.request.urlopen(req, timeout=TIMEOUT))
+        self.opener = opener or (lambda req: urllib.request.urlopen(req, timeout=TIMEOUT, context=_tls_context()))
         self.api = api.rstrip('/')
 
     def for_repo(self, repo):
@@ -385,7 +404,7 @@ def git_env(hidden=(), secrets=(), base=None):
     return env
 
 
-def push_branch(worktree, branch, token, repo, push_dir, run=subprocess.run, env=None):
+def push_branch(worktree, branch, token, repo, push_dir, run=subprocess.run, env=None, force=True):
     """Push the worktree's HEAD to <branch> on GitHub.
 
     The worker can write its worktree's git config and hooks, so the token never runs there. HEAD is first fetched,
@@ -393,6 +412,7 @@ def push_branch(worktree, branch, token, repo, push_dir, run=subprocess.run, env
     removed afterwards); the push runs from it with hooks off and an environment holding nothing but the token's
     extra HTTP header (never argv) and the basics. A long-lived push repo would not be enough: a worker running as
     the same user could plant a path-specific `http.<url>.proxy` in its config, which beats any command-line pin.
+    `force=False` (a branch the service did not create) makes GitHub refuse anything but a fast-forward.
     """
     auth = base64.b64encode(f'x-access-token:{token}'.encode()).decode()
     env = git_env(secrets=[token, auth]) if env is None else env
@@ -412,13 +432,8 @@ def push_branch(worktree, branch, token, repo, push_dir, run=subprocess.run, env
         git('init', ['git', *GIT_HARDEN, 'init', '--bare', '-q', git_dir], env)
         in_push_repo = ['git', f'--git-dir={git_dir}', *GIT_HARDEN]
         git('fetch', [*in_push_repo, 'fetch', '--no-tags', worktree, f'+HEAD:refs/heads/{branch}'], env)
-        keys = PUSH_ENV_KEYS + (PUSH_ENV_KEYS_WINDOWS if WINDOWS else ())
-        push_env = {k: os.environ[k] for k in keys if k in os.environ}
-        push_env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0',
-                        GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',
-                        GIT_CONFIG_VALUE_0=f'AUTHORIZATION: basic {auth}')
-        git('push', [*in_push_repo, *PUSH_PINS, 'push', '--no-verify', f'https://github.com/{repo}.git',
-                     f'+refs/heads/{branch}:refs/heads/{branch}'], push_env)
+        git('push', [*in_push_repo, *push_pins(), 'push', '--no-verify', f'https://github.com/{repo}.git',
+                     f'{"+" if force else ""}refs/heads/{branch}:refs/heads/{branch}'], _token_env(auth))
     finally:
         rmtree(git_dir)
 
@@ -437,12 +452,66 @@ def rmtree(path):
         shutil.rmtree(path, onerror=retry)
 
 
+def _token_env(auth):
+    """The whole environment of a git command that carries the token: the basics and its extra HTTP header."""
+    keys = PUSH_ENV_KEYS + (PUSH_ENV_KEYS_WINDOWS if WINDOWS else ())
+    env = {k: os.environ[k] for k in keys if k in os.environ}
+    env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0',
+               GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',
+               GIT_CONFIG_VALUE_0=f'AUTHORIZATION: basic {auth}')
+    return env
+
+
+def fetch_from_github(checkout, repo, token, branch, temp_parent, run=subprocess.run, env=None, prune=False,
+                      timeout=None):
+    """Fetch <branch> ('*': every branch) of `repo` from GitHub into the checkout's refs/remotes/origin/.
+
+    Like push_branch, the token never runs in the checkout, whose config a worker can write: GitHub is fetched with
+    it into a bare repo created for this fetch alone (in `temp_parent`, removed afterwards), and the checkout then
+    fetches from that repo without it, with `env`.
+    """
+    auth = base64.b64encode(f'x-access-token:{token}'.encode()).decode()
+    env = git_env(secrets=[token, auth]) if env is None else env
+
+    def git(step, argv, step_env, **kw):
+        r = run(argv, env=step_env, capture_output=True, text=True, timeout=timeout, **kw)
+        if r.returncode != 0:
+            err = r.stderr or r.stdout or ''
+            for secret in (token, auth):
+                err = err.replace(secret, '***')
+            raise GitHubError(f'git fetch {branch} failed ({step}): {err.strip()}')
+
+    os.makedirs(temp_parent, exist_ok=True)
+    git_dir = tempfile.mkdtemp(prefix='fetch.git.', dir=temp_parent)  # 0700, unpredictable name
+    try:
+        git('init', ['git', *GIT_HARDEN, 'init', '--bare', '-q', git_dir], env)
+        git('github', ['git', f'--git-dir={git_dir}', *GIT_HARDEN, *push_pins(), 'fetch', '--no-tags',
+                       f'https://github.com/{repo}.git', f'+refs/heads/{branch}:refs/heads/{branch}'], _token_env(auth))
+        git('checkout', ['git', *GIT_HARDEN, 'fetch', '--no-tags', *(['--prune'] if prune else []), git_dir,
+                         f'+refs/heads/{branch}:refs/remotes/origin/{branch}'], env, cwd=checkout)
+    finally:
+        rmtree(git_dir)
+
+
+def has_ref(worktree, ref, run=subprocess.run, env=None):
+    r = run(['git', *GIT_HARDEN, '-C', worktree, 'rev-parse', '--verify', '--quiet', f'{ref}^{{commit}}'],
+            env=git_env() if env is None else env, capture_output=True, text=True)
+    return r.returncode == 0
+
+
 def has_new_commits(worktree, base_ref, run=subprocess.run, env=None):
     r = run(['git', *GIT_HARDEN, '-C', worktree, 'rev-list', '--count', f'{base_ref}..HEAD'],
             env=git_env() if env is None else env, capture_output=True, text=True)
     if r.returncode != 0:
         raise GitHubError(f'git rev-list {base_ref}..HEAD failed: {(r.stderr or "").strip()}')
     return int(r.stdout.strip() or 0) > 0
+
+
+def commit_subjects(worktree, base_ref, run=subprocess.run, env=None, limit=50):
+    """'<short sha> <subject>' of the commits on HEAD not on `base_ref`, oldest first; [] when git fails."""
+    r = run(['git', *GIT_HARDEN, '-C', worktree, 'log', '--reverse', f'--max-count={limit}', '--format=%h %s',
+             f'{base_ref}..HEAD'], env=git_env() if env is None else env, capture_output=True, text=True)
+    return [line for line in (r.stdout or '').splitlines() if line.strip()] if r.returncode == 0 else []
 
 
 def open_pull(gh, branch, base, title, body):

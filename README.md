@@ -47,11 +47,15 @@ policy, the effect queue and the "confirm once, then stay quiet" reply style com
   last 3,000 characters of output go back to the same Pi session, which fixes and reports ready again. After
   `max_test_retries` failed fixes the Ticket is reported blocked ("tests still failing: <command>").
 - **Delivery.** On `ready` (and passing tests), the service (not the worker) pushes `agent/<name>` with its token
+  (or, for a request on an existing branch, that branch, never with force)
   and opens or reuses a PR. For every push it creates a new private bare repo next to `<state_dir>/push.git`
   (single-repo form) or `<state_dir>/push/<owner>__<name>.git` (`[[repos]]`), fetches the worktree's HEAD into
   it, pushes from it, and deletes it, so nothing a worker wrote earlier can change how the token is sent. The
-  body states the tests (``Tests: `<command>` passed in <N>s`` or `Tests: no test command configured for
-  <repo>.`) and says `Closes #<n>` when the request came from an issue. No commits means a "no changes" reply
+  body has a Summary (the worker's report), Details (the description the worker passes with
+  `superagent-report --details-file`, when it does), Commits (the branch's commit subjects) and Tests
+  (``Tests: `<command>` passed in <N>s`` or `Tests: no test command configured for <repo>.`) section, names the
+  worker's model and thinking level, and says `Closes #<n>` when the request came from an issue. No commits means a
+  "no changes" reply
   and no PR. The Ticket ends when the PR is merged or closed, or when someone stops it.
 - **Cross-repo Tickets.** With `[[repos]]`, a request that names other configured repos as `owner/name` (not in
   quoted lines; unconfigured repos are ignored) gets one Ticket for all of them. Its ticket folder
@@ -72,8 +76,14 @@ policy, the effect queue and the "confirm once, then stay quiet" reply style com
 You need:
 
 - Python 3.11 or newer (the service uses only the standard library; the web panel needs `streamlit`).
-- git, and the [Pi coding agent](https://github.com/earendil-works/pi) signed in to at least one model provider
-  (`pi auth check --provider <name>`).
+- git, and a worker agent, either one (`[executor] agent`, also on the panel's Settings tab):
+  - the [Pi coding agent](https://github.com/earendil-works/pi) signed in to at least one model provider
+    (`pi auth check --provider <name>`): `agent = "pi"`, the default; or
+  - [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli)
+    (`npm install -g @github/copilot`, then `copilot login`): `agent = "copilot"`. It runs as a server over the Agent
+    Client Protocol (`copilot --acp`, in public preview) with your Copilot license, the config's `model` as Copilot
+    names it (for example `claude-sonnet-5.5`) and its `thinking` as the reasoning effort. `superagent check`
+    checks whichever is chosen.
 - A GitHub account the agent can act as, with a token that can push to your repositories (see Setup).
 
 ```sh
@@ -198,6 +208,11 @@ New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name
 - The service's own git commands turn hooks off with `core.hooksPath=C:/Windows/System32/cmd.exe` (a file, so no
   hook can exist below it) instead of `/dev/null`: Git for Windows would look `/dev/null/<hook>` up as
   `C:\dev\null\<hook>`, a folder any user can create.
+- A Copilot worker (`agent = "copilot"`): npm installs `copilot.cmd`, which is found on `PATH`; to pin it, set
+  `copilot = "C:/Users/me/AppData/Roaming/npm/copilot.cmd"` in `[executor]`. It gets the same environment as a Pi
+  worker (no token, no `secret_env`, case-insensitively, as Windows treats variable names).
+- Behind an HTTPS proxy, set it for the service the same way as the token, for example
+  `setx HTTPS_PROXY http://proxy.example:8080` (see [Safety model](#safety-model)).
 - A test command's background processes are killed through the process tree. One whose parent already exited is no
   longer in that tree and can survive the command.
 - There is no SIGTERM: stopping `superagent run` from Task Manager ends it at once; the next start recovers the
@@ -219,6 +234,55 @@ export SUPERAGENT_GITHUB_TOKEN=...      # never put the token in the config file
 ```
 
 Each section below explains a step in detail.
+
+### Windows
+
+The same steps in PowerShell, with four differences: venv scripts live in `.venv\Scripts`, the config needs the
+full path to Pi's `.cmd` launcher, Windows paths go in single-quoted TOML strings, and the token is typed at a
+prompt.
+
+```powershell
+git clone https://github.com/mikeliaowei/pi-superagent.git
+cd pi-superagent
+py -3 -m venv .venv
+.venv\Scripts\pip install -e ".[panel]"
+New-Item -ItemType Directory -Force "$HOME\.config\pi-superagent" | Out-Null
+Copy-Item config.example.toml "$HOME\.config\pi-superagent\config.toml"
+```
+
+In `%USERPROFILE%\.config\pi-superagent\config.toml`:
+
+```toml
+[executor]
+checkout = 'C:\src\your-repo'                              # single quotes: TOML reads backslashes literally
+pi = 'C:\Users\<you>\AppData\Roaming\npm\pi.cmd'           # (Get-Command pi).Source, with .cmd instead of .ps1
+provider = "github-copilot"                                # any provider `pi --list-models` shows
+model = "claude-opus-5.5"
+```
+
+- **Pi launcher.** An npm install of Pi puts `pi`, `pi.cmd` and `pi.ps1` in `%APPDATA%\npm`, and the default
+  `~/.pi/agent/bin/pi` does not exist. Point `pi` at `pi.cmd`: Python cannot start `pi.ps1`
+  (`OSError: [WinError 193] %1 is not a valid Win32 application`).
+- **Token.** Set it in the terminal that runs `superagent`, typed at the prompt so it stays out of your shell
+  history:
+
+  ```powershell
+  $env:SUPERAGENT_GITHUB_TOKEN = Read-Host -AsSecureString "GitHub PAT" | ConvertFrom-SecureString -AsPlainText
+  ```
+
+  This lasts until the terminal closes. To keep it for new terminals, also run
+  `[Environment]::SetEnvironmentVariable("SUPERAGENT_GITHUB_TOKEN", $env:SUPERAGENT_GITHUB_TOKEN, "User")` (it is
+  stored unencrypted in your user registry; VS Code terminals see it only after VS Code restarts). Check it with
+  `[bool]$env:SUPERAGENT_GITHUB_TOKEN`, which prints `True` without showing the value.
+- **`test_command`** runs with `sh -c`, which is not on a default Windows `PATH`. Before `superagent run`, add
+  Git for Windows' shell: `$env:PATH = "C:\Program Files\Git\usr\bin;$env:PATH"`. Repos without `test_command`
+  don't need it.
+- **Your own GitHub account as `agent_login`.** Comments by `agent_login` are ignored as the agent's own, so your
+  @-mentions don't start work. Ask with `superagent ask` or the panel's New request instead, or use a separate bot
+  account.
+
+Then run `.venv\Scripts\superagent check`, `.venv\Scripts\superagent run` and, in a second terminal,
+`.venv\Scripts\superagent panel`.
 
 ## Setup
 
@@ -288,16 +352,37 @@ request carries an explicit mandate from `local_user` (config `[policy] local_us
 
 ```sh
 superagent ask --repo acme/api "fix the flaky test in tests/test_login.py"   # prints: queued request 1 for acme/api
+superagent ask --repo acme/api --branch feature/login "add a unit test"     # work on an existing branch
+superagent ask --repo acme/api --title "Login page" --new-branch feature/login-page \
+  --skill ~/.agents/skills/tdd "rebuild the login page"                    # title, branch name, extra worker skill
+superagent ask --repo acme/api --model github-copilot/claude-opus-5.5 --thinking high "fix the flaky test"
 superagent show local:1            # the Ticket once `superagent run` picked it up: stage, PRs, conversation
 superagent answer add-storage "Use SQLite."   # answer its question; the same Pi session resumes
 superagent stop add-storage
 ```
 
 `--repo` can repeat for a cross-repo change; without it the request goes to the only configured repo, or to the
-configured repos its text names. The running service picks requests up each poll round. A local Ticket's thread is
+configured repos its text names. A request gets a new branch `agent/<name>` from the base branch, unless `--branch`
+names a branch that already exists on GitHub or only in the repo's checkout (one repo only, not the base branch): the
+worktree then starts from that branch (from GitHub's copy when there is one; on a local `agent/<name>` branch, so it
+never clashes with your own checkout of it), the commits are pushed
+onto it without force (GitHub refuses anything but a fast-forward, so nobody's commits are overwritten; a local-only
+branch is published by that push), and the
+branch's open pull request is reused, or one is opened against the base branch. The running service picks requests up each poll round. A local Ticket's thread is
 `local:<id>`: its replies (the acknowledgement, questions, reports and PR links) go to a local outbox that
-`superagent show` and the panel display, never to GitHub. Its pull requests say "Requested locally by <user>"
+`superagent show` and the panel display, never to GitHub. Its pull requests say "Code change requested by super
+agent on behalf of <user>."
 instead of closing an issue. Everything else (worker, tests, cross-repo PRs, stop and retry) works as for GitHub.
+
+`--title` names the Ticket: its name (and so its default branch `agent/<name>`) is made from the title instead of
+the first line of the request. `--new-branch NAME` names the new branch instead (not with `--branch`): it must be a
+valid name, not the base branch, not a branch the repo's checkout knows (on GitHub as of its last fetch, or local),
+and not the branch of an open Ticket, since the service force-pushes its new branches. The worktree's local branch
+stays `agent/<name>`. `--skill PATH` (repeatable) gives the worker a skill folder (with a `SKILL.md`) or `.md` file
+besides its own `superagent-worker` skill; it still discovers no other skills, extensions or prompts.
+`--model provider/model` (as `pi --list-models` shows; a bare model uses the config's provider) and
+`--thinking off|minimal|low|medium|high|xhigh|max` set the worker's model and thinking level instead of the config's.
+The Ticket's name keeps up to 8 words and 48 characters of the title, cut at a whole word.
 
 ### From a Pi chat
 
@@ -319,7 +404,8 @@ files it did not write unless you pass `--force`; `superagent pi-install --unins
 ### Look inside a worker's Pi session
 
 Each Ticket is one Pi session named after its id, stored in `<state_dir>/sessions`. To read what a worker did,
-or continue it by hand, open it in Pi from the Ticket's worktree (the panel's ticket details show the path),
+open the Ticket in the web panel: its **Worker log** tab lists the session step by step (see Web panel).
+To continue it by hand, open it in Pi from the Ticket's worktree (the panel's ticket details show the path),
 only while that Ticket's worker is not running:
 
 ```sh
@@ -335,9 +421,9 @@ cd <worktree shown in the panel>
 | `superagent run` | Run the service. |
 | `superagent status` | JSON: repo (`repos` with `[[repos]]`), agent login, whether the token is set, open Tickets by stage, failing effects, last poll time. |
 | `superagent tickets [--all] [--json]` | Tickets with id, name, repo (with `[[repos]]`; every repo of a cross-repo Ticket), stage, issue number (`local` for a local Ticket), PR (`owner/name#<n>, ...` for a cross-repo Ticket) and last report; `--json` adds each Ticket's `thread` (`github:owner/name#<n>` or `local:<id>`). |
-| `superagent ask [--repo R ...] TEXT` | Queue a local request (see above). |
+| `superagent ask [--repo R ...] [--title T] [--branch B \| --new-branch N] [--skill PATH ...] [--model M] [--thinking L] TEXT` | Queue a local request (see above); `--branch` works on an existing branch, `--new-branch` names the new one, `--skill` adds worker skills, `--model` and `--thinking` set up the worker. |
 | `superagent show <ticket> [--json]` | A Ticket's stage, repos, PR links and conversation (request, local replies, answers); `local:<id>` also finds a request not picked up yet. |
-| `superagent answer <ticket> TEXT` | Give a Ticket an answer or instruction: it steers a running worker or resumes the same session. |
+| `superagent answer <ticket> TEXT` | Give a Ticket an answer or instruction: it steers a running worker or resumes the same session. On an ended Ticket it reopens it first (unless another Ticket is open on its thread); one that ended merged or closed gets a new pull request on its next delivery. A new run also clears a failed delivery. |
 | `superagent pi-install [--agent-dir DIR] [--force] [--uninstall]` | Install the Pi skill and `/superagent` prompt template (see above). |
 | `superagent stop <ticket>` | Stop a Ticket (id or name). |
 | `superagent retry <ticket>` | Relaunch a Ticket whose last run ended, or retry a failed delivery. |
@@ -350,16 +436,53 @@ debug logging. Exit codes: 0 ok, 1 runtime error, 2 configuration error.
 
 ## Web panel
 
-A local web panel shows what needs a person first, in the spirit of dsh-superagent's panel: Tickets waiting for
-an answer, a review, or help after a block, failure or delivery error, each with its thread link and Stop / Retry
-buttons, plus an Answer box for a local Ticket waiting on a question and a New request form (the same as
-`superagent ask`). Its other tabs list Tickets (filter by stage, open/all, text; details show the mandate, assignments,
-request (a local Ticket's whole conversation), every message for the worker, marked delivered or not, and a
-worker log: the Ticket's Pi session as a timeline of prompts, assistant text, tool calls with their arguments,
-trimmed tool results and errors, newest at the bottom, plus the service log lines for that Ticket), recent Triggers with the policy decision
-(`accept`, `stop`, `context`, `ignore`) and why it was made, and the loaded settings (whether the token is set,
-never its value). `superagent panel` replaces itself with Streamlit, so Ctrl+C or `kill` stops the panel completely
-(on Windows it runs Streamlit as a child, and Ctrl+C stops both).
+A local web panel with four tabs.
+
+- **Overview**: every Ticket at a glance. Counts of all, open, needing you, succeeded (pull request merged) and not
+  merged (closed or stopped); a **Needs you** list (waiting for your answer or review, blocked, failed, or not
+  delivered); charts of Tickets by status and per repo, Tickets opened and ended per day and worker tokens per day
+  over the last 30 days; and the last 24 hours (running workers, opened, ended, worker cost).
+- **Tickets**: one table of Tickets (open, or all), filtered by repo, status and text, with plain-language status,
+  branch, issue and PR links, tokens and cost. Click a row to open its details below, and click it again to hide
+  them; they stay open through the 10 s refreshes, and close when a new ticket or another filter changes the rows:
+  status, repo, branch, links, who asked, its question or latest report, a box for an
+  answer or instruction (the same as `superagent answer`: a running worker gets it right away, a finished one is
+  resumed with it, an ended Ticket is reopened with it), **Stop** and **Retry**, and four tabs. **Worker log**
+  shows, read only, the worker's activity from its Pi or Copilot session files (the end of each file, 5 MB): the
+  assignment, what the agent said, each tool call with its arguments, each result or error (folded, long output
+  trimmed to its head and tail), and a failed or aborted model call with its error and stop reason, each with its
+  time, newest at the bottom; the last 50 steps (**Show all steps**), reasoning hidden (**Show reasoning**). Below it,
+  the **Service log** lines about this Ticket (launch, tests, delivery, reports), read from the rotating log file
+  `superagent run` writes (`<state_dir>/logs/service.log`, 2 MB, 3 rotations). The GitHub token and the Ticket's
+  report token are masked as `***`, and strings that look like tokens or keys (GitHub, Anthropic, OpenAI, AWS,
+  bearer tokens, private keys) are masked too. **Request** (a local
+  Ticket's whole **Conversation**), **Runs** (each worker start and how it ended) and **Messages to worker** (marked
+  delivered or not).
+- **New request**: the same as `superagent ask`. A **Title** (required; it names the Ticket) and **Requirements** open
+  a new Ticket on a new branch (`agent/<name>`, or the **New branch name** you give) or, with **Existing branch**, on
+  a branch you pick from the repo's GitHub and local branches (**Refresh from GitHub** runs `git fetch --prune origin`
+  in its checkout) or type. **Skills for the worker** adds skills from `~/.pi/agent/skills`, `~/.agents/skills` and
+  the chosen repos' `.agents/skills`, `.pi/skills` and `.claude/skills`. **Model** and **Thinking level** set up the
+  worker; empty keeps the config's. With **Continue ticket** naming an open one, the text goes to that Ticket's
+  worker on its branch and PR instead, like `superagent answer`.
+- **Settings**, in five sub-tabs. **Repos**: each repo in its own card: its name (owner/name), checkout folder, base
+  branch, test command and test
+  timeout, all editable, each with its own **Save**, and **Remove** (not the last repo). A repo with Tickets keeps its
+  name and cannot be removed, since they refer to it. **Add a repo** adds one as a new `[[repos]]` table; a config in
+  the single-repo form (`repo` + `checkout`) is moved to `[[repos]]` tables first, and that repo's Tickets, history
+  and GitHub read positions carry over. The bot token must reach the new repo too. **Worker and service** changes
+  the agent (Pi or GitHub Copilot CLI), model, thinking level, max workers, test fix attempts and poll interval. Every
+  change rewrites only its lines of the config file, keeping its comments, and refuses (writing nothing) a value the
+  service would reject or a file laid out in a way it cannot edit exactly; restart `superagent run` to apply it. **All
+  settings** lists the config read-only (whether the token is set, never its value). **Service health** shows the
+  last poll and failing effects; **Incoming messages** lists every GitHub issue and comment the service read and what
+  it did with it (started work, added as context, stopped a ticket, or ignored) and why: the place to look when the
+  agent did not answer a comment.
+
+Tokens and cost are summed from the worker's session files. The cost is Pi's figure (for some providers an estimate
+from its price table, 0 where Pi has no price); Copilot workers show 0, since Copilot bills premium requests.
+`superagent panel` replaces itself with Streamlit, so Ctrl+C or `kill` stops the panel completely (on Windows it runs
+Streamlit as a child, and Ctrl+C stops both).
 Databases from earlier versions gain new tables when opened (`trigger_reasons`, `local_requests`,
 `local_messages`); existing tables are never altered, so an older version keeps working on the same database.
 Triggers recorded before reasons were kept show no reason.
@@ -389,17 +512,39 @@ record the same requests as `superagent stop|retry` (Answer and New request as `
   Every git command the service runs therefore has hooks off (`-c core.hooksPath=/dev/null`; on Windows a path
   below `C:/Windows/System32/cmd.exe`), no system or global
   git config, and no token or `secret_env` variable in its environment. The token is used only by the final
-  `git push`, which runs from a bare repo created for that push alone (mode 0700, deleted afterwards) with proxy
-  and TLS settings pinned and an environment holding nothing but `PATH`, `HOME` and the auth header. A long-lived
-  push repo would not be safe: a worker could plant a repo-specific `http.<url>.proxy` there, which beats any pin.
-  Because global git config is off, `git fetch origin` in the checkout cannot use a credential helper configured
-  there; use an SSH remote or a public repository for `checkout`.
+  `git push`, and by the fetch of a checkout whose origin is `https://github.com/<owner>/<name>`: each runs from a
+  bare repo created for that command alone (mode 0700, deleted afterwards), and the checkout then fetches from that
+  repo without the token. The token-bearing command has proxy and TLS settings pinned on its command line
+  (`http.proxy` and `http.https://github.com/.proxy`, `sslVerify=true`) and an environment holding nothing but
+  `PATH`, `HOME`, `SYSTEMROOT` (on Windows also `WINDIR`, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `TEMP`, `TMP`,
+  `PATHEXT`, `COMSPEC`) and the auth header. A long-lived push repo would not be safe: a worker could plant a
+  repo-specific `http.<url>.proxy` there, which beats any pin.
+- **HTTPS proxy.** Behind a corporate proxy, start `superagent run` with `HTTPS_PROXY` (or `https_proxy`) set, for
+  example `HTTPS_PROXY=http://proxy.example:8080`. The GitHub API calls use it, and the token-bearing push and fetch
+  pin `http.proxy` to exactly that value (empty when it is unset), so only the service's own environment decides
+  the proxy: nothing a worker can write (a worktree's or the checkout's git config, a push repo) can point the token
+  at another proxy or turn TLS verification off. The proxy URL is visible in that git command's arguments, so do not
+  put a proxy password in it. API calls verify the certificate chain and host name with the system's CAs; only
+  Python 3.13's extra strict X.509 check is relaxed, which TLS-inspecting corporate proxies often fail.
+- Other origins (SSH, or a non-GitHub host) are fetched with plain `git fetch origin` in the checkout; since global
+  git config is off there, it cannot use a credential helper configured there: use an SSH remote or a public
+  repository.
 - Workers get git credential helpers and prompts turned off (`credential.helper=`, `GIT_TERMINAL_PROMPT=0`,
   `GIT_ASKPASS=/usr/bin/false`, `SSH_ASKPASS=/usr/bin/false`; on Windows also `GCM_INTERACTIVE=never` and a
   failing `deny-askpass.cmd`), so their `git push` cannot fall back on your keychain. This only raises the bar: a worker with `bash` runs as your user and can still read any file you can
   read, including `<state_dir>`. Container isolation is the real fix.
 - Workers can use Pi's stored provider logins (that is how signed-in providers work), and a worker with `bash`
   could also read that file. Treat model credentials Pi holds as reachable by workers.
+- A Copilot worker (`agent = "copilot"`) runs `copilot --acp` with every tool allowed, without your plugins,
+  AGENTS.md files or Copilot's GitHub MCP server (`--disable-builtin-mcps`, so it cannot call GitHub with your
+  login), and gets the worker prompt and skill in its first message. It runs with its own `COPILOT_HOME`
+  (`<state_dir>/copilot-home`), not your `~/.copilot`, which can add well over 100k tokens to every model call; your
+  skills in `~/.agents/skills` and `~/.claude/skills` still load, but only on use. `tools` does not apply. It signs
+  in with your stored `copilot login` (the OS credential store); where the CLI keeps the login in `~/.copilot`
+  instead, sign the workers in once with `COPILOT_HOME=<state_dir>/copilot-home copilot login`. A worker with a
+  shell could use that login too. It cannot take a message mid-run: one arrives with its next run. Its activity on
+  the panel is read from `<state_dir>/copilot-home/session-state`; its cost shows as 0, since Copilot bills premium
+  requests.
 - **Pi does not ask before running tools.** A worker can run any shell command its `bash` tool allows, as your
   user. Use a test repository and a machine you do not mind it touching. Container isolation is not built yet.
 
@@ -407,7 +552,8 @@ record the same requests as `superagent stop|retry` (Answer and New request as `
 
 - Explicit requests only: no observe mode or proactive rules.
 - No LLM router; the policy gate is deterministic.
-- The web panel is read-only apart from Stop, Retry, Answer and New request; no login, so keep it on localhost.
+- The web panel is read-only apart from Stop, Retry, Answer / Send instruction, New request and Settings (which
+  writes the config file); no login, so keep it on localhost.
 - Sources are GitHub and local requests (`superagent ask`, the Pi skill); others (Slack, email, ...) are not ported.
 - Anyone who can run `superagent` as you (or write its database) can request work: local requests are not checked
   against `allowed`.

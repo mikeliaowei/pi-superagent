@@ -15,6 +15,7 @@ from .model import REPORTS
 log = logging.getLogger('superagent.report')
 
 SUMMARY_MAX = 4000
+DETAILS_MAX = 16000
 BODY_MAX = 64 * 1024
 
 
@@ -27,6 +28,7 @@ def validate(body):
     if not isinstance(body, dict):
         return None, 'body must be a JSON object'
     status, summary, question = body.get('status'), body.get('summary'), body.get('question') or ''
+    details = body.get('details') or ''
     if status not in REPORTS:
         return None, f'status must be one of {", ".join(REPORTS)}'
     if not isinstance(summary, str) or not summary.strip():
@@ -37,7 +39,11 @@ def validate(body):
         return None, 'question must be a string'
     if status == 'waiting' and not question.strip():
         return None, 'waiting needs a question'
-    return {'status': status, 'summary': summary.strip(), 'question': question.strip()}, ''
+    if not isinstance(details, str):
+        return None, 'details must be a string'
+    if len(details) > DETAILS_MAX:
+        return None, f'details is longer than {DETAILS_MAX} characters'
+    return {'status': status, 'summary': summary.strip(), 'question': question.strip(), 'details': details.strip()}, ''
 
 
 def main(argv=None):
@@ -45,15 +51,25 @@ def main(argv=None):
     p.add_argument('--status', required=True, choices=REPORTS)
     p.add_argument('--summary', required=True, help='what happened, in at most about 100 words')
     p.add_argument('--question', default='', help='the one question for a human (required with --status waiting)')
+    p.add_argument('--details-file', default='',
+                   help='a markdown file describing the change for the pull request (with --status ready)')
     args = p.parse_args(argv)
     if args.status == 'waiting' and not args.question.strip():
         p.error('--question is required when --status is waiting')
+    details = ''
+    if args.details_file:
+        try:
+            with open(args.details_file, encoding='utf-8') as f:
+                details = f.read()
+        except OSError as e:
+            p.error(f'cannot read --details-file: {e}')
     url, token = os.environ.get('SUPERAGENT_URL'), os.environ.get('SUPERAGENT_TICKET_TOKEN')
     if not url or not token:
         print('superagent-report: SUPERAGENT_URL and SUPERAGENT_TICKET_TOKEN must be set '
               '(this command only works inside a superagent worker)', file=sys.stderr)
         return 2
-    body = json.dumps({'status': args.status, 'summary': args.summary, 'question': args.question}).encode()
+    body = json.dumps({'status': args.status, 'summary': args.summary, 'question': args.question,
+                       'details': details}).encode()
     req = urllib.request.Request(url.rstrip('/') + '/report', data=body, method='POST',
                                  headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'})
     try:

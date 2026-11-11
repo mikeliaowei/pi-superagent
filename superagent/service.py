@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 from . import executor, github, policy
 from .model import Assignment, Ticket, Trigger, named_repos, new_id, new_part, short_name, ticket_title
-from .pi_rpc import PiRpc, RunResult
+from .pi_rpc import RunResult
 from .report import NotRunning
 
 log = logging.getLogger('superagent.service')
@@ -57,7 +57,7 @@ def _digest(*parts):
 
 
 class Service:
-    def __init__(self, cfg, store, gh, *, spawn=PiRpc, run_git=subprocess.run, clock=utcnow, report_url='',
+    def __init__(self, cfg, store, gh, *, spawn=None, run_git=subprocess.run, clock=utcnow, report_url='',
                  run_timeout=RUN_TIMEOUT):
         self.cfg, self.store, self.gh = cfg, store, gh
         self.spawn, self.run_git, self.clock = spawn, run_git, clock
@@ -99,6 +99,7 @@ class Service:
         """`message`, when given, is what the relaunched worker is told (before any new thread messages)."""
         a = Assignment(id=new_id('as'))
         t.assignments.append(asdict(a))
+        t.delivery_error = ''  # the new run delivers again
         self.store.save_ticket(t)
         data = {'ticket_id': t.id, 'assignment_id': a.id, 'mode': mode}
         if message:
@@ -187,18 +188,27 @@ class Service:
             repos += [r for r in named_repos(trig.text, self.cfg.repo_names) if r.lower() != repo.lower()]
         self.open_ticket(trig, title, repos, int(trig.meta['number']))
 
-    def open_ticket(self, trig, title, repos, number):
+    def open_ticket(self, trig, title, repos, number, existing_branch='', new_branch='', skills=(), model='',
+                    thinking=''):
         """Open a Ticket for the accepted request `trig` (already stored) and queue its ack and first launch.
 
         `repos`: configured repo names, the thread's own first; more than one makes a cross-repo Ticket (S14).
+        `existing_branch`: a branch to work on instead of a new one (single repo only). `new_branch`: the name of
+        the new branch instead of agent/<name>. `skills`: skill paths for the worker. `model`, `thinking`: the
+        worker's model and thinking level ('' = the config's).
         Replies go to the request thread (`repos[0]`, `number`). Returns the Ticket."""
-        taken = {t.name for t in self.store.tickets()}  # unique across every repo
+        tickets = self.store.tickets()
+        # Unique across every repo, and never the default branch agent/<name> another Ticket chose by name.
+        taken = {t.name for t in tickets} | {t.branch.removeprefix('agent/') for t in tickets
+                                             if t.branch.startswith('agent/')}
         a = Assignment(id=new_id('as'))
         t = Ticket(id=new_id('tk'), name=short_name(title, taken), title=title, thread_key=trig.thread_key,
                    repo=repos[0], number=number,
                    mandate={'actor': trig.actor, 'strength': 'explicit', 'trigger_id': trig.id, 'at': trig.at},
                    created_at=self.now_iso(), token=secrets.token_urlsafe(24), assignments=[asdict(a)],
-                   last_human_at=trig.at, parts=[new_part(r) for r in repos] if len(repos) > 1 else [])
+                   last_human_at=trig.at, parts=[new_part(r) for r in repos] if len(repos) > 1 else [],
+                   existing_branch=existing_branch, branch=existing_branch or new_branch, skills=list(skills),
+                   model=model, thinking=thinking)
         self.store.save_ticket(t)
         log.info('[%s] new ticket for #%s from %s%s', t.name, t.number, trig.actor,
                  f' across {", ".join(repos)}' if t.parts else '')
@@ -271,22 +281,44 @@ class Service:
             return
         self.store.add_trigger(trig, 'accept', 'local request')
         first = next((line for line in r['text'].splitlines() if line.strip()), '')
-        title = ticket_title(first)
-        t = self.open_ticket(trig, title, repos, 0)
+        opts = self.store.ask_options(r['id'])
+        title = ticket_title(opts['title'] or first)
+        branch = self.store.ask_branch(r['id']) if len(repos) == 1 else ''
+        t = self.open_ticket(trig, title, repos, 0, existing_branch=branch, new_branch=opts['new_branch'],
+                             skills=opts['skills'], model=opts['model'], thinking=opts['thinking'])
         self.store.local_request_done(r['id'], t.id)
 
     async def _take_answer(self, r):
-        """Deliver an operator's answer like a human follow-up on the thread: steer or resume the worker."""
+        """Deliver an operator's answer like a human follow-up on the thread: steer or resume the worker. An answer
+        for an ended Ticket reopens it first, unless another Ticket is open on its thread."""
         t = self.store.ticket(r['ticket_id'])
         trig_id = f"local-answer|{r['id']}"
-        if not t or t.state == 'ended':
-            log.info('answer %s for %s dropped: the ticket ended', r['id'], r['ticket_id'])
+        if not t:
+            log.info('answer %s for %s dropped: no such ticket', r['id'], r['ticket_id'])
+        elif t.state == 'ended' and self._open_on_thread(t):
+            log.info('answer %s for %s dropped: another ticket is open on its thread', r['id'], t.name)
         elif not any(i['trigger_id'] == trig_id for i in self.store.inputs(t.id)):
+            if t.state == 'ended':
+                self._reopen(t, r)
             trig = Trigger(id=trig_id, thread_key=t.thread_key, actor=r['actor'], human=True, addressed=True,
                            at=r['at'], text=r['text'], kind='answer')
             self.store.add_trigger(trig, 'context', 'local answer')
             await self._context(t.id, trig)
         self.store.local_request_done(r['id'])
+
+    def _open_on_thread(self, t):
+        return next((o for o in self.store.tickets(state='open', thread_key=t.thread_key) if o.id != t.id), None)
+
+    def _reopen(self, t, r):
+        if t.outcome in ('merged', 'closed'):
+            # Its pull request is finished: forget it, or check_pulls would end the Ticket again at once.
+            t.pr_number = None
+            for p in t.parts:
+                p['pr_number'] = None
+        t.state, t.outcome, t.test_failures = 'open', None, 0
+        self.store.save_ticket(t)
+        self.reply(t, f"{t.id}-reopened-{r['id']}", f"Reopened by {r['actor']}.")
+        log.info('[%s] reopened by %s', t.name, r['actor'])
 
     # Operator requests
     async def apply_operator_requests(self):
@@ -406,7 +438,8 @@ class Service:
             self.workers.pop(t.id, None)
             self.store.effect_done(e['id'])
             await worker.stop()
-            self._fail_assignment(self.store.ticket(t.id), a, f'could not start pi: {ex}', 'start failed')
+            self._fail_assignment(self.store.ticket(t.id), a, f'could not start the worker ({self.cfg.agent}): {ex}',
+                                  'start failed')
             return
         self.store.mark_delivered([i['seq'] for i in inputs])
         self.store.effect_done(e['id'])
@@ -487,6 +520,8 @@ class Service:
         a = t.current
         status = report['status']
         a.report, a.summary, a.question = status, report['summary'], report.get('question', '')
+        if status == 'ready':
+            t.details = report.get('details', '')
         self._set_current(t, a)
         self.store.save_ticket(t)
         log.info('[%s] report %s', t.name, status)
@@ -627,8 +662,11 @@ class Service:
             await self._deliver_parts(e, t, a)
             return
         repo = self.cfg.repo_config(t.repo)
-        base = f'origin/{repo.base_branch}'
         env = executor.git_env(self.cfg)
+        base = f'origin/{repo.base_branch}'
+        if t.existing_branch and await asyncio.to_thread(github.has_ref, t.worktree, f'origin/{t.existing_branch}',
+                                                         self.run_git, env):
+            base = f'origin/{t.existing_branch}'  # else a branch not on GitHub yet: this push publishes it
         if not await asyncio.to_thread(github.has_new_commits, t.worktree, base, self.run_git, env):
             self.store.effect_done(e['id'])
             self.reply(t, f'{t.id}-{a.id}-nochange', 'I finished, but there were no changes to propose.')
@@ -636,26 +674,41 @@ class Service:
             return
         push_dir = self.cfg.push_dir(repo)
         os.makedirs(os.path.dirname(push_dir), exist_ok=True)
+        # Never force onto an existing branch: someone else's commits there would be lost.
         await asyncio.to_thread(github.push_branch, t.worktree, t.branch, self.cfg.token, repo.name, push_dir,
-                                self.run_git, env)
+                                self.run_git, env, force=not t.existing_branch)
+        commits = await asyncio.to_thread(github.commit_subjects, t.worktree, base, self.run_git, env)
         number = await asyncio.to_thread(github.open_pull, self._gh(repo.name), t.branch, repo.base_branch, t.title,
-                                         self._pr_body(t, a, repo, t.test_result))
+                                         self._pr_body(t, a, repo, t.test_result, commits))
         t = self.store.ticket(t.id)
         t.pr_number = number
+        t.delivery_error = ''
         self.store.save_ticket(t)
         self.store.effect_done(e['id'])
-        self.reply(t, f'{t.id}-pr-{number}', f'Opened a pull request: https://github.com/{repo.name}/pull/{number}')
+        url = f'https://github.com/{repo.name}/pull/{number}'
+        if t.existing_branch:
+            self.reply(t, f'{t.id}-{a.id}-pushed', f'Pushed to `{t.branch}`: {url}')
+        else:
+            self.reply(t, f'{t.id}-pr-{number}', f'Opened a pull request: {url}')
         log.info('[%s] delivered PR #%s', t.name, number)
 
-    def _pr_body(self, t, a, repo, test_result):
+    def _pr_body(self, t, a, repo, test_result, commits=()):
         trig = self._request(t)
         if not repo.test_command:
             tests = f'Tests: no test command configured for {repo.name}.'
         else:
             tests = test_result or f'Tests: `{repo.test_command}` was not run for this delivery.'
-        body = f'{a.summary or t.title}\n\n{tests}'
+        provider, model = executor.worker_model(self.cfg, t)
+        sections = [f'## Summary\n\n{a.summary or t.title}']
+        if t.details:
+            sections.append(f'## Details\n\n{t.details}')
+        if commits:
+            sections.append('## Commits\n\n' + '\n'.join(f'- {c}' for c in commits))
+        sections.append(f'## Tests\n\n{tests}')
+        sections.append(f'Agent: `{provider}/{model}`, thinking `{t.thinking or self.cfg.thinking}`.')
+        body = '\n\n'.join(sections)
         if is_local(t):
-            body += f"\n\nRequested locally by {t.mandate.get('actor') or 'the operator'}."
+            body += f"\n\nCode change requested by super agent on behalf of {t.mandate.get('actor') or 'the operator'}."
         elif repo.name.lower() != t.repo.lower():
             body += f'\n\nRequested in https://github.com/{t.repo}/issues/{t.number}'
         elif not (trig and trig.meta.get('is_pr')):
@@ -680,6 +733,7 @@ class Service:
             log.info('[%s] ready without commits in any repo: no PR', t.name)
             return
         numbers = {}  # repo -> PR number
+        commits = {}  # repo -> its commit subjects
         for p in changed:
             repo = self.cfg.repo_config(p['repo'])
             if p.get('pushed') != a.id:
@@ -688,18 +742,24 @@ class Service:
                 await asyncio.to_thread(github.push_branch, p['worktree'], t.branch, self.cfg.token, repo.name,
                                         push_dir, self.run_git, env)
                 self._update_part(t.id, repo.name, pushed=a.id)
+            commits[repo.name] = await asyncio.to_thread(github.commit_subjects, p['worktree'],
+                                                         f'origin/{repo.base_branch}', self.run_git, env)
             numbers[repo.name] = await asyncio.to_thread(github.open_pull, self._gh(repo.name), t.branch,
                                                          repo.base_branch, t.title,
-                                                         self._pr_body(t, a, repo, p['test_result']))
+                                                         self._pr_body(t, a, repo, p['test_result'], commits[repo.name]))
         urls = {r: f'https://github.com/{r}/pull/{n}' for r, n in numbers.items()}
         if len(urls) > 1:
             for p in changed:
                 repo = self.cfg.repo_config(p['repo'])
                 links = '\n'.join(f'- {u}' for r, u in urls.items() if r != repo.name)
-                body = f'{self._pr_body(t, a, repo, p["test_result"])}\n\nPart of a cross-repo change:\n{links}'
+                body = (f'{self._pr_body(t, a, repo, p["test_result"], commits[repo.name])}\n\n'
+                        f'Part of a cross-repo change:\n{links}')
                 await asyncio.to_thread(github.update_pull_body, self._gh(repo.name), numbers[repo.name], body)
         for r, n in numbers.items():
             t = self._update_part(t.id, r, pr_number=n)
+        if t.delivery_error:
+            t.delivery_error = ''
+            self.store.save_ticket(t)
         self.store.effect_done(e['id'])
         lines = [f'- {p["repo"]}: {urls[p["repo"]]}' if p['repo'] in urls else f'- {p["repo"]}: no changes'
                  for p in t.parts]
