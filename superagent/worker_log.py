@@ -65,10 +65,15 @@ def copilot_home(state_dir):
     return os.path.join(state_dir, 'copilot-home')
 
 
+def pi_session_files(state_dir, ticket_id):
+    """The Ticket's Pi session files, oldest first."""
+    pattern = os.path.join(glob.escape(os.path.join(state_dir, 'sessions')), f'*_{glob.escape(ticket_id)}.jsonl')
+    return sorted(glob.glob(pattern), key=os.path.basename)  # the timestamp prefix sorts oldest first
+
+
 def session_files(state_dir, ticket_id):
     """The Ticket's session files, oldest first: its Pi sessions, then its Copilot session's events, if any."""
-    pattern = os.path.join(glob.escape(os.path.join(state_dir, 'sessions')), f'*_{glob.escape(ticket_id)}.jsonl')
-    found = sorted(glob.glob(pattern), key=os.path.basename)  # the timestamp prefix sorts oldest first
+    found = pi_session_files(state_dir, ticket_id)
     try:
         with open(copilot_session_file(state_dir, ticket_id), encoding='utf-8') as f:
             sid = f.read().strip()

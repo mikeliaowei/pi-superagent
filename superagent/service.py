@@ -424,9 +424,8 @@ class Service:
             self._fail_assignment(t, a, f'could not prepare the worktree: {ex}', 'prepare failed')
             return
         t.worktree, t.branch = path, branch
-        fresh = not any(x.get('started_at') for x in t.assignments[:-1])
+        first = not any(x.get('started_at') for x in t.assignments[:-1])
         inputs = self.store.pending_inputs(t.id)
-        message = self._message(t, d['mode'], fresh, inputs, d.get('message', ''))
         a.state, a.started_at = 'running', self.now_iso()
         self._set_current(t, a)
         self.store.save_ticket(t)
@@ -441,6 +440,13 @@ class Service:
             self._fail_assignment(self.store.ticket(t.id), a, f'could not start the worker ({self.cfg.agent}): {ex}',
                                   'start failed')
             return
+        if first or not worker.new_session:
+            message = self._message(t, d['mode'], first, inputs, d.get('message', ''))
+        else:
+            # A new conversation (the configured worker changed, or its session was lost) has never seen the request:
+            # it gets the whole assignment, with every earlier message on the thread, not just "continue".
+            note = d.get('message', '')
+            message = self._message(t, d['mode'], True, self.store.inputs(t.id)) + (f'\n\n{note}' if note else '')
         self.store.mark_delivered([i['seq'] for i in inputs])
         self.store.effect_done(e['id'])
         self.tasks[t.id] = asyncio.create_task(self._run_worker(t.id, a.id, worker, message))

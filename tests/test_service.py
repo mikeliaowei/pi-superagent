@@ -531,6 +531,29 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         t = self.store.ticket(t.id)
         self.assertEqual((len(t.assignments), t.current.state), (2, 'running'))
         self.assertEqual(pi.runs[1].session_id(), t.id)
+        self.assertIn('try this Ticket again', pi.runs[1].messages[0])  # the session already has the assignment
+
+    async def test_a_retry_in_a_new_session_gets_the_whole_assignment_and_earlier_messages(self):
+        # The worker changed (Pi to Copilot, or the other way), so its session has never seen the request.
+        self.gh.add_issue('Fix it', '@bot fix the login page')
+        pi = Pi({'mode': 'error'}, {'mode': 'hang'})
+        self.service(pi)
+        await self.round()
+        await self.settle()
+        t = self.only_ticket()
+        self.store.add_input(t.id, 'comment', 'follow tdd rules')
+        self.store.mark_delivered([i['seq'] for i in self.store.pending_inputs(t.id)])
+        sessions = os.path.join(self.cfg.state_dir, 'sessions')
+        self.assertTrue(os.listdir(sessions))
+        shutil.rmtree(sessions)
+        self.store.put(f'operator:retry:{t.id}', self.now.isoformat())
+        await self.round()
+        await until(lambda: len(pi.runs) == 2 and pi.runs[1].messages)
+        message = pi.runs[1].messages[0]
+        self.assertIn('New assignment', message)
+        self.assertIn('@bot fix the login page', message)
+        self.assertIn('follow tdd rules', message)
+        self.assertNotIn('try this Ticket again', message)
 
 
 class CliTest(unittest.TestCase):

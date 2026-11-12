@@ -196,6 +196,17 @@ class WorkerTest(unittest.IsolatedAsyncioTestCase):
             await w.start(self.cfg, ticket(), 'http://127.0.0.1:1', spawn=FakeSpawn)
         return w
 
+    async def test_a_pi_worker_has_a_new_session_until_the_tickets_session_file_exists(self):
+        w = await self.start('ok')
+        await w.stop()
+        self.assertTrue(w.new_session)
+        sessions = os.path.join(self.tmp, 'sessions')
+        os.makedirs(sessions, exist_ok=True)
+        open(os.path.join(sessions, '2026-11-09T03-24-39-408Z_tk-abc.jsonl'), 'w').close()
+        w = await self.start('ok')
+        await w.stop()
+        self.assertFalse(w.new_session)
+
     async def test_worker_runs_with_ticket_session_and_env(self):
         w = await self.start('ok')
         try:
@@ -588,6 +599,7 @@ class CopilotTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_new_session_gets_the_worker_prompt_once_and_a_later_process_resumes_it(self):
         w = await self.start('ok')
+        self.assertTrue(w.new_session)
         try:
             r = await w.run('hello', timeout=10)
             r2 = await w.run('again', timeout=10)
@@ -604,6 +616,7 @@ class CopilotTest(unittest.IsolatedAsyncioTestCase):
         with open(worker_log.copilot_session_file(self.tmp, 'tk-abc')) as f:
             self.assertEqual(f.read(), 's1')
         w = await self.start('ok')  # a retry or an answer: a new process
+        self.assertFalse(w.new_session)
         try:
             r = await w.run('answer', timeout=10)
         finally:

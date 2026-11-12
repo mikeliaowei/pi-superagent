@@ -9,6 +9,7 @@ import sys
 
 MODE = os.environ.get('FAKE_PI_MODE', 'ok')
 SESSION = sys.argv[sys.argv.index('--session-id') + 1] if '--session-id' in sys.argv else 'none'
+SESSION_DIR = sys.argv[sys.argv.index('--session-dir') + 1] if '--session-dir' in sys.argv else ''
 streaming = False
 
 
@@ -48,6 +49,10 @@ def read():
 
 def prompt(cmd):
     global streaming
+    if SESSION_DIR:  # like Pi: the conversation is kept in <session-dir>/<timestamp>_<session-id>.jsonl
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        with open(os.path.join(SESSION_DIR, f'2026-01-01T00-00-00-000Z_{SESSION}.jsonl'), 'a') as f:
+            f.write(json.dumps({'type': 'message', 'message': {'role': 'user', 'content': cmd['message']}}) + '\n')
     if MODE == 'handled':
         return respond(cmd, {'disposition': 'handled'})
     respond(cmd, {'disposition': 'started'})

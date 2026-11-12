@@ -428,7 +428,7 @@ cd <worktree shown in the panel>
 | `superagent answer <ticket> TEXT` | Give a Ticket an answer or instruction: it steers a running worker or resumes the same session. On an ended Ticket it reopens it first (unless another Ticket is open on its thread); one that ended merged or closed gets a new pull request on its next delivery. A new run also clears a failed delivery. |
 | `superagent pi-install [--agent-dir DIR] [--force] [--uninstall]` | Install the Pi skill and `/superagent` prompt template (see above). |
 | `superagent stop <ticket>` | Stop a Ticket (id or name). Its worker ends with every process its tools started. |
-| `superagent retry <ticket>` | Relaunch a Ticket whose last run ended, or retry a failed delivery. |
+| `superagent retry <ticket>` | Relaunch a Ticket whose last run ended, or retry a failed delivery. A worker that resumes its session is told to continue; one that starts a new session (after switching between Pi and Copilot, for example) gets the whole request again, with the thread's earlier messages. |
 | `superagent panel [--port 8742]` | Local web panel (see below); needs the `panel` extra. |
 
 `stop` and `retry` write a request to the store (`operator:stop:<ticket>` / `operator:retry:<ticket>` in the kv

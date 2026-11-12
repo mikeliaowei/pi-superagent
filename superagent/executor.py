@@ -15,7 +15,7 @@ from .copilot_acp import CopilotAcp
 from .github import GIT_HARDEN, GitHubError, fetch_from_github, git_env as _git_env
 from .pi_rpc import PiRpc, RpcError
 from .proctree import group_options, kill_tree
-from .worker_log import copilot_home, copilot_session_file
+from .worker_log import copilot_home, copilot_session_file, pi_session_files
 
 PACKAGE = os.path.dirname(os.path.abspath(__file__))
 SKILL_DIR = os.path.join(PACKAGE, 'skills', 'superagent-worker')
@@ -269,6 +269,7 @@ class Worker:
         self.rpc = None
         self.running = False
         self.queued = []
+        self.new_session = False  # after start: the worker's conversation is new, so it has never seen the request
 
     async def start(self, cfg, ticket, report_url, spawn=None):
         cwd, env = worktree_path(cfg, ticket), worker_env(cfg, ticket, report_url)
@@ -282,8 +283,11 @@ class Worker:
             argv = copilot_argv(cfg, ticket)
         else:
             spawn, argv = spawn or PiRpc, pi_argv(cfg, ticket)
+        had_pi_session = bool(pi_session_files(cfg.state_dir, ticket.id))
         self.rpc = spawn()
         await self.rpc.start(argv, cwd, env)
+        # Pi resumes the Ticket's session file when there is one; Copilot says whether it had to open a new session.
+        self.new_session = bool(getattr(self.rpc, 'fresh', False)) if cfg.agent == 'copilot' else not had_pi_session
 
     async def run(self, message, timeout):
         if self.queued:
