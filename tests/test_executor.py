@@ -662,6 +662,13 @@ class CopilotTest(unittest.IsolatedAsyncioTestCase):
                          ('claude-sonnet-5.5', 'none'))
         self.assertIn('/skills/a/SKILL.md', executor.copilot_preamble(t).replace(os.sep, '/'))
 
+    def test_the_auto_model_gets_no_reasoning_effort(self):
+        # Copilot refuses the session: 'Reasoning effort is not supported when using the "auto" model.'
+        for thinking in ('high', 'off'):
+            argv = executor.copilot_argv(self.cfg, ticket(model='auto', thinking=thinking))
+            self.assertEqual(argv[argv.index('--model') + 1], 'auto')
+            self.assertNotIn('--reasoning-effort', argv)
+
 
 class CopilotModelsTest(unittest.TestCase):
     def test_the_enabled_models_come_with_their_premium_request_cost(self):

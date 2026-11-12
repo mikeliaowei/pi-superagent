@@ -82,8 +82,9 @@ You need:
   - [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli)
     (`npm install -g @github/copilot`, then `copilot login`): `agent = "copilot"`. It runs as a server over the Agent
     Client Protocol (`copilot --acp`, in public preview) with your Copilot license, the config's `model` as Copilot
-    names it (for example `claude-sonnet-5.5`) and its `thinking` as the reasoning effort. `superagent check`
-    checks whichever is chosen.
+    names it (for example `claude-sonnet-5.5`) and its `thinking` as the reasoning effort (except for
+    `model = "auto"`, where Copilot picks the model and its effort itself). `superagent check` checks whichever is
+    chosen.
 - A GitHub account the agent can act as, with a token that can push to your repositories (see Setup).
 
 ```sh

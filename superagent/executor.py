@@ -146,8 +146,10 @@ def copilot_argv(cfg, ticket):
     # COPILOT_HOME is its own (Worker.start). Nobody is at a terminal, so every tool is allowed and none asks the user.
     _, model = worker_model(cfg, ticket)
     effort = ticket.thinking or cfg.thinking
+    # Copilot picks the reasoning effort itself for its 'auto' model and refuses a session that sets one.
+    reasoning = [] if model == 'auto' else ['--reasoning-effort', 'none' if effort == 'off' else effort]
     return [shutil.which(cfg.copilot) or cfg.copilot, '--acp', '--stdio', '--model', model,
-            '--reasoning-effort', 'none' if effort == 'off' else effort, '--allow-all-tools', '--disable-builtin-mcps',
+            *reasoning, '--allow-all-tools', '--disable-builtin-mcps',
             '--no-ask-user', '--no-custom-instructions', '--no-auto-update',
             *[a for s in ticket.skills for a in ('--add-dir', s)]]
 
