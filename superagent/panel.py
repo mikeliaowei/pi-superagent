@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import zlib
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -26,6 +27,38 @@ WORKER_CLIP = 4000
 STEP_ICONS = {'request': ':material/assignment:', 'reasoning': ':material/psychology:', 'said': ':material/chat:',
               'tool': ':material/terminal:', 'result': ':material/check_circle:', 'error': ':material/error:',
               'stopped': ':material/report:'}
+HOME_TAB, TICKETS_TAB, STATS_TAB, SETTINGS_TAB = MAIN_TABS = (
+    ':material/home: Home', ':material/confirmation_number: Tickets', ':material/bar_chart: Stats',
+    ':material/settings: Settings')
+# The top menu (st.tabs key main-tabs) as a raised segmented control: a sunken tray, the selected tab lifted out of
+# it, bold and shadowed, so it reads by shape and weight, not color alone. Nested tabs (in a panel) keep Streamlit's
+# look. Streamlit 1.59+ tabs: [data-testid=stTab] with react-aria [data-selected], [data-hovered],
+# [data-focus-visible].
+_TOP = '.st-key-main-tabs'
+_TAB = f'{_TOP} [data-testid="stTab"]:not([data-testid="stTabPanel"] *)'
+TAB_STYLE = f'''<style>
+{_TOP} [role="tablist"]:not([data-testid="stTabPanel"] *) {{
+  gap: 6px; padding: 6px; margin-bottom: 0.75rem; border-radius: 14px; border: none;
+  background: linear-gradient(180deg, rgba(49, 51, 63, 0.09), rgba(49, 51, 63, 0.04));
+  box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.12), inset 0 -1px 0 rgba(255, 255, 255, 0.7);
+}}
+{_TAB} {{
+  min-height: 48px; padding: 0 22px; border-radius: 10px;
+  transition: transform 150ms ease, box-shadow 150ms ease, background-color 150ms ease;
+}}
+{_TAB} p {{ font-size: 1.1rem; font-weight: 600; }}
+{_TAB}[data-hovered]:not([data-selected]) {{
+  background: rgba(255, 255, 255, 0.6); transform: translateY(-1px); box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+}}
+{_TAB}[data-selected] {{
+  background: linear-gradient(180deg, #ffffff, #f7f8fa); transform: translateY(-2px);
+  box-shadow: inset 0 1px 0 #ffffff, 0 6px 14px rgba(0, 0, 0, 0.14), 0 2px 4px rgba(0, 0, 0, 0.10);
+}}
+{_TAB}[data-selected] p {{ font-weight: 700; }}
+{_TAB}[data-focus-visible] {{ outline: 2px solid currentColor; outline-offset: 2px; }}
+{_TAB} .react-aria-SelectionIndicator {{ display: none; }}
+@media (prefers-reduced-motion: reduce) {{ {_TAB} {{ transition: none; transform: none !important; }} }}
+</style>'''
 
 
 AGENT_NAMES = {'pi': 'Pi', 'copilot': 'GitHub Copilot CLI'}
@@ -80,6 +113,23 @@ def updated_at(t):
     return max((x for x in times if x), default=t.created_at)
 
 
+def ago(s, now=None):
+    """'just now', '5 min ago', '3 h ago', '2 d ago', then the date: how long since an ISO time."""
+    at = parse_time(s)
+    if not at:
+        return '-'
+    secs = ((now or datetime.now(timezone.utc)) - at).total_seconds()
+    if secs < 60:
+        return 'just now'
+    if secs < 3600:
+        return f'{int(secs // 60)} min ago'
+    if secs < 86400:
+        return f'{int(secs // 3600)} h ago'
+    if secs < 7 * 86400:
+        return f'{int(secs // 86400)} d ago'
+    return at.astimezone().strftime('%Y-%m-%d')
+
+
 def ended_at(t):
     a = t.current
     return (a.ended_at if a and a.ended_at else None) or updated_at(t)
@@ -114,11 +164,18 @@ def usage_cells(cfg, t):
 
 
 USAGE_COLUMNS = {'tokens': st.column_config.NumberColumn('tokens', format='compact'),
-                 'cost': st.column_config.NumberColumn('cost', format='$%.2f', help='As Pi reports it')}
+                 'cost': st.column_config.NumberColumn('cost', format='$%.2f', help="Pi's estimate, or Copilot's AI credits at $0.01 each (list price)")}
+
+
+ACTION_LABELS = {'stop': 'Stop', 'retry': 'Retry', 'done': 'Mark done'}
+ACTION_HELP = {'stop': 'End it as stopped and stop its worker.', 'retry': 'Relaunch its worker, or redeliver it.',
+               'done': 'End it as done without a pull request: for work that only changed Jira or Confluence, '
+                       'or answered a question.'}
 
 
 def act(store, ticket, action, where):
-    if st.button(action.capitalize(), key=f'{where}-{action}-{ticket.id}'):
+    if st.button(ACTION_LABELS[action], key=f'{where}-{action}-{ticket.id}', help=ACTION_HELP[action],
+                 icon=':material/task_alt:' if action == 'done' else None):
         try:
             st.success(cli.request_action(store, ticket.id, action))
         except RuntimeError as e:
@@ -128,16 +185,14 @@ def act(store, ticket, action, where):
 def actions(store, t, where):
     if t.state == 'ended':
         return
-    left, right, _ = st.columns([1, 1, 6])
-    with left:
-        act(store, t, 'stop', where)
-    with right:
-        act(store, t, 'retry', where)
+    with st.container(horizontal=True):
+        for action in ('done', 'stop', 'retry'):
+            act(store, t, action, where)
 
 
-def answer_box(cfg, store, t, where):
+def answer_box(cfg, store, t, where, attach=True):
     """An answer to the Ticket's question or an instruction, sent as `superagent answer` sends it; for an ended
-    Ticket the instruction reopens it."""
+    Ticket the instruction reopens it. `attach`: offer files too (the ticket's details do; a Home card stays short)."""
     if t.state == 'ended':
         label, button = 'Instruction to reopen this ticket', 'Reopen with instruction'
         tip = 'Reopens the ticket and resumes its worker on the same branch with this instruction.'
@@ -148,11 +203,21 @@ def answer_box(cfg, store, t, where):
         label, button = 'Instruction for the worker', 'Send instruction'
         tip = 'A running worker gets it right away; a finished one is resumed with it.'
     text = st.text_area(label, key=f'{where}-answer-text-{t.id}', help=tip)
-    if st.button(button, key=f'{where}-answer-{t.id}'):
+    files = attach_box(f'{where}-answer-files-{t.id}') if attach else []
+    if st.button(button, key=f'{where}-answer-{t.id}', type='primary', icon=':material/send:'):
         try:
-            st.success(cli.answer_request(cfg, store, t.id, text))
+            st.success(cli.answer_request(cfg, store, t.id, text, files))
         except RuntimeError as e:
             st.error(str(e))
+
+
+def attach_box(key):
+    """Files for the worker: [(name, bytes)]. Kept under <state_dir>/attachments, never committed; images are also
+    shown to its model."""
+    up = st.file_uploader('Attach files', accept_multiple_files=True, key=key,
+                          help='Screenshots, logs, specs: the worker gets their paths, and sees images. At most 10 '
+                               'files of 10 MB each.')
+    return [(f.name, f.getvalue()) for f in up or []]
 
 
 def conversation(cfg, store, t):
@@ -163,23 +228,52 @@ def conversation(cfg, store, t):
         st.text(msg['text'])
 
 
-def worker_step(s):
+SHELL_TOOLS = {'bash': 'bash', 'shell': 'bash', 'powershell': 'powershell'}  # tool name: code highlighting
+REPORT_STATUS = re.compile(r'--status[ =]+["\']?(\w+)')
+REPORT_SUMMARY = re.compile(r'--summary[ =]+(?:"((?:[^"\\]|\\.)*)"|\'([^\']*)\'|(\S+))')
+LEGEND = (':blue-badge[:material/chat: Agent] :violet-badge[:material/terminal: Shell] '
+          ':orange-badge[:material/build: Tool] :green-badge[:material/check_circle: Result] '
+          ':red-badge[:material/error: Error] :green-badge[:material/flag: Report] '
+          ':gray-badge[:material/assignment: Assignment]')
+
+
+def report_of(s):
+    """(status, summary) when the step is the worker's `superagent-report` call, else None."""
+    if s.kind != 'tool' or 'superagent-report' not in s.text:
+        return None
+    status, summary = REPORT_STATUS.search(s.text), REPORT_SUMMARY.search(s.text)
+    return (status.group(1) if status else '?',
+            next((g for g in summary.groups() if g is not None), '') if summary else '')
+
+
+def step_time(s):
+    """A step's time in the viewer's zone, with the date: a retried Ticket's steps span days."""
     at = parse_time(s.at)
-    head = f"{STEP_ICONS[s.kind]} **{s.title}** · {at.astimezone().strftime('%H:%M:%S') if at else s.at}"
-    if s.kind == 'tool':
-        st.markdown(head)
-        st.code(s.text, language='bash' if s.title == 'bash' else None, wrap_lines=True)
+    return at.astimezone().strftime('%Y-%m-%d %H:%M:%S') if at else s.at
+
+
+def worker_step(s):
+    when = step_time(s)
+    report = report_of(s)
+    if report:
+        st.success(f'**Report: {report[0]}** · {when}\n\n{report[1]}', icon=':material/flag:')
+    elif s.kind == 'tool' and s.title in SHELL_TOOLS:
+        st.markdown(f':violet-badge[:material/terminal: Shell · {s.title}] {when}')
+        st.code(s.text, language=SHELL_TOOLS[s.title], wrap_lines=True)
+    elif s.kind == 'tool':
+        st.markdown(f':orange-badge[:material/build: {s.title}] {when}')
+        st.code(s.text, language=None, wrap_lines=True)
     elif s.kind == 'said':
-        st.markdown(head)
-        st.markdown(s.text)
+        st.info(f'**Agent** · {when}\n\n{s.text}', icon=':material/chat:')
     elif s.kind == 'reasoning':
-        st.markdown(head)
-        st.caption(s.text)
+        st.caption(f':material/psychology: Reasoning · {when}\n\n{s.text}')
     elif s.kind == 'stopped':  # a failed or aborted model call: never folded away
-        st.error(f'{s.title} · {at.astimezone().strftime("%H:%M:%S") if at else s.at}: {s.text}')
+        st.error(f'**{s.title}** · {when}\n\n{s.text}', icon=':material/report:')
     else:  # the assignment and tool output are long, so they start folded
         text = s.text if len(s.text) <= WORKER_CLIP else s.text[:WORKER_CLIP] + '\n… (clipped)'
-        with st.expander(f"{s.title} · {len(s.text.splitlines())} lines", icon=STEP_ICONS[s.kind]):
+        color = {'request': 'gray', 'result': 'green', 'error': 'red'}[s.kind]
+        with st.expander(f':{color}[{s.title}] · {when} · {len(s.text.splitlines())} lines',
+                         icon=STEP_ICONS[s.kind]):
             st.code(text, language=None, wrap_lines=True)
 
 
@@ -190,7 +284,8 @@ def worker_activity(cfg, t):
     u = ticket_usage(cfg, t)
     if u['tokens']:
         st.caption(f"Usage: {u['tokens']:,} tokens (input {u['input']:,}, output {u['output']:,}, cache read "
-                   f"{u['cacheRead']:,}, cache write {u['cacheWrite']:,}) · cost ${u['cost']:.2f}, as Pi reports it")
+                   f"{u['cacheRead']:,}, cache write {u['cacheWrite']:,}) · cost ${u['cost']:.2f} (Pi's estimate, or Copilot's AI credits at "
+                   "list price)")
     files = worker_log.session_files(cfg.state_dir, t.id)
     steps = worker_log.steps(files, secrets=[cfg.token, t.token])
     if not steps:
@@ -204,12 +299,18 @@ def worker_activity(cfg, t):
         row = st.container(horizontal=True)
         reasoning = row.toggle('Show reasoning', key=f'worker-reasoning-{t.id}')
         show_all = row.toggle('Show all steps', key=f'worker-all-{t.id}')
+        newest_first = row.toggle('Newest first', key=f'worker-newest-{t.id}')
+        st.caption(f'Started {step_time(steps[0])} · last step {step_time(steps[-1])}')
         if not reasoning:
             steps = [s for s in steps if s.kind != 'reasoning']
         if not show_all and len(steps) > WORKER_STEPS:
             st.caption(f'Showing the last {WORKER_STEPS} of {len(steps)} steps.')
             steps = steps[-WORKER_STEPS:]
-        with st.container(height=500, border=True, autoscroll=True):  # newest at the bottom, kept in view
+        if newest_first:
+            steps = steps[::-1]
+        st.markdown(LEGEND)
+        # Keep the newest step in view: at the bottom, unless the list is newest first.
+        with st.container(height=500, border=True, autoscroll=not newest_first):
             for s in steps:
                 worker_step(s)
     st.markdown('Service log')
@@ -251,7 +352,7 @@ def worker_skills(cfg, repos, where=''):
         st.caption('No skills found to add: the worker gets its own superagent-worker skill only.')
         return []
     return st.multiselect('Skills for the worker', list(found), key=f'{where}new-request-skills',
-                          format_func=lambda p: found.get(p, p), placeholder='Its own skill only',
+                          format_func=lambda p: found.get(p) or p, placeholder='Its own skill only',
                           help='Added to its own superagent-worker skill. From ~/.pi/agent/skills, ~/.agents/skills '
                                "and the chosen repos' .agents/skills, .pi/skills and .claude/skills.")
 
@@ -300,43 +401,58 @@ def worker_setup(cfg, where=''):
 
 
 def new_request(cfg, store, tickets, where=''):
-    """The same request as `superagent ask`, or, to continue an open Ticket, the same as `superagent answer`.
+    """The same request as `superagent ask`, or, to continue an open Ticket (under More options), the same as
+    `superagent answer`. The request text comes first; what most requests leave as it is waits under More options.
     `where`: a widget key prefix."""
     open_tickets = {t.id: t for t in tickets if t.state == 'open'}
-    tid = st.selectbox('Continue ticket', [None, *open_tickets], key=f'{where}new-request-continue',
-                       format_func=lambda i: 'None: open a new ticket and branch' if i is None else
-                       f"{open_tickets[i].name} · {', '.join(open_tickets[i].repos)} · {open_tickets[i].branch or '-'}")
+    tid = st.session_state.get(f'{where}new-request-continue')  # picked under More options, below
+    tid = tid if tid in open_tickets else None
+    text = st.text_area('What should superagent do?', key=f'{where}new-request-text', height=140,
+                        placeholder='Describe the change, bug or question. Jira issues and Confluence pages you '
+                                    'mention are read for the worker.')
+    title, repos, branch, new_branch, skills, model, thinking = '', [], '', '', [], '', ''
     if tid:
         t = open_tickets[tid]
         st.caption(f"Goes to {t.name}'s worker on branch `{t.branch or '-'}` in {', '.join(t.repos)}; "
                    'no new ticket or branch.')
     else:
-        title = st.text_input('Title', key=f'{where}new-request-title', help="The ticket's title; its name is made from it.")
-        only = cfg.repo_names if len(cfg.repo_names) == 1 else []
-        repos = st.multiselect('Repos', cfg.repo_names, default=only, key=f'{where}new-request-repos')
-        kind = st.radio('Branch', ['New branch', 'Existing branch'], horizontal=True, key=f'{where}new-request-branch-kind',
-                        help='New: a new branch from the base branch, agent/<name> unless you name it. Existing: work '
-                             'on a branch of one repo, on GitHub or only local; commits go on top of it and its open '
-                             'PR is reused.')
-        branch = new_branch = ''
-        if kind == 'Existing branch':
-            branch = existing_branch(cfg, repos, where)
-        else:
-            new_branch = st.text_input('New branch name', key=f'{where}new-request-new-branch',
-                                       placeholder=f'agent/{short_name(title)}' if title.strip() else 'agent/<name>',
-                                       help='Leave empty for the default. It must not exist yet.')
-        skills = worker_skills(cfg, repos, where)
-        model, thinking = worker_setup(cfg, where)
-    text = st.text_area('Requirements', key=f'{where}new-request-text')
-    if st.button('Queue request', key=f'{where}new-request-submit'):
+        left, right = st.columns(2)
+        title = left.text_input('Title', key=f'{where}new-request-title',
+                                help="The ticket's title; its name is made from it.")
+        last = [r for r in (store.get('panel:last-repos') or '').split(',') if r in cfg.repo_names]
+        repos = right.multiselect('Repos', cfg.repo_names, key=f'{where}new-request-repos',
+                                  default=cfg.repo_names if len(cfg.repo_names) == 1 else last,
+                                  placeholder='Choose repos', help='Remembers the repos of your last request.')
+    files = attach_box(f'{where}new-request-files')
+    with st.expander('More options', icon=':material/tune:'):
+        st.selectbox('Continue ticket', [None, *open_tickets], key=f'{where}new-request-continue',
+                     format_func=lambda i: 'None: open a new ticket and branch' if i is None else
+                     f"{open_tickets[i].name} · {', '.join(open_tickets[i].repos)} · {open_tickets[i].branch or '-'}",
+                     help='Send this to the worker of an open ticket instead of starting a new one.')
+        if not tid:
+            kind = st.radio('Branch', ['New branch', 'Existing branch'], horizontal=True,
+                            key=f'{where}new-request-branch-kind',
+                            help='New: a new branch from the base branch, agent/<name> unless you name it. Existing: '
+                                 'work on a branch of one repo, on GitHub or only local; commits go on top of it and '
+                                 'its open PR is reused.')
+            if kind == 'Existing branch':
+                branch = existing_branch(cfg, repos, where)
+            else:
+                new_branch = st.text_input('New branch name', key=f'{where}new-request-new-branch',
+                                           placeholder=f'agent/{short_name(title)}' if title.strip() else 'agent/<name>',
+                                           help='Leave empty for the default. It must not exist yet.')
+            skills = worker_skills(cfg, repos, where)
+            model, thinking = worker_setup(cfg, where)
+    if st.button('Send', key=f'{where}new-request-submit', type='primary', icon=':material/send:'):
         try:
             if tid:
-                message = cli.answer_request(cfg, store, tid, text)
+                message = cli.answer_request(cfg, store, tid, text, files)
             elif not title.strip():
                 raise RuntimeError('Give the request a title: it names the ticket.')
             else:
                 message = cli.ask_request(cfg, store, text, repos, branch, title, new_branch, skills, model,
-                                          thinking)[1]
+                                          thinking, files)[1]
+                store.put('panel:last-repos', ','.join(repos))
             st.success(message)
         except RuntimeError as e:
             st.error(str(e))
@@ -345,7 +461,14 @@ def new_request(cfg, store, tickets, where=''):
 STATUS = {'working/queued': 'Queued', 'working': 'Working', 'idle': 'Idle', 'person/answer': 'Waiting for your answer',
           'person/review': 'Ready for review', 'person/blocked': 'Blocked', 'person/failed': 'Failed',
           'person/delivery': 'Delivery failed'}
-OUTCOMES = {'merged': 'Merged', 'closed': 'Closed without merge', 'stopped': 'Stopped'}
+OUTCOMES = {'merged': 'Merged', 'completed': 'Done', 'closed': 'Closed without merge', 'stopped': 'Stopped'}
+SUCCEEDED = ('merged', 'completed')  # a merged pull request, or marked done (work with no pull request)
+# Each status as a badge: icon and words as well as color, so it never reads by color alone.
+STATUS_LOOK = {'Queued': ('gray', 'schedule'), 'Working': ('blue', 'autorenew'), 'Idle': ('gray', 'pause_circle'),
+               'Waiting for your answer': ('orange', 'help'), 'Ready for review': ('green', 'rate_review'),
+               'Blocked': ('red', 'block'), 'Failed': ('red', 'error'), 'Delivery failed': ('red', 'error'),
+               'Merged': ('green', 'check_circle'), 'Closed without merge': ('gray', 'cancel'),
+               'Stopped': ('gray', 'stop_circle'), 'Done': ('green', 'task_alt')}
 DECISION_NAMES = {'accept': 'Started work', 'context': 'Added as context', 'stop': 'Stopped a ticket',
                   'ignore': 'Ignored'}
 RUN_COLUMNS = ['id', 'state', 'report', 'summary', 'question', 'end_reason', 'started_at', 'ended_at']
@@ -358,6 +481,13 @@ def status(t):
     if t.state == 'ended':
         return OUTCOMES.get(t.outcome, 'Ended')
     return STATUS.get(stage(t), stage(t))
+
+
+def badge(t):
+    """The Ticket's status as a colored badge with an icon, in Markdown."""
+    words = status(t)
+    color, icon = STATUS_LOOK.get(words, ('gray', 'info'))
+    return f':{color}-badge[:material/{icon}: {words}]'
 
 
 def _day(s):
@@ -382,13 +512,80 @@ def in_range(t, days):
 
 def show_tickets(scope, statuses, repos, time_range):
     """A count card's Show: the Tickets tab, filtered to the tickets behind the count."""
-    st.session_state.update({'main-tabs': 'Tickets', 'ticket-scope': scope, 'ticket-stages': statuses,
+    st.session_state.update({'main-tabs': TICKETS_TAB, 'ticket-scope': scope, 'ticket-stages': statuses,
                              'ticket-repos': repos, 'ticket-range': time_range, 'ticket-search': ''})
 
 
-def overview(cfg, tickets):
-    """Every Ticket at a glance, for a time range and repos: counts that open the Tickets tab, what needs you,
-    and charts."""
+def open_ticket(tid):
+    """Open →: the Tickets tab with this ticket picked, every filter cleared so it is in the list."""
+    show_tickets('all', [], [], list(RANGES)[-1])
+    st.session_state['open-ticket'] = tid
+    st.session_state['open-seq'] = st.session_state.get('open-seq', 0) + 1
+
+
+def open_button(t, where):
+    st.button('Open', key=f'{where}-open-{t.id}', type='tertiary', icon=':material/arrow_forward:',
+              on_click=open_ticket, args=(t.id,), help='Its details, worker activity and conversation')
+
+
+def needs_you(t, proposed, store):
+    """Does the open Ticket wait for a person: a question, a review, a failure, a write to approve, a repo to add?"""
+    return t.state == 'open' and bool(stage(t).startswith('person/') or proposed.get(t.id)
+                                      or store.get(f'repo-request:{t.id}'))
+
+
+def home(cfg, store, tickets, proposed):
+    """Start a request on the left; on the right, what waits for you (answered right here) and what is running."""
+    ask, inbox = st.columns([5, 6], gap='large')
+    with ask, st.container(border=True):
+        st.markdown('#### :material/add_circle: Ask superagent')
+        new_request(cfg, store, tickets)
+    by_recent = sorted(tickets, key=updated_at, reverse=True)
+    needs = [t for t in by_recent if needs_you(t, proposed, store)]
+    with inbox:
+        st.markdown(f'#### :material/notifications: Needs you ({len(needs)})')
+        if not needs:
+            st.info('Nothing needs you right now.', icon=':material/check:')
+        for t in needs:
+            with st.container(border=True):
+                head = st.container(horizontal=True, vertical_alignment='center')
+                head.markdown(f"{badge(t)} **{t.title}** · {', '.join(t.repos)} · {ago(updated_at(t))}")
+                with head:
+                    open_button(t, 'home')
+                    act(store, t, 'done', 'home')
+                a = t.current
+                if t.delivery_error:
+                    st.error(f'Delivery failed: {t.delivery_error}')
+                if a and a.question and stage(t) == 'person/answer':
+                    st.warning(a.question, icon=':material/help:')
+                elif a and a.summary:
+                    st.caption(a.summary)
+                if pr_links(t):
+                    st.markdown(pr_markdown(t).removeprefix(' · '))
+                repo_request(cfg, store, t, 'home')
+                proposals_box(cfg, store, t, 'home')
+                answer_box(cfg, store, t, 'home', attach=False)
+        busy = [t for t in by_recent if t.state == 'open' and t not in needs]
+        st.markdown(f'#### :material/autorenew: Working now ({len(busy)})')
+        if not busy:
+            st.caption('No other open tickets.')
+        for t in busy:
+            with st.container(border=True):
+                head = st.container(horizontal=True, vertical_alignment='center')
+                head.markdown(f"{badge(t)} **{t.title}** · {', '.join(t.repos)} · {ago(updated_at(t))}")
+                with head:
+                    open_button(t, 'busy')
+                    act(store, t, 'done', 'busy')
+                if t.current and t.current.summary:
+                    st.caption(t.current.summary)
+    if not tickets:
+        st.caption('No tickets yet: ask above, or mention the bot on a GitHub issue.')
+
+
+def overview(cfg, tickets, proposed=None):
+    """The Stats tab: every Ticket at a glance, for a time range and repos: counts that open the Tickets tab, and
+    charts. `proposed`: {ticket id: Jira or Confluence writes waiting for approval}."""
+    proposed = proposed or {}
     f = st.columns([2, 5])
     time_range = f[0].selectbox('Time range', list(RANGES), index=1, key='ov-range',
                                 help='Counts and charts cover the tickets created in this range.')
@@ -397,15 +594,15 @@ def overview(cfg, tickets):
     in_repo = [t for t in tickets if not repos or set(repos) & set(t.repos)]
     picked = [t for t in in_repo if in_range(t, days)]
     open_tickets = [t for t in picked if t.state == 'open']
-    needs = [t for t in open_tickets if stage(t).startswith('person/')]
-    merged = [t for t in picked if t.state == 'ended' and t.outcome == 'merged']
-    not_merged = [t for t in picked if t.state == 'ended' and t.outcome != 'merged']
+    needs = [t for t in open_tickets if stage(t).startswith('person/') or proposed.get(t.id)]
+    merged = [t for t in picked if t.state == 'ended' and t.outcome in SUCCEEDED]
+    not_merged = [t for t in picked if t.state == 'ended' and t.outcome not in SUCCEEDED]
     statuses = lambda group: sorted({status(t) for t in group})  # noqa: E731
     cards = [('Tickets', picked, 'all', [], 'Every ticket created in the range'),
              ('Open', open_tickets, 'open', [], 'Not ended yet'),
              ('Need you', needs, 'open', statuses(needs),
               'Waiting for your answer or review, blocked, failed, or not delivered'),
-             ('Succeeded', merged, 'all', statuses(merged), 'Ended with its pull request merged'),
+             ('Succeeded', merged, 'all', statuses(merged), 'Ended with its pull request merged, or marked done'),
              ('Not merged', not_merged, 'all', statuses(not_merged), 'Ended with its pull request closed, or stopped')]
     for col, (label, group, scope, wanted, tip) in zip(st.columns(len(cards)), cards, strict=True):
         with col.container(border=True):
@@ -413,17 +610,6 @@ def overview(cfg, tickets):
             st.button('Show', key=f'ov-show-{label}', type='tertiary', icon=':material/arrow_forward:',
                       disabled=not group, on_click=show_tickets, args=(scope, wanted, repos, time_range),
                       help='Open these tickets on the Tickets tab')
-
-    st.subheader('Needs you')
-    if needs:
-        st.dataframe(pd.DataFrame([{'title': t.title, 'ID': t.name, 'repo': ', '.join(t.repos), 'status': status(t),
-                                    'question or report': (t.current.question or t.current.summary) if t.current
-                                    else '', 'issue': issue_url(t)} for t in needs]),
-                     hide_index=True, width='stretch', key='ov-needs',
-                     column_config={'issue': st.column_config.LinkColumn('issue', display_text=r'issues/(\d+)$')})
-        st.caption('Need you → Show opens them on the Tickets tab; click one there to answer it, retry it or stop it.')
-    else:
-        st.info('Nothing needs you right now.')
     if not picked:
         return
 
@@ -441,7 +627,7 @@ def overview(cfg, tickets):
                     .reindex(index=names, columns=['open', 'ended'], fill_value=0))  # a repo without tickets: 0
         st.bar_chart(per_repo, horizontal=True, height=260, color=[OPEN_COLOR, ENDED_COLOR])
 
-    first = min((_day(t.created_at) for t in in_repo if _day(t.created_at)), default=None)
+    first = min((d for t in in_repo if (d := _day(t.created_at))), default=None)
     span = days or max(7, (datetime.now(timezone.utc).date() - datetime.fromisoformat(first).date()).days + 1
                        if first else 7)
     dates = pd.date_range(end=datetime.now(timezone.utc).date(), periods=span).strftime('%Y-%m-%d')
@@ -473,18 +659,19 @@ def overview(cfg, tickets):
     cols[1].metric('Tickets opened (24 h)', sum(1 for t in in_repo if recent(t.created_at)))
     cols[2].metric('Tickets ended (24 h)', sum(1 for t in in_repo if t.state == 'ended' and recent(ended_at(t))))
     cols[3].metric('Worker cost (24 h)', f"${sum(u['cost'] for u in used):.2f}",
-                   help=f"{sum(u['tokens'] for u in used):,} tokens; Pi's estimate, 0 for Copilot workers")
+                   help=f"{sum(u['tokens'] for u in used):,} tokens; Pi's estimate, or Copilot's AI credits at list price")
 
 
 def tickets_tab(cfg, store, tickets):
-    """Every Ticket in one table; click one for its details below, click it again to hide them."""
+    """Every Ticket in a list on the left, the picked one's details on the right. Home's Open picks one too."""
     c = st.columns([2, 3, 3, 2, 3])
     scope = c[0].radio('Show', ['open', 'all'], horizontal=True, key='ticket-scope')
     repos = c[1].multiselect('Repo', cfg.repo_names, key='ticket-repos', placeholder='All repos')
     statuses = c[2].multiselect('Status', sorted({status(t) for t in tickets}), key='ticket-stages',
                                 placeholder='Any status')
     time_range = c[3].selectbox('Created', list(RANGES), index=len(RANGES) - 1, key='ticket-range')
-    query = c[4].text_input('Search', key='ticket-search', placeholder='title, ID or summary').strip().lower()
+    query = c[4].text_input('Search', key='ticket-search', placeholder='title, ID or summary',
+                            icon=':material/search:').strip().lower()
     newest_first = sorted(tickets, key=lambda t: (t.created_at, t.id), reverse=True)  # rowid moves on every save
     shown = [t for t in newest_first if (scope == 'all' or t.state == 'open') and in_range(t, RANGES[time_range])
              and (not repos or set(repos) & set(t.repos)) and (not statuses or status(t) in statuses)
@@ -493,24 +680,90 @@ def tickets_tab(cfg, store, tickets):
     if not shown:
         st.info('No tickets match.' if scope == 'all' else 'No open tickets match. Choose Show: all for ended ones.')
         return
-    rows = [{'title': t.title, 'ID': t.name, 'repo': ', '.join(t.repos), 'status': status(t),
-             'branch': t.branch or '-', 'issue': issue_url(t), 'pr': pr_url(t), 'updated': updated_at(t),
-             **usage_cells(cfg, t)} for t in shown]
+    rows = [{'status': status(t), 'title': t.title, 'repo': ', '.join(t.repos), 'updated': ago(updated_at(t)),
+             'pr': pr_url(t), 'ID': t.name, 'branch': t.branch or '-', 'issue': issue_url(t), **usage_cells(cfg, t)}
+            for t in shown]
     # The key names the rows shown: a new ticket or another filter starts a fresh selection, so a remembered row
-    # number never points at a different ticket. Changes within a row (status, tokens) keep it.
+    # number never points at a different ticket. Changes within a row (status, tokens) keep it. Each Open → (open-seq)
+    # starts a fresh one too, so its ticket is picked even when the same one was picked and then unpicked before.
     rows_key = zlib.crc32(' '.join(t.id for t in shown).encode())
-    event = st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch', key=f'tickets-table-{rows_key}',
-                         on_select='rerun', selection_mode='single-row', column_config={
-                             'ID': st.column_config.TextColumn(
-                                 'ID', help='Short name from the title: for `superagent show <ID>`, the worker folder '
-                                            'and the default branch agent/<ID>'),
-                             'issue': st.column_config.LinkColumn('#', display_text=r'issues/(\d+)$'),
-                             'pr': st.column_config.LinkColumn('PR', display_text=r'pull/(\d+)$'), **USAGE_COLUMNS})
+    ids = [t.id for t in shown]
+    opened = st.session_state.get('open-ticket')
+    listing, detail = st.columns([2, 3], gap='medium')
+    with listing:
+        event = st.dataframe(
+            pd.DataFrame(rows), hide_index=True, width='stretch', placeholder='-', alt='Tickets',
+            key=f"tickets-table-{rows_key}-{st.session_state.get('open-seq', 0)}", on_select='rerun',
+            selection_mode='single-row', column_order=['status', 'title', 'repo', 'updated', 'pr'],
+            selection_default={'selection': {'rows': [ids.index(opened)] if opened in ids else []}},
+            column_config={'title': st.column_config.TextColumn('title', width='large'),
+                           'repo': st.column_config.TextColumn('repo', width='small'),
+                           'pr': st.column_config.LinkColumn('PR', display_text=r'pull/(\d+)$', width='small')})
+        st.caption('Click a ticket to see it on the right.')
     picked = event.selection.rows
-    if not picked or picked[0] >= len(shown):
-        st.caption('Click a ticket to see its details; click it again to hide them.')
+    with detail:
+        if not picked or picked[0] >= len(shown):
+            st.info('Pick a ticket on the left to see its details, answer it, retry it or stop it.',
+                    icon=':material/arrow_back:')
+            return
+        ticket_detail(cfg, store, shown[picked[0]])
+
+
+def repo_request(cfg, store, t, where='tk'):
+    """The repo the worker asked to add (superagent-report --needs-repo), with Add: the same as `superagent add-repo`.
+    `where`: a widget key prefix, as the same ticket can show on Home and in its details."""
+    adding = store.get(f'operator:add-repo:{t.id}')
+    if adding:
+        st.info(f'Adding **{adding}** to this ticket: the service adds it after the current run and resumes the '
+                'worker.', icon=':material/hourglass_top:')
         return
-    ticket_detail(cfg, store, shown[picked[0]])
+    wanted = store.get(f'repo-request:{t.id}')
+    if not wanted:
+        return
+    with st.container(border=True):
+        st.markdown(f':orange-badge[:material/add_link: Repo requested] The worker asks to add **{wanted}**, to change '
+                    f"it together with {', '.join(t.repos)} in this ticket.")
+        if st.button(f'Add {wanted} to this ticket', key=f'{where}-add-repo-{t.id}', type='primary'):
+            try:
+                st.success(cli.add_repo_request(cfg, store, t.id, wanted))
+            except RuntimeError as e:
+                st.error(str(e))
+        st.caption('Or answer below to tell it otherwise.')
+
+
+def proposals_box(cfg, store, t, where='tk'):
+    """The Jira and Confluence writes the worker proposed (superagent-report propose), each with a preview and
+    Approve / Reject: the same as `superagent approve|reject`. Nothing is written without Approve. `where`: a widget
+    key prefix; the preview starts open only in the ticket's details."""
+    from superagent import atlassian
+    for p in store.proposals(ticket_id=t.id):
+        if p['state'] in ('rejected',) and p['id'] != st.session_state.get('just-decided'):
+            continue
+        with st.container(border=True):
+            badge = {'pending': ':orange-badge[:material/edit_note: Proposed]',
+                     'approved': ':blue-badge[:material/hourglass_top: Approved, writing next round]',
+                     'writing': ':blue-badge[:material/sync: Writing]', 'done': ':green-badge[:material/check: Written]',
+                     'failed': ':red-badge[:material/error: Failed]', 'rejected': ':gray-badge[Rejected]'}[p['state']]
+            st.markdown(f"{badge} **#{p['id']}** {atlassian.target(p)}"
+                        + (f" · [{p['result']}]({p['result']})" if p['result'] else ''))
+            if p['error'] and p['state'] == 'failed':
+                st.error(p['error'])
+            with st.expander('What it would write', expanded=p['state'] == 'pending' and where == 'tk'):
+                st.markdown(p['body'])
+            if p['state'] == 'pending' and p['kind'] == 'confluence-update' and p.get('mode') == 'replace':
+                st.warning("Approving replaces the page's whole current text with this. Confluence keeps the old "
+                           'version in its page history.', icon=':material/warning:')
+            if p['state'] != 'pending':
+                continue
+            row = st.container(horizontal=True)
+            approve = row.button('Approve and write', key=f"{where}-approve-{p['id']}", type='primary')
+            reject = row.button('Reject', key=f"{where}-reject-{p['id']}")
+            if approve or reject:
+                try:
+                    st.success(cli.decide_proposal(cfg, store, p['id'], approve))
+                    st.session_state['just-decided'] = p['id']
+                except RuntimeError as e:
+                    st.error(str(e))
 
 
 def ticket_detail(cfg, store, t):
@@ -518,7 +771,7 @@ def ticket_detail(cfg, store, t):
     with st.container(border=True):
         st.markdown(f'### {t.title}')
         m = t.mandate
-        st.markdown(f"**{status(t)}** · {', '.join(t.repos)} · branch `{t.branch or '-'}` · {thread_markdown(t)}"
+        st.markdown(f"{badge(t)} · {', '.join(t.repos)} · branch `{t.branch or '-'}` · {thread_markdown(t)}"
                     + pr_markdown(t))
         st.caption(f"ID `{t.name}` · asked by {m.get('actor', '?')} at {m.get('at') or t.created_at}"
                    f" · {'ticket folder' if t.parts else 'worktree'} `{t.worktree or '-'}`"
@@ -533,6 +786,9 @@ def ticket_detail(cfg, store, t):
             st.error(f'Delivery failed: {t.delivery_error}')
         if a and a.question and stage(t) == 'person/answer':
             st.warning(f'Question: {a.question}')
+        if t.state == 'open':
+            repo_request(cfg, store, t)
+        proposals_box(cfg, store, t)
         if a and a.summary:
             st.markdown(f"Latest report ({a.report or '-'}): {a.summary}")
         answer_box(cfg, store, t, 'tk')
@@ -632,10 +888,11 @@ def settings_done(kind, text):
 
 
 def check_repo(name, checkout):
+    """A repo name as owner/name, and its checkout folder: empty (superagent makes its own) or an existing one."""
     if not re.fullmatch(r'[\w.-]+/[\w.-]+', name):
         raise ValueError('give the repo as owner/name, as in its GitHub URL')
-    if not os.path.isdir(checkout):
-        raise ValueError(f'checkout folder {checkout or "(empty)"} does not exist: clone the repo there first')
+    if checkout and not os.path.isdir(checkout):
+        raise ValueError(f'checkout folder {checkout} does not exist: clone the repo there, or leave it empty')
 
 
 def repo_settings(cfg, tickets, r):
@@ -651,7 +908,8 @@ def repo_settings(cfg, tickets, r):
                                    'Add a second repo to rename this one.' if r.legacy else
                                    'As in its GitHub URL: github.com/owner/name.')
             checkout = c[1].text_input('Checkout folder', r.checkout, key=f'set-{r.slug}-checkout',
-                                       help='A local clone with an origin remote; worktrees are made from it.')
+                                       help='A local clone with an origin remote, or the copy superagent keeps '
+                                            'itself; worktrees are made from it.')
             c = st.columns([1, 3, 1])
             fields = {'name': name, 'checkout': checkout,
                       'base_branch': c[0].text_input('Base branch', r.base_branch, key=f'set-{r.slug}-base',
@@ -682,7 +940,7 @@ def repo_settings(cfg, tickets, r):
     if not diff:
         settings_done('info', f'{r.name}: nothing changed.')
     try:
-        check_repo(fields['name'] if 'name' in diff else 'o/k', fields['checkout'] if 'checkout' in diff else '.')
+        check_repo(fields['name'] if 'name' in diff else 'o/k', fields['checkout'] if 'checkout' in diff else '')
         if r.legacy:  # the single-repo form keeps checkout and base_branch in [executor]
             config.update(config_path(), diff)
         else:
@@ -703,7 +961,9 @@ def add_repo(cfg):
             c = st.columns([2, 3])
             name = c[0].text_input('Repo (owner/name)', key='add-repo-name', placeholder='owner/name')
             checkout = c[1].text_input('Checkout folder', key='add-repo-checkout',
-                                       placeholder='a local clone with an origin remote')
+                                       placeholder='empty: superagent keeps its own copy',
+                                       help='Leave it empty and superagent clones the repo itself on first use. Or '
+                                            'give a local clone with an origin remote.')
             c = st.columns([1, 3, 1])
             base = c[0].text_input('Base branch', key='add-repo-base', placeholder=cfg.base_branch)
             test = c[1].text_input('Test command', key='add-repo-test', placeholder='none',
@@ -768,6 +1028,17 @@ def open_store(db_path):
     return _cached_store(db_path, id(Store), Store)
 
 
+def service_warning(cfg, store):
+    """Say so on every tab when `superagent run` is not polling: the panel only queues requests, it runs nothing."""
+    if cli.service_running(cfg, store):
+        return
+    last = store.get('last-poll')
+    waiting = len(store.local_requests())
+    st.warning(f"The service is not running: {'its last poll was ' + last if last else 'it has never polled'}. "
+               'Start `superagent run` in a terminal and leave it open.'
+               + (f' {waiting} request(s) are waiting for it.' if waiting else ''), icon=':material/warning:')
+
+
 @st.fragment(run_every=REFRESH_SECONDS)
 def body(cfg):
     if not os.path.exists(cfg.db_path):
@@ -775,30 +1046,34 @@ def body(cfg):
         return
     store = open_store(cfg.db_path)
     tickets = store.tickets()
-    if st.button('Refresh', key='refresh'):
-        pass  # the click itself reruns this fragment
-    st.caption(f'Updated {datetime.now().strftime("%H:%M:%S")}; refreshes every {REFRESH_SECONDS} s.')
-    if not tickets:
-        st.info('No tickets yet. Mention the bot on an issue, or queue one on the New request tab, to start one.')
-    # Keyed and tracked, so an Overview card's Show can switch to the Tickets tab.
-    overview_tab, tickets_tab_, request_tab, settings = st.tabs(
-        ['Overview', 'Tickets', 'New request', 'Settings'], key='main-tabs', on_change='rerun')
-    with overview_tab:
-        overview(cfg, tickets)
+    head = st.container(horizontal=True, vertical_alignment='center', gap='small')
+    head.markdown('### :material/smart_toy: superagent')
+    up = cli.service_running(cfg, store)
+    head.markdown(f"{':green-badge[:material/check_circle: Service running]' if up else ':red-badge[:material/error: Service stopped]'}"
+                  f" · {len(cfg.repo_names)} repo{'s' if len(cfg.repo_names) != 1 else ''} as @{cfg.agent_login}"
+                  f" · updated {datetime.now().strftime('%H:%M:%S')}",
+                  help='Repos: ' + ', '.join(cfg.repo_names) + f'. The page refreshes every {REFRESH_SECONDS} s.')
+    head.button('Refresh', key='refresh', type='tertiary', icon=':material/refresh:')  # a click reruns this fragment
+    service_warning(cfg, store)
+    # Keyed and tracked, so a Stats card's Show or a Home card's Open can switch to the Tickets tab.
+    home_tab, tickets_tab_, stats_tab, settings = st.tabs(MAIN_TABS, key='main-tabs', on_change='rerun')
+    proposed = Counter(p['ticket_id'] for p in store.proposals(state='pending'))
+    with home_tab:
+        home(cfg, store, tickets, proposed)
     with tickets_tab_:
         if tickets:
             tickets_tab(cfg, store, tickets)
         else:
-            st.info('No tickets yet.')
-    with request_tab:
-        new_request(cfg, store, tickets)
+            st.info('No tickets yet: ask on the Home tab, or mention the bot on a GitHub issue.')
+    with stats_tab:
+        overview(cfg, tickets, proposed)
     with settings:
         settings_tab(cfg, store, tickets)
 
 
 def main():
-    st.set_page_config(page_title='superagent', layout='wide')
-    st.title('superagent')
+    st.set_page_config(page_title='superagent', page_icon=':material/smart_toy:', layout='wide')
+    st.html(TAB_STYLE)
     path = config_path()
     if not path:
         st.error('No config: set SUPERAGENT_CONFIG or start the panel with `superagent panel`.')
@@ -808,7 +1083,6 @@ def main():
     except cli.ConfigError as e:
         st.error(str(e))
         return
-    st.caption(f'{", ".join(cfg.repo_names)} as @{cfg.agent_login}')
     body(cfg)
 
 

@@ -120,12 +120,14 @@ class CopilotAcp(PiRpc):
         await self._send({'jsonrpc': '2.0', 'method': 'session/cancel', 'params': {'sessionId': self.session}})
         return {}
 
-    async def run(self, message, timeout):
-        """Prompt and wait for its stop reason. The result holds the agent's last message."""
+    async def run(self, message, timeout, images=()):
+        """Prompt and wait for its stop reason. The result holds the agent's last message. `images`: ACP image
+        blocks ({type: image, data: base64, mimeType}) shown to the model with the message."""
         if self.fresh and self.preamble:
             message, self.fresh = f'{self.preamble}\n\n---\n\n{message}', False
         result, self._said = RunResult(), ''
-        fut = self._ask('session/prompt', {'sessionId': self.session, 'prompt': [{'type': 'text', 'text': message}]})
+        prompt = [{'type': 'text', 'text': message}, *images]
+        fut = self._ask('session/prompt', {'sessionId': self.session, 'prompt': prompt})
         try:
             try:
                 r = await asyncio.wait_for(asyncio.shield(fut), timeout)

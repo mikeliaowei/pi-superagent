@@ -6,7 +6,7 @@ import os
 import re
 import unittest
 
-from superagent import cli
+from superagent import cli, report
 from superagent.executor import first_message
 from superagent.model import Ticket
 from superagent.store import Store
@@ -59,6 +59,54 @@ class CrossRepoTest(ServiceBase):
 
     def replies(self):
         return [p.split('<!--')[0].strip() for p in self.one.posted(1)]
+
+    async def test_a_worker_asks_for_another_repo_and_after_approval_works_in_both(self):
+        self.one.add_issue('Rename the API', '@bot rename `get` in this repo.')
+        ask = {'status': 'waiting', 'summary': 'Renamed it in a/one.', 'question': 'The b/two client calls get too: add it?',
+               'needs_repo': 'b/two'}
+        self.start({'commit': True, 'report': ask}, {'before': commit_in('b__two'), **READY})
+        await self.round()
+        await until(lambda: self.pi.runs and self.pi.runs[0].messages)
+        await self.drain()
+        t = self.ticket()
+        old = t.worktree
+        self.assertEqual((t.parts, self.store.get(f'repo-request:{t.id}')), ([], 'b/two'))  # asked, not yet added
+        self.assertIn('will be added', cli.add_repo_request(self.cfg, self.store, t.name, 'B/Two'))
+        await self.round()
+        await until(lambda: len(self.pi.runs) > 1 and self.pi.runs[1].messages)
+        await self.drain()
+        t = self.ticket()
+        folder = os.path.join(self.cfg.work_dir, 'tickets', t.name)
+        self.assertEqual([(p['repo'], p['worktree']) for p in t.parts],
+                         [('a/one', os.path.join(folder, 'a__one')), ('b/two', os.path.join(folder, 'b__two'))])
+        self.assertEqual(t.worktree, folder)
+        self.assertFalse(os.path.exists(old))  # moved, with the first run's commit
+        self.assertIn('fix', git('log', '--format=%s', cwd=os.path.join(folder, 'a__one')).stdout)
+        msg = self.pi.runs[1].messages[0]
+        self.assertIn('A person approved adding b/two', msg)
+        self.assertIn(os.path.join(folder, 'b__two'), msg)
+        self.assertIsNone(self.store.get(f'repo-request:{t.id}'))
+        await self.until_effects(lambda: self.one.pulls and self.two.pulls)
+        self.assertIn('Part of a cross-repo change', self.two.pulls[1]['body'])
+        self.assertIn('Added b/two to this ticket', '\n'.join(self.replies()))
+
+    async def test_adding_a_repo_is_refused_when_it_cannot_join_the_ticket(self):
+        self.one.add_issue('Rename the API', '@bot rename `get`.')
+        self.start({'report': {'status': 'waiting', 'summary': 'q', 'question': 'Which name?'}})
+        await self.round()
+        await until(lambda: self.pi.runs and self.pi.runs[0].messages)
+        await self.drain()
+        t = self.ticket()
+        for repo, error in (('x/y', 'x/y is not configured'), ('a/one', 'already works in a/one')):
+            with self.assertRaisesRegex(RuntimeError, error):
+                cli.add_repo_request(self.cfg, self.store, t.id, repo)
+        self.assertIsNone(self.store.get(f'operator:add-repo:{t.id}'))
+        self.assertEqual(report.validate({'status': 'waiting', 'summary': 's', 'question': 'q',
+                                          'needs_repo': ' b/two '})[0]['needs_repo'], 'b/two')
+        for body, error in (({'status': 'ready', 'summary': 's', 'needs_repo': 'b/two'}, 'goes with status waiting'),
+                            ({'status': 'waiting', 'summary': 's', 'question': 'q', 'needs_repo': 'two'},
+                             'owner/name')):
+            self.assertIn(error, report.validate(body)[1])
 
     async def test_a_request_naming_a_second_configured_repo_gets_one_ticket_with_a_worktree_per_repo(self):
         self.one.add_issue('Rename the API', '@bot rename `get` in this repo and update the client in B/Two too.')

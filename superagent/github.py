@@ -86,6 +86,15 @@ class Gone(GitHubError):
     pass
 
 
+class NotFastForward(GitHubError):
+    """GitHub refused a push without force: the branch has commits the pushed history lacks (someone pushed, or the
+    worker rewrote history). Pushing the same history again can never succeed."""
+
+
+def _refused_as_not_fast_forward(err):
+    return '[rejected]' in err and ('(fetch first)' in err or '(non-fast-forward)' in err)
+
+
 def _tls_context():
     # Python 3.13+ rejects the corporate TLS-inspecting proxy's CA ("Basic Constraints ... not marked critical").
     # Drop only that strict RFC 5280 check; the chain and hostname are still verified.
@@ -423,7 +432,8 @@ def push_branch(worktree, branch, token, repo, push_dir, run=subprocess.run, env
             err = r.stderr or ''
             for secret in (token, auth):
                 err = err.replace(secret, '***') if secret else err
-            raise GitHubError(f'git push {branch} failed ({step}): {err.strip()}')
+            error = NotFastForward if step == 'push' and _refused_as_not_fast_forward(err) else GitHubError
+            raise error(f'git push {branch} failed ({step}): {err.strip()}')
 
     parent = os.path.dirname(os.path.abspath(push_dir))
     os.makedirs(parent, exist_ok=True)

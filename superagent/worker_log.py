@@ -207,9 +207,22 @@ def _one_line(text):
     return line if len(line) <= TITLE_CHARS else line[:TITLE_CHARS - 1] + '…'
 
 
+def _time(at):
+    try:
+        dt = datetime.fromisoformat(str(at).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def steps(paths, secrets=(), max_bytes=TAIL_BYTES):
-    """Every step of the sessions (the last `max_bytes` of each file), in order. The exact `secrets`, then strings that
-    look like tokens, are masked before a long text is cut: tool output keeps its head and tail, other text its head."""
+    """Every step of the sessions (the last `max_bytes` of each file), oldest first. The exact `secrets`, then strings
+    that look like tokens, are masked before a long text is cut: tool output keeps its head and tail, other text its
+    head.
+
+    Sessions are ordered by time, not by file: a Ticket worked by Copilot then retried with Pi (or the reverse) has
+    its Copilot events listed after its Pi files. A step without a readable time keeps its place after the one before.
+    """
     secrets = [s for s in secrets if s]
 
     def mask(text):
@@ -217,18 +230,20 @@ def steps(paths, secrets=(), max_bytes=TAIL_BYTES):
             text = text.replace(secret, MASK)
         return mask_secrets(text)
 
-    out = []
+    keyed, last = [], datetime.min.replace(tzinfo=timezone.utc)
     for e in _entries(paths, max_bytes):
         for s in _entry_steps(e):
+            last = _time(s.at) or last
             s.at, s.title, text = str(s.at or ''), _one_line(mask(str(s.title))), mask(str(s.text))
             s.text = _trim(text) if s.kind in ('result', 'error') else _clip(text)
-            out.append(s)
-    return out
+            keyed.append((last, len(keyed), s))
+    return [s for _, _, s in sorted(keyed, key=lambda k: k[:2])]
 
 
 # Usage
 
 USAGE_KEYS = ('input', 'output', 'cacheRead', 'cacheWrite')
+AI_CREDIT_DOLLARS = 0.01  # what one GitHub AI credit costs
 
 
 def _number(v):
@@ -236,14 +251,18 @@ def _number(v):
 
 
 def _usage_of(e):
-    """(timestamp, {input, output, cacheRead, cacheWrite, cost}) of a model call's entry, else None. Copilot bills
-    premium requests, not dollars: its calls cost 0 here."""
+    """(timestamp, {input, output, cacheRead, cacheWrite, cost}) of a model call's entry, else None. A Copilot call's
+    cost is its GitHub AI credits at list price: copilotUsage.totalNanoAiu is in 1e-9 credits, 1 credit = $0.01
+    (docs.github.com, Models and pricing for GitHub Copilot)."""
     if e.get('type') == 'session.usage_record':
         d = e.get('data')
         u = d.get('usage') if isinstance(d, dict) else None
         if isinstance(u, dict):
+            copilot = u.get('copilotUsage') if isinstance(u.get('copilotUsage'), dict) else {}
+            credits = _number(copilot.get('totalNanoAiu')) / 1e9
             return e.get('timestamp'), {'input': u.get('inputTokens'), 'output': u.get('outputTokens'),
-                                        'cacheRead': u.get('cacheReadTokens'), 'cacheWrite': u.get('cacheWriteTokens')}
+                                        'cacheRead': u.get('cacheReadTokens'), 'cacheWrite': u.get('cacheWriteTokens'),
+                                        'cost': {'total': credits * AI_CREDIT_DOLLARS}}
         return None
     m = e.get('message')
     u = m.get('usage') if e.get('type') == 'message' and isinstance(m, dict) else None

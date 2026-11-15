@@ -202,10 +202,10 @@ class Store:
 
     # Local requests (S15): `superagent ask` and `answer` queue them; the running service applies each once.
     @_locked
-    def queue_ask(self, text, repos, actor, branch='', options=None):
+    def queue_ask(self, text, repos, actor, branch='', options=None, files=()):
         """Queue a local request for a new Ticket in `repos`; returns its id (the thread is `local:<id>`). `branch`:
         an existing branch to work on instead of a new one. `options`: {title, new_branch, skills} (see
-        ask_options)."""
+        ask_options). `files`: paths of files attached to it (see trigger_files)."""
         cur = self.db.execute('INSERT INTO local_requests (kind, repos, text, actor, at) VALUES (?, ?, ?, ?, ?)',
                               ('ask', json.dumps(list(repos)), text, actor, now_iso()))
         # In kv, not new columns: tables are never altered (see _keep_column_reasons).
@@ -215,6 +215,9 @@ class Store:
         if options:
             self.db.execute('INSERT OR REPLACE INTO kv VALUES (?, ?)',
                             (f'ask-options:{cur.lastrowid}', json.dumps(options)))
+        if files:
+            self.db.execute('INSERT OR REPLACE INTO kv VALUES (?, ?)',
+                            (f'files:local|{cur.lastrowid}', json.dumps(list(files))))
         self.db.commit()
         return cur.lastrowid
 
@@ -234,15 +237,79 @@ class Store:
                 **(json.loads(row['v']) if row else {})}
 
     @_locked
-    def queue_answer(self, ticket_id, text, actor):
-        """Queue an answer for the Ticket and record it in its conversation, in one transaction."""
+    def queue_answer(self, ticket_id, text, actor, files=()):
+        """Queue an answer for the Ticket and record it in its conversation, in one transaction. `files`: paths of
+        files attached to it (see trigger_files)."""
         at = now_iso()
         cur = self.db.execute('INSERT INTO local_requests (kind, ticket_id, text, actor, at) VALUES (?, ?, ?, ?, ?)',
                               ('answer', ticket_id, text, actor, at))
+        body = text + ('\n\nAttached: ' + ', '.join(os.path.basename(f) for f in files) if files else '')
         self.db.execute('INSERT INTO local_messages (ticket_id, at, kind, body, key, actor) VALUES (?, ?, ?, ?, ?, ?)',
-                        (ticket_id, at, 'answer', text, f'answer-{cur.lastrowid}', actor))
+                        (ticket_id, at, 'answer', body, f'answer-{cur.lastrowid}', actor))
+        if files:
+            self.db.execute('INSERT OR REPLACE INTO kv VALUES (?, ?)',
+                            (f'files:local-answer|{cur.lastrowid}', json.dumps(list(files))))
         self.db.commit()
         return cur.lastrowid
+
+    @_locked
+    def trigger_files(self, trigger_id):
+        """Paths of the files attached to a request or answer, by the id of its Trigger (local|<id>,
+        local-answer|<id>); [] when none."""
+        row = self.db.execute('SELECT v FROM kv WHERE k = ?', (f'files:{trigger_id}',)).fetchone()
+        return json.loads(row['v']) if row else []
+
+    @_locked
+    def add_trigger_files(self, trigger_id, paths):
+        """Add files to those of a Trigger (see trigger_files): what the service fetched for it."""
+        row = self.db.execute('SELECT v FROM kv WHERE k = ?', (f'files:{trigger_id}',)).fetchone()
+        files = [*(json.loads(row['v']) if row else []), *paths]
+        self.db.execute('INSERT OR REPLACE INTO kv VALUES (?, ?)', (f'files:{trigger_id}', json.dumps(files)))
+        self.db.commit()
+
+    # Proposals: what a worker asks to write to Jira or Confluence (report.validate_proposal). In kv, not a new table
+    # column: proposal:<id> = {id, ticket_id, state, at, ..., result, error}. state: pending -> approved -> writing ->
+    # done | failed, or pending -> rejected.
+    @_locked
+    def add_proposal(self, ticket_id, proposal, limit=None):
+        """Record a pending proposal; returns its id. ValueError when the Ticket already has `limit` pending."""
+        if limit is not None and len(self._proposals(ticket_id, 'pending')) >= limit:
+            raise ValueError(f'{limit} proposals already wait for a person: wait for them to be approved or rejected')
+        row = self.db.execute("SELECT v FROM kv WHERE k = 'proposal-seq'").fetchone()
+        pid = (json.loads(row['v']) if row else 0) + 1
+        record = {**proposal, 'id': pid, 'ticket_id': ticket_id, 'state': 'pending', 'at': now_iso(), 'result': '',
+                  'error': '', 'decided_by': ''}
+        self.db.execute('INSERT OR REPLACE INTO kv VALUES (?, ?)', ('proposal-seq', json.dumps(pid)))
+        self.db.execute('INSERT OR REPLACE INTO kv VALUES (?, ?)', (f'proposal:{pid}', json.dumps(record)))
+        self.db.commit()
+        return pid
+
+    def _proposals(self, ticket_id=None, state=None):
+        rows = self.db.execute("SELECT v FROM kv WHERE k LIKE 'proposal:%'").fetchall()
+        found = (json.loads(r['v']) for r in rows)
+        return sorted((p for p in found if (ticket_id is None or p['ticket_id'] == ticket_id)
+                       and (state is None or p['state'] == state)), key=lambda p: p['id'])
+
+    @_locked
+    def proposals(self, ticket_id=None, state=None):
+        """Proposals, oldest first: of one Ticket and/or in one state."""
+        return self._proposals(ticket_id, state)
+
+    @_locked
+    def proposal(self, pid):
+        row = self.db.execute('SELECT v FROM kv WHERE k = ?', (f'proposal:{pid}',)).fetchone()
+        return json.loads(row['v']) if row else None
+
+    @_locked
+    def update_proposal(self, pid, expect=None, **changes):
+        """Change a proposal; with `expect`, only when it is in that state (returns False otherwise)."""
+        row = self.db.execute('SELECT v FROM kv WHERE k = ?', (f'proposal:{pid}',)).fetchone()
+        record = json.loads(row['v']) if row else None
+        if not record or (expect is not None and record['state'] != expect):
+            return False
+        self.db.execute('INSERT OR REPLACE INTO kv VALUES (?, ?)', (f'proposal:{pid}', json.dumps({**record, **changes})))
+        self.db.commit()
+        return True
 
     @_locked
     def local_requests(self):

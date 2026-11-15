@@ -19,8 +19,9 @@ allowed = ["your-login"]
 # local_user = "your-name"
 
 [executor]
-# Local clone of the repository (with an `origin` remote). Worktrees are created from it.
-checkout = "~/src/your-repo"
+# Local clone of the repository (with an `origin` remote). Worktrees are created from it. Optional: leave it out
+# and superagent makes its own copy in <state_dir>/checkouts/<owner>__<name> on first use (`superagent check` does).
+# checkout = "~/src/your-repo"
 # Where per-Ticket worktrees live. Default: <state_dir>/work
 # work_dir = "~/.local/share/pi-superagent/work"
 # Branch pull requests target, and the worktrees start from (origin/<base_branch>).
@@ -57,11 +58,20 @@ state_dir = "~/.local/share/pi-superagent"
 # Localhost port workers report to with `superagent-report`.
 report_port = 8741
 
+[atlassian]
+# Jira issues (KEY-123, or a /browse/ link) and Confluence page links in a request or answer are fetched by the
+# service, read-only, and given to the worker as files. Leave a URL empty to turn that side off.
+# jira_url = "https://jira.example.com"
+# confluence_url = "https://confluence.example.com"
+# Environment variables holding personal access tokens (sent as Bearer). They never reach a worker.
+# jira_token_env = "JIRA_API_TOKEN"
+# confluence_token_env = "CONFLUENCE_API_TOKEN"
+
 # Several repositories: one table per repository, instead of [github] repo and [executor] checkout.
 # Every name must be covered by the one token in token_env.
 # [[repos]]
 # name = "your-org/your-repo"
-# checkout = "~/src/your-repo"
+# checkout = "~/src/your-repo"    # optional: without it superagent keeps its own copy
 # base_branch = "main"            # default: [executor] base_branch
 # test_command = "make test"      # run with `sh -c` (cmd.exe on Windows) in the worktree before any pull request;
 #                                 # default: none
@@ -69,4 +79,3 @@ report_port = 8741
 #
 # [[repos]]
 # name = "your-org/other-repo"
-# checkout = "~/src/other-repo"

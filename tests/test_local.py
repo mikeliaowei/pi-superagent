@@ -1,6 +1,7 @@
 """Local requests (S15): `superagent ask/show/answer`, the local outbox, and the Pi skill and prompt template."""
 
 import asyncio
+import base64
 import gc
 import getpass
 import io
@@ -17,7 +18,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from unittest import mock
 
-from superagent import cli
+from superagent import cli, executor
 from superagent.executor import followup_message
 from superagent.model import stage
 from superagent.service import Service
@@ -73,6 +74,29 @@ class CliBase(unittest.TestCase):
 
 
 class AskTest(CliBase):
+    def test_ask_and_answer_take_attached_files_kept_outside_the_repos_with_limits(self):
+        log = write(os.path.join(self.tmp, 'app.log'), 'Traceback ...\n')
+        code, out, err = self.cli('ask', '--repo', 'a/one', '--attach', log, '--attach', log, 'Fix the crash in the log')
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('with 2 attached file(s)', out.splitlines()[0])
+        paths = self.store().trigger_files('local|1')
+        folder = os.path.join(self.state, 'attachments')
+        self.assertEqual([os.path.basename(p) for p in paths], ['app.log', 'app-2.log'])  # same name: both kept
+        self.assertTrue(all(p.startswith(folder) for p in paths))
+        with open(paths[0]) as f:
+            self.assertEqual(f.read(), 'Traceback ...\n')
+        cfg = cli.load_config(self.config)
+        with self.assertRaisesRegex(RuntimeError, 'at most 10 files'):
+            cli.save_attachments(cfg, [(f'f{i}.txt', b'x') for i in range(11)])
+        with self.assertRaisesRegex(RuntimeError, 'larger than 10 MB'):
+            cli.save_attachments(cfg, [('big.bin', b'0' * (10 * 1024 * 1024 + 1))])
+        self.assertEqual(len(os.listdir(folder)), 1)  # a refused set keeps nothing
+        (odd,) = cli.save_attachments(cfg, [('../../etc/pass:wd', b'1')])
+        self.assertEqual(os.path.dirname(os.path.dirname(odd)), folder)  # a name cannot leave the folder
+        code, _, err = self.cli('ask', '--repo', 'a/one', '--attach', os.path.join(self.tmp, 'missing.png'), 'x')
+        self.assertEqual(code, 1)
+        self.assertIn('cannot attach', err)
+
     def test_ask_queues_one_request_and_prints_its_id(self):
         code, out, err = self.cli('ask', '--repo', 'a/one', 'Fix the flaky test')
         self.assertEqual((code, err), (0, ''))
@@ -197,6 +221,22 @@ class LocalServiceTest(ServiceBase):
 
     def github_writes(self):
         return [c for c in self.fakes.calls if c.method != 'GET']
+
+    async def test_attached_files_reach_the_worker_and_images_go_to_its_model(self):
+        self.start({'mode': 'hang'})
+        png = b'\x89PNG\r\n\x1a\n' + b'0' * 32
+        rid, _ = cli.ask_request(self.cfg, self.store, 'Fix the layout in the screenshot', ['a/one'],
+                                 files=[('screen.png', png), ('notes.txt', b'the header overlaps')])
+        await self.round()
+        await until(lambda: self.pi.runs and self.pi.runs[0].messages)
+        paths = self.store.trigger_files(f'local|{rid}')
+        message = self.pi.runs[0].messages[0]
+        self.assertIn('Files attached to this message', message)
+        for p in paths:
+            self.assertIn(p, message)
+        (image,) = self.pi.runs[0].images[0]  # only the picture goes to the model; the text file is opened by path
+        self.assertEqual((image['type'], image['mimeType'], base64.b64decode(image['data'])), ('image', 'image/png', png))
+        self.assertIn('--add-dir', executor.copilot_argv(self.cfg, self.ticket()))
 
     async def test_a_queued_request_becomes_exactly_one_ticket_with_an_ack_in_the_local_outbox(self):
         self.start({'mode': 'hang'})
@@ -349,6 +389,51 @@ class LocalServiceTest(ServiceBase):
         self.assertEqual(t.pr_number, 7)
         self.assertEqual(self.outbox(t)[-1],
                          'Pushed to `feature/memory-history`: https://github.com/a/one/pull/7')
+
+    def existing_branch(self):
+        """feature/memory-history on GitHub with an open PR #7, as in the test above."""
+        git('checkout', '-b', 'feature/memory-history', cwd=self.one_co)
+        write(os.path.join(self.one_co, 'history.txt'), 'history\n')
+        git('add', 'history.txt', cwd=self.one_co)
+        git('commit', '-m', 'history', cwd=self.one_co)
+        git('push', 'origin', 'feature/memory-history', cwd=self.one_co)
+        self.one.pulls[7] = {'number': 7, 'state': 'open', 'merged': False, 'head': 'feature/memory-history',
+                             'base': 'main', 'title': 'Memory history', 'body': ''}
+
+    async def test_a_push_onto_an_existing_branch_that_moved_goes_back_to_the_worker_to_merge(self):
+        # The worker rebased, or someone pushed meanwhile: GitHub refuses a push that is not a fast-forward, and the
+        # service never forces onto a branch it did not create. Retrying the same push can never work.
+        self.existing_branch()
+        self.start({'commit': True, 'report': {'status': 'ready', 'summary': 'Rebased.'}},
+                   {'report': {'status': 'ready', 'summary': 'Merged origin instead.'}})
+        self.git.rejected = 1
+        cli.ask_request(self.cfg, self.store, 'Rebase it', ['a/one'], branch='feature/memory-history')
+        await self.round()
+        await self.drain()
+        t = self.ticket()
+        self.assertEqual(len(self.pi.runs), 2)
+        sent = self.pi.runs[1].messages[0]
+        self.assertIn('git merge origin/feature/memory-history', sent)
+        self.assertIn('fetch first', sent)  # what GitHub said
+        self.assertIn('Do not rebase', sent)
+        self.assertEqual(len(self.git.pushes), 2)
+        self.assertEqual((t.delivery_error, t.pr_number, stage(t)), ('', 7, 'person/review'))
+        self.assertEqual(self.outbox(t)[-1], 'Pushed to `feature/memory-history`: https://github.com/a/one/pull/7')
+
+    async def test_a_push_still_refused_after_the_fix_attempts_leaves_the_ticket_blocked(self):
+        self.existing_branch()
+        ready = {'report': {'status': 'ready', 'summary': 'Done.'}}
+        self.start({'commit': True, **ready}, ready, ready, ready)
+        self.git.rejected = 99
+        cli.ask_request(self.cfg, self.store, 'Rebase it', ['a/one'], branch='feature/memory-history')
+        await self.round()
+        await self.drain()
+        t = self.ticket()
+        self.assertEqual(len(self.pi.runs), 3)  # the first run and two fix attempts
+        self.assertEqual(len(self.git.pushes), 3)
+        self.assertEqual((stage(t), t.current.report), ('person/blocked', 'blocked'))
+        self.assertIn('GitHub refused the push to `feature/memory-history`', self.outbox(t)[-1])
+        self.assertIn('force', self.outbox(t)[-1])
 
     async def test_a_request_with_a_title_and_a_new_branch_name_uses_them_and_pushes_to_that_branch(self):
         self.start({'commit': True, 'report': {'status': 'ready', 'summary': 'Added the page.'}})

@@ -14,6 +14,116 @@ This is a Python port of the design of DeepSeek's
 harness onto Pi's RPC mode. The domain (Triggers, Tickets, Assignments, Reports, stages), the explicit-mandate
 policy, the effect queue and the "confirm once, then stay quiet" reply style come from that project.
 
+## Easy setup (Windows, about 10 minutes)
+
+You only need **this repository**. superagent makes its own copy of each repository it works in, so you do not
+clone them. Use PowerShell 7 (`pwsh`).
+
+**1. Install the tools (once).**
+
+```powershell
+winget install Git.Git astral-sh.uv OpenJS.NodeJS.LTS   # skip what you already have
+npm install -g @github/copilot                          # the worker: GitHub Copilot CLI
+copilot login                                           # sign in with your GitHub account
+```
+
+**2. Get superagent.** Unzip `pi-superagent.zip` (or clone this repository), then in that folder:
+
+```powershell
+cd pi-superagent
+uv sync --extra panel
+```
+
+**3. Give it a GitHub token.** On github.com: your picture, **Settings**, **Developer settings**, **Personal access
+tokens**, **Fine-grained tokens**, **Generate new token**. Choose the repositories it should work in and set
+**Contents**, **Issues** and **Pull requests** to *Read and write*. Then save the token for your Windows user (it
+is typed at a hidden prompt, so it stays out of your history):
+
+```powershell
+$t = Read-Host -AsSecureString "GitHub token" | ConvertFrom-SecureString -AsPlainText
+[Environment]::SetEnvironmentVariable("SUPERAGENT_GITHUB_TOKEN", $t, "User")
+$env:SUPERAGENT_GITHUB_TOKEN = $t
+```
+
+**4. Write your config.** Paste this, then change the three marked lines in the file that opens:
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\.config\pi-superagent" | Out-Null
+@'
+[github]
+agent_login = "your-github-login"      # 1. your GitHub login
+
+[policy]
+allowed = ["your-github-login"]        # 2. your GitHub login again
+
+[executor]
+agent = "copilot"
+model = "claude-sonnet-5.5"
+base_branch = "main"                   # the branch pull requests target, e.g. develop
+
+[[repos]]
+name = "your-org/your-repo"           # 3. a repository it works in; add one [[repos]] block per repository
+'@ | Set-Content "$HOME\.config\pi-superagent\config.toml"
+notepad "$HOME\.config\pi-superagent\config.toml"
+```
+
+**5. Check, then run.**
+
+```powershell
+uv run superagent check    # the first time it also makes its own copy of each repository
+uv run superagent run      # the service: keep this window open
+```
+
+In a second window, from the same folder:
+
+```powershell
+uv run superagent panel    # opens http://127.0.0.1:8742
+```
+
+**6. Use it.** On the panel's **Home** tab, write what to do in **Ask superagent**, give a title, pick the
+repository (it remembers your last) and **Send** (attach a screenshot or log if it helps). Questions and approvals
+show up on Home under **Needs you**, where you answer them; **Open** shows a ticket's worker activity and pull
+request on **Tickets**.
+
+**7. Optional: Jira and Confluence.** Then requests can name Jira issues (`RWT-123`) and Confluence pages (links),
+which the service reads for the worker, and workers can propose Jira issues, comments and Confluence pages that you
+approve. Create a personal access token on each site (your picture, **Profile** or **Settings**, **Personal Access
+Tokens**, **Create token**), then save them for your Windows user:
+
+```powershell
+$j = Read-Host -AsSecureString "Jira token" | ConvertFrom-SecureString -AsPlainText
+[Environment]::SetEnvironmentVariable("JIRA_API_TOKEN", $j, "User")
+$c = Read-Host -AsSecureString "Confluence token" | ConvertFrom-SecureString -AsPlainText
+[Environment]::SetEnvironmentVariable("CONFLUENCE_API_TOKEN", $c, "User")
+```
+
+Add the sites to your config (`notepad "$HOME\.config\pi-superagent\config.toml"`):
+
+```toml
+[atlassian]
+jira_url = "https://jira.your-company.com"
+confluence_url = "https://confluence.your-company.com"
+```
+
+Open a new window and run `uv run superagent check`: it says who each token signs in as
+(`ok    jira: JIRA_API_TOKEN signs in to ... as <you>`). The tokens stay with the service; workers never get them.
+
+**If something is wrong**
+
+| You see | Do this |
+|---|---|
+| `FAIL token` | Repeat step 3 in this window, or open a new window after it. |
+| `FAIL checkout: could not make ...` | The token cannot read that repository: add it to the token (step 3). |
+| `FAIL copilot` | Run step 1 again: `npm install -g @github/copilot`, then `copilot login`. |
+| The panel says *The service is not running* | Start `uv run superagent run` (step 5) and keep it open. |
+| `FAIL jira: ... refused JIRA_API_TOKEN (HTTP 401)` (or confluence) | The token expired or was revoked: create a new one and save it again (step 7), then restart `run`. |
+| `FAIL jira: environment variable JIRA_API_TOKEN is not set` | Save it (step 7) and open a new window. |
+| You prefer Pi to Copilot | Set `agent = "pi"` in the config, or on the panel's **Settings** tab, and restart `run`. |
+
+Requests you make on the panel run as you, with your token. With your own login as `agent_login`, the agent
+ignores GitHub @-mentions (they would be its own), so ask from the panel. The rest of this README is the full
+reference.
+
 ## How it works
 
 ```
@@ -67,6 +177,35 @@ policy, the effect queue and the "confirm once, then stay quiet" reply style com
   under "Part of a cross-repo change:", and one reply on the request thread lists every PR (repos without
   commits as "no changes"). Only the request's own repo PR says `Closes #<n>`. The Ticket ends when none of its
   PRs is open: `merged` if all merged, else `closed`. Stop and retry act on the whole Ticket.
+- **Jira and Confluence.** With `[atlassian] jira_url` and `confluence_url` set, the Jira issues (`RWT-123`, or a
+  `/browse/` link) and Confluence page links (`?pageId=`, `/pages/<id>`, `/display/<space>/<title>`) in a request,
+  answer or thread message are fetched by the service, read-only, with the tokens in `jira_token_env` and
+  `confluence_token_env` (personal access tokens, sent as Bearer). Each becomes a Markdown file (an issue: its
+  summary, type, status, people, description and latest 5 comments; a page: its title, space, version and text)
+  given to the worker like an attached file, at most 5 per message, fetched once. Names like `UTF-8` or
+  `ISO-8601` are not taken for issues; an issue or page that does not exist is skipped. The tokens never reach
+  a worker, which cannot write to Jira or Confluence.
+- **Writing to Jira and Confluence, with approval.** A worker cannot write there (it has no token), but it can
+  propose a write: `superagent-report propose jira-issue --project KEY --summary S [--type T]`, `... jira-comment
+  --issue KEY-1`, `... confluence-page --space KEY --title T [--parent <page id>]` or `... confluence-update --page
+  <page id> [--mode append|replace] [--title T]`, each with `--body-file` (Markdown;
+  `superagent-propose` is the same command). The thread gets "I propose to write ..."; the ticket's details on
+  the panel show each proposal with a preview and **Approve and write** / **Reject** (or `superagent proposals`,
+  `superagent approve <id>`, `superagent reject <id> [reason]`), and Home lists it under **Needs you**. After
+  approval the service writes it at the next poll round, with the Jira or Confluence token, converting the
+  Markdown to Jira wiki markup or Confluence storage format; the thread gets the link, and the worker learns the
+  result (or the rejection and why) in its next message. Each is written once; at most 10 wait per Ticket.
+  A `confluence-update` saves a new version of the page: `append` (the default) adds the Markdown to the end and
+  keeps everything already there (macros included); `replace` makes it the whole page, and the panel warns before
+  you approve one. If the page was edited between the service reading and saving it, Confluence refuses the update
+  and the proposal shows as failed, so a person's edit is never overwritten; the old version stays in the page history.
+- **Adding a repo mid-ticket.** When a worker finds the change also needs another configured repo, it reports
+  `superagent-report --status waiting --needs-repo <owner/name> --question "..."`. The panel shows the request
+  on the ticket with **Add <repo> to this ticket** (or run `superagent add-repo <ticket> <owner/name>`). After
+  the current run, the service adds that repo's worktree on `agent/<name>`; a single-repo Ticket becomes a
+  cross-repo one first, its worktree moved into `<work_dir>/tickets/<ticket>/` (`git worktree move`, so its
+  commits stay) and its PR carried over. The worker resumes with each repo's path, then everything works as
+  for cross-repo Tickets. A Ticket on an existing branch stays in one repo.
 - **Durability.** Every side effect is written to the SQLite effect queue before it runs, retried with backoff
   (5 s doubling to 300 s), and replies carry a hidden marker so a retry never posts twice. After a restart,
   running Assignments end as "host restarted" and relaunch with a recovery note.
@@ -280,7 +419,7 @@ model = "claude-opus-5.5"
   Git for Windows' shell: `$env:PATH = "C:\Program Files\Git\usr\bin;$env:PATH"`. Repos without `test_command`
   don't need it.
 - **Your own GitHub account as `agent_login`.** Comments by `agent_login` are ignored as the agent's own, so your
-  @-mentions don't start work. Ask with `superagent ask` or the panel's New request instead, or use a separate bot
+  @-mentions don't start work. Ask with `superagent ask` or the panel's Ask superagent box instead, or use a separate bot
   account.
 
 Then run `.venv\Scripts\superagent check`, `.venv\Scripts\superagent run` and, in a second terminal,
@@ -370,7 +509,10 @@ worktree then starts from that branch (from GitHub's copy when there is one; on 
 never clashes with your own checkout of it), the commits are pushed
 onto it without force (GitHub refuses anything but a fast-forward, so nobody's commits are overwritten; a local-only
 branch is published by that push), and the
-branch's open pull request is reused, or one is opened against the base branch. The running service picks requests up each poll round. A local Ticket's thread is
+branch's open pull request is reused, or one is opened against the base branch. When GitHub refuses that push (someone
+pushed to the branch meanwhile, or the worker rebased it), the service fetches the branch again and sends the worker
+back to `git merge origin/<branch>` and report ready again; after 2 such attempts the Ticket is reported blocked, and
+only a person can force-push. The running service picks requests up each poll round. A local Ticket's thread is
 `local:<id>`: its replies (the acknowledgement, questions, reports and PR links) go to a local outbox that
 `superagent show` and the panel display, never to GitHub. Its pull requests say "Code change requested by super
 agent on behalf of <user>."
@@ -423,11 +565,14 @@ cd <worktree shown in the panel>
 | `superagent run` | Run the service. |
 | `superagent status` | JSON: repo (`repos` with `[[repos]]`), agent login, whether the token is set, open Tickets by stage, failing effects, last poll time. |
 | `superagent tickets [--all] [--json]` | Tickets with id, name, repo (with `[[repos]]`; every repo of a cross-repo Ticket), stage, issue number (`local` for a local Ticket), PR (`owner/name#<n>, ...` for a cross-repo Ticket) and last report; `--json` adds each Ticket's `thread` (`github:owner/name#<n>` or `local:<id>`). |
-| `superagent ask [--repo R ...] [--title T] [--branch B \| --new-branch N] [--skill PATH ...] [--model M] [--thinking L] TEXT` | Queue a local request (see above); `--branch` works on an existing branch, `--new-branch` names the new one, `--skill` adds worker skills, `--model` and `--thinking` set up the worker. |
+| `superagent ask [--repo R ...] [--title T] [--branch B \| --new-branch N] [--skill PATH ...] [--model M] [--thinking L] [--attach FILE ...] TEXT` | Queue a local request (see above); `--branch` works on an existing branch, `--new-branch` names the new one, `--skill` adds worker skills, `--model` and `--thinking` set up the worker, `--attach` adds files for it (see the panel's New request). |
 | `superagent show <ticket> [--json]` | A Ticket's stage, repos, PR links and conversation (request, local replies, answers); `local:<id>` also finds a request not picked up yet. |
+| `superagent add-repo <ticket> <owner/name>` | Add a configured repo to an open Ticket, as its worker asked with `--needs-repo` (or any other): after the current run the service adds the repo's worktree and resumes the worker with both. |
+| `superagent proposals [--all]`, `superagent approve <id>`, `superagent reject <id> [reason]` | List the Jira and Confluence writes workers proposed, and approve (the running service writes it within one poll round) or reject one (its worker learns why). |
 | `superagent answer <ticket> TEXT` | Give a Ticket an answer or instruction: it steers a running worker or resumes the same session. On an ended Ticket it reopens it first (unless another Ticket is open on its thread); one that ended merged or closed gets a new pull request on its next delivery. A new run also clears a failed delivery. |
 | `superagent pi-install [--agent-dir DIR] [--force] [--uninstall]` | Install the Pi skill and `/superagent` prompt template (see above). |
 | `superagent stop <ticket>` | Stop a Ticket (id or name). Its worker ends with every process its tools started. |
+| `superagent done <ticket>` | Mark a Ticket done without a pull request, e.g. when it only changed Jira or Confluence or answered a question: it ends as *Done* (counted as succeeded) and its worker stops. |
 | `superagent retry <ticket>` | Relaunch a Ticket whose last run ended, or retry a failed delivery. A worker that resumes its session is told to continue; one that starts a new session (after switching between Pi and Copilot, for example) gets the whole request again, with the thread's earlier messages. |
 | `superagent panel [--port 8742]` | Local web panel (see below); needs the `panel` extra. |
 
@@ -438,35 +583,48 @@ debug logging. Exit codes: 0 ok, 1 runtime error, 2 configuration error.
 
 ## Web panel
 
-A local web panel with four tabs.
+A local web panel with four tabs, under a one-line header: whether the service runs, the repos, when the page last
+refreshed, and **Refresh**.
 
-- **Overview**: every Ticket at a glance. Counts of all, open, needing you, succeeded (pull request merged) and not
-  merged (closed or stopped); a **Needs you** list (waiting for your answer or review, blocked, failed, or not
-  delivered); charts of Tickets by status and per repo, Tickets opened and ended per day and worker tokens per day
-  over the last 30 days; and the last 24 hours (running workers, opened, ended, worker cost).
-- **Tickets**: one table of Tickets (open, or all), filtered by repo, status and text, with plain-language status,
-  branch, issue and PR links, tokens and cost. Click a row to open its details below, and click it again to hide
-  them; they stay open through the 10 s refreshes, and close when a new ticket or another filter changes the rows:
-  status, repo, branch, links, who asked, its question or latest report, a box for an
-  answer or instruction (the same as `superagent answer`: a running worker gets it right away, a finished one is
-  resumed with it, an ended Ticket is reopened with it), **Stop** and **Retry**, and four tabs. **Worker log**
+- **Home**: everything you do day to day, on one screen. On the left, **Ask superagent**: the same as
+  `superagent ask`. Write what to do, give a **Title** (required; it names the Ticket) and pick the **Repos** (it
+  remembers those of your last request), optionally attach files, and **Send**. **More options** holds the rest:
+  **Continue ticket** (send the text to an open Ticket's worker on its branch and PR instead, like
+  `superagent answer`); a new branch (`agent/<name>`, or the **New branch name** you give) or, with **Existing
+  branch**, one you pick from the repo's GitHub and local branches (**Refresh from GitHub** runs
+  `git fetch --prune origin` in its checkout) or type; **Skills for the worker** (from `~/.pi/agent/skills`,
+  `~/.agents/skills` and the chosen repos' `.agents/skills`, `.pi/skills` and `.claude/skills`); and the worker's
+  **Model** and **Thinking level** (empty keeps the config's). On the right, **Needs you**: one card per open Ticket
+  waiting for you (a question, a review, blocked, failed, not delivered, a Jira or Confluence write to approve, a
+  repo to add), with its question or latest report and the box to answer it, **Approve and write** / **Reject**, or
+  **Add** right there; and **Working now**: the other open Tickets with their latest report. **Open** on a card
+  shows that Ticket on the Tickets tab; **Mark done** ends one that needs no pull request (a Jira comment, a
+  Confluence page, an answer) as *Done*, which Stats counts as succeeded.
+- **Tickets**: the list of Tickets (open, or all), filtered by repo, status, creation time and text, with their
+  status, title, repo, last update ("5 min ago") and PR link. Click one to see it on the right; it stays picked
+  through the 10 s refreshes until a new ticket or another filter changes the list: its status, repos, branch,
+  links, who asked, its question or latest report, a box for an answer or instruction (the same as
+  `superagent answer`: a running worker gets it right away, a finished one is resumed with it, an ended Ticket is
+  reopened with it), **Mark done**, **Stop** and **Retry**, and four tabs. **Worker log**
   shows, read only, the worker's activity from its Pi or Copilot session files (the end of each file, 5 MB): the
   assignment, what the agent said, each tool call with its arguments, each result or error (folded, long output
   trimmed to its head and tail), and a failed or aborted model call with its error and stop reason, each with its
-  time, newest at the bottom; the last 50 steps (**Show all steps**), reasoning hidden (**Show reasoning**). Below it,
+  time, newest at the bottom (**Newest first** turns it around); the last 50 steps (**Show all steps**), reasoning hidden (**Show reasoning**). Below it,
   the **Service log** lines about this Ticket (launch, tests, delivery, reports), read from the rotating log file
   `superagent run` writes (`<state_dir>/logs/service.log`, 2 MB, 3 rotations). The GitHub token and the Ticket's
   report token are masked as `***`, and strings that look like tokens or keys (GitHub, Anthropic, OpenAI, AWS,
   bearer tokens, private keys) are masked too. **Request** (a local
   Ticket's whole **Conversation**), **Runs** (each worker start and how it ended) and **Messages to worker** (marked
   delivered or not).
-- **New request**: the same as `superagent ask`. A **Title** (required; it names the Ticket) and **Requirements** open
-  a new Ticket on a new branch (`agent/<name>`, or the **New branch name** you give) or, with **Existing branch**, on
-  a branch you pick from the repo's GitHub and local branches (**Refresh from GitHub** runs `git fetch --prune origin`
-  in its checkout) or type. **Skills for the worker** adds skills from `~/.pi/agent/skills`, `~/.agents/skills` and
-  the chosen repos' `.agents/skills`, `.pi/skills` and `.claude/skills`. **Model** and **Thinking level** set up the
-  worker; empty keeps the config's. With **Continue ticket** naming an open one, the text goes to that Ticket's
-  worker on its branch and PR instead, like `superagent answer`.
+- **Attach files** (on Ask superagent and in a ticket's answer box; `--attach FILE` on `ask` and `answer`) adds
+  screenshots, logs or specs, at most 10 files of 10 MB each.
+  They are kept in `<state_dir>/attachments/` (never committed). The worker's message lists their paths, and
+  images (PNG, JPEG, GIF, WebP) are also shown to its model with that message; a Copilot worker may read the
+  folder (`--add-dir`). An answer sent while the worker runs lists the paths; the images go with its next run.
+- **Stats**: every Ticket at a glance, for a time range and repos. Counts of all, open, needing you, succeeded
+  (pull request merged) and not merged (closed or stopped), each with **Show** to list them on Tickets; charts of
+  Tickets by status and per repo, Tickets opened and ended per day and worker tokens per day; and the last 24 hours
+  (running workers, opened, ended, worker cost).
 - **Settings**, in five sub-tabs. **Repos**: each repo in its own card: its name (owner/name), checkout folder, base
   branch, test command and test
   timeout, all editable, each with its own **Save**, and **Remove** (not the last repo). A repo with Tickets keeps its
@@ -482,7 +640,9 @@ A local web panel with four tabs.
   agent did not answer a comment.
 
 Tokens and cost are summed from the worker's session files. The cost is Pi's figure (for some providers an estimate
-from its price table, 0 where Pi has no price); Copilot workers show 0, since Copilot bills premium requests.
+from its price table, 0 where Pi has no price). A Copilot worker's cost is its GitHub AI credits at list price
+($0.01 each, the per-token rates in GitHub's *Models and pricing for GitHub Copilot*), read from each model
+call; what you pay depends on the credits your Copilot plan includes.
 `superagent panel` replaces itself with Streamlit, so Ctrl+C or `kill` stops the panel completely (on Windows it runs
 Streamlit as a child, and Ctrl+C stops both).
 Databases from earlier versions gain new tables when opened (`trigger_reasons`, `local_requests`,
@@ -499,11 +659,14 @@ and `<state_dir>/logs/service.log`) and masks strings that look like tokens or k
 AWS, bearer tokens, private keys) before showing them; masking is pattern-based, so treat the panel as private anyway.
 
 It binds to 127.0.0.1 only and refreshes every 10 s. It reads the same database as `superagent run`; Stop and Retry
-record the same requests as `superagent stop|retry` (Answer and New request as `answer|ask`), which the running service applies at its next poll round.
+record the same requests as `superagent stop|done|retry` (Answer and Ask superagent as `answer|ask`), which the running service applies at its next poll round.
 
 ## Safety model
 
 - Each Ticket works in its own git worktree on `agent/<name>`; Pi gets only the `tools` allow-list.
+- The Jira and Confluence tokens (`jira_token_env`, `confluence_token_env`) are removed from every worker's
+  environment, like the GitHub token. The service reads Jira and Confluence for the pages a request names, and
+  writes there only what a person approved (`superagent-report propose`).
 - Workers get no credentials: the GitHub token and every variable in `secret_env` are removed from their
   environment. Only the service pushes and opens pull requests.
 - Workers run with explicit provider and model, and without your Pi extensions, skills, prompt templates or
@@ -545,8 +708,8 @@ record the same requests as `superagent stop|retry` (Answer and New request as `
   in with your stored `copilot login` (the OS credential store); where the CLI keeps the login in `~/.copilot`
   instead, sign the workers in once with `COPILOT_HOME=<state_dir>/copilot-home copilot login`. A worker with a
   shell could use that login too. It cannot take a message mid-run: one arrives with its next run. Its activity on
-  the panel is read from `<state_dir>/copilot-home/session-state`; its cost shows as 0, since Copilot bills premium
-  requests.
+  the panel is read from `<state_dir>/copilot-home/session-state`; its cost is the GitHub AI credits of each model
+  call at list price ($0.01 each).
 - **Pi does not ask before running tools.** A worker can run any shell command its `bash` tool allows, as your
   user. Use a test repository and a machine you do not mind it touching. Container isolation is not built yet.
 
@@ -554,13 +717,13 @@ record the same requests as `superagent stop|retry` (Answer and New request as `
 
 - Explicit requests only: no observe mode or proactive rules.
 - No LLM router; the policy gate is deterministic.
-- The web panel is read-only apart from Stop, Retry, Answer / Send instruction, New request and Settings (which
+- The web panel is read-only apart from Stop, Retry, Answer / Send instruction, Ask superagent and Settings (which
   writes the config file); no login, so keep it on localhost.
 - Sources are GitHub and local requests (`superagent ask`, the Pi skill); others (Slack, email, ...) are not ported.
 - Anyone who can run `superagent` as you (or write its database) can request work: local requests are not checked
   against `allowed`.
-- A Ticket can span several configured repositories only when the request names them; a later comment cannot
-  add a repo to a running Ticket.
+- A Ticket gains another repository only when the request names it, or when its worker asks for it
+  (`--needs-repo`) and a person approves; a comment on the thread cannot add one.
 - Rolling back to an earlier version: the database stays readable and writable by it, and Tickets that never used
   test retries, cross-repo parts or local requests load there unchanged. Tickets that did use them only load in
   this version or later.
@@ -570,10 +733,13 @@ record the same requests as `superagent stop|retry` (Answer and New request as `
 ```sh
 .venv/bin/pip install -e ".[panel]"
 .venv/bin/python -m unittest discover -s tests -t .
+uv run python tests/run_parallel.py       # the same tests, several processes at once (-j N; names to narrow)
 ```
 
-The tests use a fake Pi and a fake GitHub, real git in temporary directories, and no network. Issues and pull
-requests are welcome; please run the tests first. `odd/tasks/` holds the design log the project was built from.
+The tests use a fake Pi and a fake GitHub, real git in temporary directories, and no network. Most of their time
+is process starts (git, Python), which is slow on Windows with file scanning, so `tests/run_parallel.py` runs
+chunks of tests side by side: on a 16-core Windows laptop, 278 tests take about 8 minutes instead of 23. Issues and
+pull requests are welcome; please run the tests first. `odd/tasks/` holds the design log the project was built from.
 
 ## License
 

@@ -19,6 +19,8 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import time
 import tomllib
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -149,7 +151,8 @@ def _run(cfg):
         holder = {}
         try:
             server = ReportServer(lambda tok: holder['svc'].lookup(tok),
-                                  lambda tid, r: holder['svc'].on_report(tid, r), cfg.report_port)
+                                  lambda tid, r: holder['svc'].on_report(tid, r), cfg.report_port,
+                                  on_propose=lambda tid, p: holder['svc'].on_propose(tid, p))
         except OSError as e:
             raise RuntimeError(f'cannot listen on 127.0.0.1:{cfg.report_port}: {e.strerror or e}') from None
         svc = holder['svc'] = Service(cfg, store, gh, report_url=server.url)
@@ -217,7 +220,7 @@ def cmd_tickets(cfg, args):
 
 
 def request_action(store, ref, action):
-    """Record an operator `stop` or `retry` request for the service and return the confirmation line.
+    """Record an operator `stop`, `done` or `retry` request for the service and return the confirmation line.
 
     Shared by the CLI and the web panel; raises RuntimeError when the Ticket is unknown or already ended.
     """
@@ -234,6 +237,74 @@ def request_action(store, ref, action):
 def _request(action):
     def cmd(cfg, args):
         print(request_action(open_store(cfg), args.ticket, action))
+        return 0
+    return cmd
+
+
+def add_repo_request(cfg, store, ref, repo):
+    """Approve adding the configured `repo` to an open Ticket (what its worker asked with --needs-repo, or any other).
+    The running service adds the repo's worktree between runs and resumes the worker. Shared by the CLI and the web
+    panel; raises RuntimeError with the reason it cannot be done."""
+    t = find_ticket(store, ref)
+    if not t:
+        raise RuntimeError(f'no ticket {ref!r} (see `superagent tickets --all`)')
+    if t.state == 'ended':
+        raise RuntimeError(f'ticket {t.name} already ended ({t.outcome})')
+    try:
+        name = cfg.repo_config(repo).name
+    except ValueError:
+        raise RuntimeError(f'{repo} is not configured: add it on the Settings tab (or as a [[repos]] table) and '
+                           'restart `superagent run` first') from None
+    if name.lower() in (r.lower() for r in t.repos):
+        raise RuntimeError(f'{t.name} already works in {name}')
+    if t.existing_branch:
+        raise RuntimeError(f'{t.name} works on the existing branch {t.existing_branch} of {t.repo}, which stays in '
+                           'one repo; ask for the other repo in a new request')
+    store.put(f'operator:add-repo:{t.id}', name)
+    return (f'{name} will be added to {t.name} ({t.id}): the running service adds it after the current run and '
+            'resumes the worker')
+
+
+def cmd_add_repo(cfg, args):
+    print(add_repo_request(cfg, open_store(cfg), args.ticket, args.repo))
+    return 0
+
+
+def decide_proposal(cfg, store, pid, approve, reason=''):
+    """Approve a worker's proposed Jira or Confluence write (the running service then writes it with its token and
+    tells the thread and the worker), or reject it (the worker learns why in its next message). Shared by the CLI
+    and the web panel; raises RuntimeError when it is unknown or already decided."""
+    from .atlassian import target
+    from .model import now_iso
+    p = store.proposal(int(pid)) if str(pid).isdigit() else None
+    if not p:
+        raise RuntimeError(f'no proposal {pid} (see `superagent proposals`)')
+    if not store.update_proposal(p['id'], expect='pending', state='approved' if approve else 'rejected',
+                                 decided_by=cfg.local_user, decided_at=now_iso(), error=reason):
+        raise RuntimeError(f"proposal {p['id']} is already {store.proposal(p['id'])['state']}")
+    if approve:
+        return f"approved #{p['id']}: the running service writes {target(p)} within one poll round"
+    store.add_input(p['ticket_id'], 'note', f"Proposal #{p['id']} ({target(p)}) was rejected by {cfg.local_user}"
+                    + (f': {reason}' if reason else '.'), f"proposal|{p['id']}")
+    return f"rejected #{p['id']}; its worker learns it in its next message"
+
+
+def cmd_proposals(cfg, args):
+    from .atlassian import target
+    store = open_store(cfg)
+    names = {t.id: t.name for t in store.tickets()}
+    shown = [p for p in store.proposals() if args.all or p['state'] in ('pending', 'approved', 'writing')]
+    if not shown:
+        print('no proposals waiting' + ('' if args.all else ' (use --all to include decided ones)'))
+    for p in shown:
+        print(f"#{p['id']:<4} {p['state']:<9} {names.get(p['ticket_id'], p['ticket_id'])}: {target(p)}"
+              + (f" -> {p['result']}" if p['result'] else '') + (f" ({p['error']})" if p['error'] else ''))
+    return 0
+
+
+def cmd_decide(approve):
+    def cmd(cfg, args):
+        print(decide_proposal(cfg, open_store(cfg), args.proposal, approve, ' '.join(getattr(args, 'reason', []))))
         return 0
     return cmd
 
@@ -303,8 +374,10 @@ def list_branches(cfg, repo):
 
 
 def _branch_places(cfg, repo):
-    """Every branch the checkout of `repo` knows: {name: ['GitHub' and/or 'local']}."""
+    """Every branch the checkout of `repo` knows: {name: ['GitHub' and/or 'local']}; none before it is made."""
     places = {}
+    if not os.path.exists(os.path.join(cfg.repo_config(repo).checkout, '.git')):
+        return places
     for ref in _checkout_git(cfg, repo, 'for-each-ref', '--format=%(refname)', 'refs/remotes/origin',
                              'refs/heads').split():
         for prefix, place in (('refs/remotes/origin/', 'GitHub'), ('refs/heads/', 'local')):
@@ -315,9 +388,10 @@ def _branch_places(cfg, repo):
 
 def fetch_branches(cfg, repo):
     """Bring the checkout's copy of the GitHub branches of `repo` up to date (git fetch --prune origin)."""
-    from .executor import fetch_origin
+    from .executor import ensure_checkout, fetch_origin
     try:
-        error = fetch_origin(cfg, cfg.repo_config(repo), '*', timeout=120)
+        error = ensure_checkout(cfg, cfg.repo_config(repo)) or fetch_origin(cfg, cfg.repo_config(repo), '*',
+                                                                            timeout=120)
     except (OSError, subprocess.TimeoutExpired) as e:
         error = str(e)
     if error:
@@ -443,7 +517,53 @@ def copilot_models(cfg):
     return offered_models(argv, cfg.state_dir, env)
 
 
-def ask_request(cfg, store, text, repos=(), branch='', title='', new_branch='', skills=(), model='', thinking=''):
+def save_attachments(cfg, files):
+    """Keep files attached to a request or answer: `files` is [(name, bytes)]. They go to a new folder under
+    <state_dir>/attachments (never into a repo), at most MAX_FILES of at most MAX_FILE_BYTES each. Returns their paths;
+    raises RuntimeError, keeping nothing, when they are too many or too big."""
+    from .executor import MAX_FILE_BYTES, MAX_FILES, attachments_dir
+    files = [(n, d) for n, d in files or () if n]
+    if not files:
+        return []
+    if len(files) > MAX_FILES:
+        raise RuntimeError(f'attach at most {MAX_FILES} files')
+    for name, data in files:
+        if len(data) > MAX_FILE_BYTES:
+            raise RuntimeError(f'{name} is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB')
+    folder = tempfile.mkdtemp(prefix=time.strftime('%Y%m%d-'), dir=_made(attachments_dir(cfg)))
+    paths = []
+    for name, data in files:
+        safe = re.sub(r'[^\w. -]', '_', os.path.basename(name.replace('\\', '/'))).strip(' .') or 'file'
+        path = os.path.join(folder, safe)
+        stem, ext = os.path.splitext(path)
+        n = 2
+        while os.path.exists(path):  # two files of one name: keep both
+            path, n = f'{stem}-{n}{ext}', n + 1
+        with open(path, 'wb') as f:
+            f.write(data)
+        paths.append(path)
+    return paths
+
+
+def _made(folder):
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def read_attachments(paths):
+    """[(name, bytes)] of files named on the command line (--attach); RuntimeError for one that cannot be read."""
+    out = []
+    for p in paths or ():
+        try:
+            with open(os.path.expanduser(p), 'rb') as f:
+                out.append((os.path.basename(p), f.read()))
+        except OSError as e:
+            raise RuntimeError(f'cannot attach {p}: {e.strerror or e}') from None
+    return out
+
+
+def ask_request(cfg, store, text, repos=(), branch='', title='', new_branch='', skills=(), model='', thinking='',
+                files=()):
     """Queue a local request for the running service. Returns (request id, the lines to print).
 
     `branch`: an existing branch to work on instead of a new agent/<name> branch (one repo only): on GitHub, or only
@@ -451,8 +571,9 @@ def ask_request(cfg, store, text, repos=(), branch='', title='', new_branch='', 
     instead of agent/<name>; it must not exist yet. `title`: the Ticket's title, which its name is made from
     (default: the first line of `text`). `skills`: skill folders or files the worker gets besides its own.
     `model` ('provider/model', or a model of the config's provider) and `thinking`: the worker's ('' = the config's).
+    `files`: [(name, bytes)] attached for the worker (see save_attachments).
     Shared by `superagent ask` and the web panel; raises RuntimeError for an empty text, an unknown repo, a bad
-    branch or a missing skill."""
+    branch, a missing skill or attachments that are too many or too big."""
     text = (text or '').strip()
     if not text:
         raise RuntimeError('the request is empty: say what to do')
@@ -468,9 +589,11 @@ def ask_request(cfg, store, text, repos=(), branch='', title='', new_branch='', 
         raise RuntimeError(f'thinking must be one of {", ".join(THINKING_LEVELS)}')
     options = {'title': ' '.join((title or '').split()), 'new_branch': new_branch, 'skills': _skill_paths(skills),
                'model': model, 'thinking': thinking}
-    rid = store.queue_ask(text, chosen, cfg.local_user, branch, options)
+    paths = save_attachments(cfg, files)
+    rid = store.queue_ask(text, chosen, cfg.local_user, branch, options, paths)
     lines = [f'queued request {rid} for {", ".join(chosen)}' + (f' on existing branch {branch}' if branch else '')
-             + (f' on new branch {new_branch}' if new_branch else '')]
+             + (f' on new branch {new_branch}' if new_branch else '')
+             + (f' with {len(paths)} attached file(s)' if paths else '')]
     if service_running(cfg, store):
         lines.append(f"the running service (last poll {store.get('last-poll')}) picks it up within one poll round "
                      f'(about {cfg.poll_seconds} s)')
@@ -481,10 +604,10 @@ def ask_request(cfg, store, text, repos=(), branch='', title='', new_branch='', 
     return rid, '\n'.join(lines)
 
 
-def answer_request(cfg, store, ref, text):
+def answer_request(cfg, store, ref, text, files=()):
     """Queue the operator's answer or instruction for a Ticket (applied by the running service like a human follow-up)
-    and record it in the Ticket's conversation. For an ended Ticket the service reopens it first. Returns the
-    confirmation line. Shared by `superagent answer` and the web panel."""
+    and record it in the Ticket's conversation. For an ended Ticket the service reopens it first. `files`: [(name,
+    bytes)] attached for the worker. Returns the confirmation line. Shared by `superagent answer` and the web panel."""
     t = find_ticket(store, ref)
     if not t:
         raise RuntimeError(f'no ticket {ref!r} (see `superagent tickets --all`)')
@@ -495,7 +618,7 @@ def answer_request(cfg, store, ref, text):
     text = (text or '').strip()
     if not text:
         raise RuntimeError('the answer is empty')
-    store.queue_answer(t.id, text, cfg.local_user)
+    store.queue_answer(t.id, text, cfg.local_user, save_attachments(cfg, files))
     if t.state == 'ended':
         return (f'instruction queued for {t.name} ({t.id}); the running service reopens the ticket and resumes its '
                 'worker within one poll round')
@@ -559,7 +682,7 @@ def show_text(data):
 
 def cmd_ask(cfg, args):
     _, message = ask_request(cfg, open_store(cfg), ' '.join(args.text), args.repo, args.branch, args.title,
-                             args.new_branch, args.skill, args.model, args.thinking)
+                             args.new_branch, args.skill, args.model, args.thinking, read_attachments(args.attach))
     print(message)
     return 0
 
@@ -571,7 +694,7 @@ def cmd_show(cfg, args):
 
 
 def cmd_answer(cfg, args):
-    print(answer_request(cfg, open_store(cfg), args.ticket, ' '.join(args.text)))
+    print(answer_request(cfg, open_store(cfg), args.ticket, ' '.join(args.text), read_attachments(args.attach)))
     return 0
 
 
@@ -662,7 +785,8 @@ def cmd_panel(cfg, args):
     print(f'superagent panel on http://127.0.0.1:{args.port} (Ctrl+C to stop)', file=sys.stderr)
     sys.stderr.flush()
     argv = [sys.executable, '-m', 'streamlit', 'run', panel, '--server.address', '127.0.0.1',
-            '--server.port', str(args.port), '--server.headless', 'true', '--browser.gatherUsageStats', 'false']
+            '--server.port', str(args.port), '--server.headless', 'true', '--browser.gatherUsageStats', 'false',
+            '--client.toolbarMode', 'minimal']
     if WINDOWS:
         return _run_child(argv, env)
     # Replace this process instead of starting a child, so Ctrl+C and kill reach streamlit directly.
@@ -684,6 +808,8 @@ def _run_child(argv, env, grace=10):
 
 
 def cmd_check(cfg, args):
+    """`superagent check`: config, GitHub token, checkouts, the worker agent, the Jira and Confluence tokens (when
+    [atlassian] is on) and the report port."""
     problems = []
 
     def check(ok, good, bad):
@@ -696,18 +822,29 @@ def cmd_check(cfg, args):
     check(token, f'token: {cfg.token_env} is set',
           f'token: environment variable {cfg.token_env} is not set; export the bot account\'s fine-grained token')
     git = shutil.which('git')
+    from .executor import ensure_checkout, fetch_origin, git_env
+    from .github import GIT_HARDEN
     for repo in cfg.repos:
-        origin = None
+        origin, made = None, False
+        own = repo.checkout == cfg.own_checkout(repo.name)
+        if git and token and own and not os.path.exists(os.path.join(repo.checkout, '.git')):
+            # No clone yet: make superagent's own and fetch the base branch, which also proves the token reads it.
+            error = ensure_checkout(cfg, repo) or fetch_origin(cfg, repo, repo.base_branch, timeout=300)
+            check(not error, f'checkout: made {repo.checkout} and fetched {repo.name} {repo.base_branch}',
+                  f'checkout: could not make {repo.checkout} from {repo.name}: {error}')
+            if error:
+                continue
+            made = True
         if git and os.path.isdir(repo.checkout):
-            from .executor import git_env
-            from .github import GIT_HARDEN
             # The checkout's config and hooks are worker-writable: same hardening as the service's own git commands.
             r = subprocess.run(['git', *GIT_HARDEN, '-C', repo.checkout, 'remote', 'get-url', 'origin'],
                                env=git_env(cfg), capture_output=True, text=True)
             origin = r.stdout.strip() if r.returncode == 0 else None
-        check(bool(origin), f'checkout: {repo.checkout} is a git repo with origin {origin}',
-              f'checkout: {repo.checkout} is not a git clone with an origin remote; '
-              f'run `git clone https://github.com/{repo.name}.git {repo.checkout}`')
+        if not made:
+            check(bool(origin), f'checkout: {repo.checkout} is a git repo with origin {origin}',
+                  f'checkout: {repo.checkout} is not a git clone with an origin remote; leave `checkout` out of '
+                  f'the config to let superagent make its own, or run `git clone https://github.com/{repo.name}.git '
+                  f'{repo.checkout}`')
     exe = shutil.which(cfg.copilot) if cfg.agent == 'copilot' else cfg.pi
     version = None
     if exe and os.path.isfile(exe) and os.access(exe, os.X_OK):
@@ -725,6 +862,13 @@ def cmd_check(cfg, args):
         check(bool(version), f'pi: {cfg.pi} ({version}' + (f'; {note})' if note else ')'),
               f'pi: {cfg.pi}' + (f' ({note})' if note else '')
               + ' is missing or `pi --version` fails; install Pi or set executor.pi in the config')
+    from .atlassian import whoami
+    for kind, url, var in (('jira', cfg.jira_url, cfg.jira_token_env),
+                           ('confluence', cfg.confluence_url, cfg.confluence_token_env)):
+        if url:  # [atlassian] on: the token must sign in, or requests cannot read (or write) there
+            who, error, note = whoami(cfg, kind)
+            check(not error, f'{kind}: {var} signs in to {url} as {who}' + (f' ({note})' if note else ''),
+                  f'{kind}: {error}')
     free = True
     if cfg.report_port:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -741,8 +885,10 @@ def cmd_check(cfg, args):
 
 
 COMMANDS = {'run': cmd_run, 'status': cmd_status, 'tickets': cmd_tickets, 'stop': _request('stop'),
+            'done': _request('done'),
             'retry': _request('retry'), 'check': cmd_check, 'panel': cmd_panel, 'ask': cmd_ask, 'show': cmd_show,
-            'answer': cmd_answer, 'pi-install': cmd_pi_install}
+            'answer': cmd_answer, 'pi-install': cmd_pi_install, 'add-repo': cmd_add_repo,
+            'proposals': cmd_proposals, 'approve': cmd_decide(True), 'reject': cmd_decide(False)}
 NO_CONFIG = {'pi-install'}  # commands that work before a config file exists
 
 
@@ -757,10 +903,11 @@ def parser():
     t = sub.add_parser('tickets', help='list tickets')
     t.add_argument('--all', action='store_true', help='include ended tickets')
     t.add_argument('--json', action='store_true', help='JSON output')
-    for name, text in (('stop', 'stop a ticket and its worker'), ('retry', 'relaunch or redeliver a ticket')):
+    for name, text in (('stop', 'stop a ticket and its worker'), ('retry', 'relaunch or redeliver a ticket'),
+                       ('done', 'mark a ticket done without a pull request (e.g. it only changed Jira or Confluence)')):
         s = sub.add_parser(name, help=text)
         s.add_argument('ticket', help='ticket id or name')
-    sub.add_parser('check', help='preflight: config, token, checkout, pi or copilot, report port')
+    sub.add_parser('check', help='preflight: config, token, checkout, pi or copilot, jira and confluence, report port')
     pn = sub.add_parser('panel', help='local web panel (needs the panel extra)')
     pn.add_argument('--port', type=int, default=8742, help='port on 127.0.0.1 (default 8742)')
     a = sub.add_parser('ask', help='queue a request from this machine (a local Ticket, thread local:<id>)')
@@ -785,6 +932,9 @@ def parser():
     a.add_argument('--thinking', default='', choices=['', *THINKING_LEVELS],
                    help="the worker's thinking level; default: the config's")
     a.add_argument('text', nargs='+', help='the requirements: what to do')
+    a.add_argument('--attach', action='append', default=[], metavar='FILE',
+                   help='a file for the worker, e.g. a screenshot or log (repeat for more; images are shown to its '
+                        'model)')
     sh = sub.add_parser('show', help="a ticket's stage, PR links and conversation")
     sh.add_argument('ticket', help='ticket id, name, or local:<request id>')
     sh.add_argument('--json', action='store_true', help='JSON output')
@@ -792,6 +942,19 @@ def parser():
                                        'reopens an ended ticket)')
     an.add_argument('ticket', help='ticket id, name, or local:<request id>')
     an.add_argument('text', nargs='+', help='the answer')
+    an.add_argument('--attach', action='append', default=[], metavar='FILE',
+                    help='a file for the worker (repeat for more; images are shown to its model)')
+    ar = sub.add_parser('add-repo', help="add a configured repo to an open ticket (approves its worker's "
+                                         '--needs-repo; the worker resumes with both)')
+    ar.add_argument('ticket', help='ticket id or name')
+    ar.add_argument('repo', help='configured owner/name')
+    ps = sub.add_parser('proposals', help='Jira and Confluence writes workers proposed, waiting for approval')
+    ps.add_argument('--all', action='store_true', help='include approved, rejected, written and failed ones')
+    ap = sub.add_parser('approve', help='approve a proposed Jira or Confluence write: the service writes it')
+    ap.add_argument('proposal', help='proposal id (see `superagent proposals`)')
+    rj = sub.add_parser('reject', help='reject a proposed Jira or Confluence write; its worker learns why')
+    rj.add_argument('proposal', help='proposal id')
+    rj.add_argument('reason', nargs='*', help='why, for the worker')
     pi = sub.add_parser('pi-install', help='install the superagent skill and /superagent prompt template into Pi')
     pi.add_argument('--agent-dir', help='Pi agent dir (default: $PI_CODING_AGENT_DIR or ~/.pi/agent)')
     pi.add_argument('--uninstall', action='store_true', help='remove the files pi-install wrote')

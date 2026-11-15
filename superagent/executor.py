@@ -1,7 +1,9 @@
 """Runs one worker per Ticket: its git worktree, its isolated agent process (`pi --mode rpc`, or `copilot --acp`),
 and the messages it gets."""
 
+import base64
 import json
+import logging
 import os
 import shutil
 import signal
@@ -13,15 +15,22 @@ from functools import partial
 
 from .copilot_acp import CopilotAcp
 from .github import GIT_HARDEN, GitHubError, fetch_from_github, git_env as _git_env
+from .model import new_part
 from .pi_rpc import PiRpc, RpcError
 from .proctree import group_options, kill_tree
 from .worker_log import copilot_home, copilot_session_file, pi_session_files
+
+log = logging.getLogger('superagent.executor')
 
 PACKAGE = os.path.dirname(os.path.abspath(__file__))
 SKILL_DIR = os.path.join(PACKAGE, 'skills', 'superagent-worker')
 PROMPT_PATH = os.path.join(PACKAGE, 'prompts', 'worker.md')
 REQUEST_CAP, FOLLOWUP_CAP, MAX_FOLLOWUPS = 1500, 600, 20
 TEST_OUTPUT_CAP = 64 * 1024  # bytes of a test command's output kept (the tail)
+# Attached files: kept under <state_dir>/attachments, listed in the worker's message; images also go to the model.
+MAX_FILES, MAX_FILE_BYTES, MAX_IMAGE_BYTES = 10, 10 * 1024 * 1024, 20 * 1024 * 1024  # last: all images of a message
+IMAGE_TYPES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+               '.webp': 'image/webp'}
 TEST_TAIL = 3000  # characters of that output sent back to the worker
 WINDOWS = os.name == 'nt'
 # Windows has no /usr/bin/false: askpass points at this batch file instead (see deny_askpass).
@@ -48,10 +57,38 @@ def worktree_path(cfg, ticket):
     return os.path.join(cfg.worktree_root(cfg.repo_config(ticket.repo)), ticket.name)
 
 
+def ensure_checkout(cfg, repo, run=subprocess.run):
+    """Make superagent's own checkout of `repo` (a RepoConfig the config names no checkout for) when its folder is
+    missing or empty: a git repo whose origin is the GitHub repo, which fetch_origin then fills with the token. So
+    nobody has to clone it first. A checkout the config names is never made. Returns '' or what went wrong."""
+    if os.path.exists(os.path.join(repo.checkout, '.git')):
+        return ''
+    if repo.checkout != cfg.own_checkout(repo.name):  # a configured clone is the user's to make
+        return (f'{repo.checkout} is not a git clone of {repo.name}: clone it there, or leave `checkout` out of the '
+                'config and superagent makes its own copy')
+    try:
+        if os.path.isdir(repo.checkout) and os.listdir(repo.checkout):
+            return f'{repo.checkout} is not a git clone of {repo.name}: empty it, or set its checkout in the config'
+        os.makedirs(repo.checkout, exist_ok=True)
+    except OSError as e:
+        return f'cannot make the checkout {repo.checkout}: {e}'
+    env = git_env(cfg)
+    for args in (['init', '-q'], ['remote', 'add', 'origin', f'https://github.com/{repo.name}.git']):
+        p = run(['git', *GIT_HARDEN, *args], cwd=repo.checkout, env=env, capture_output=True, text=True)
+        if p.returncode != 0:
+            return f'git {args[0]} failed in {repo.checkout}: {(p.stderr or p.stdout).strip()}'
+    return ''
+
+
 def _add_worktree(cfg, repo, path, branch, run, start=None):
     """Create (or reuse) a worktree of `repo` (a RepoConfig) at `path` on local `branch`, new from
-    origin/<start> (default: the repo's base branch), or from the local branch <start> when GitHub has no such branch."""
+    origin/<start> (default: the repo's base branch), or from the local branch <start> when GitHub has no such branch.
+    A reused worktree gets origin/<base branch> (and origin/<start>) fetched again: its worker has no credentials to
+    fetch them, and a resumed run (an answer, say "fix the conflict") must see GitHub as it is now."""
     if os.path.exists(os.path.join(path, '.git')):
+        for name in dict.fromkeys([repo.base_branch, start or repo.base_branch]):
+            if error := fetch_origin(cfg, repo, name, run):
+                log.warning('could not refresh origin/%s of %s for a resumed worker: %s', name, repo.name, error)
         return
     env = git_env(cfg)
     start = start or repo.base_branch
@@ -64,6 +101,8 @@ def _add_worktree(cfg, repo, path, branch, run, start=None):
         return p
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    if error := ensure_checkout(cfg, repo, run):
+        raise PrepareError(error)
     fetch_error = fetch_origin(cfg, repo, start, run)
     start_ref = f'origin/{start}'
     if fetch_error:
@@ -120,6 +159,47 @@ def prepare_worktree(cfg, ticket, run=subprocess.run):
     return path, ticket.branch or branch
 
 
+def add_repo_to_ticket(cfg, ticket, name, run=subprocess.run):
+    """Add the configured repo `name` to `ticket` (changed in place; the caller saves it), at its worker's request and
+    a person's approval. A single-repo Ticket becomes a cross-repo one first: its worktree moves into the ticket folder
+    (git worktree move, so its commits and branch stay), and its pull request and test result go to its part. The
+    new repo's worktree joins the folder on agent/<ticket name>; before the first launch, prepare_worktree makes it."""
+    folder = os.path.join(cfg.work_dir, 'tickets', ticket.name)
+    if not ticket.parts:
+        first = new_part(ticket.repo)
+        first.update(pr_number=ticket.pr_number, test_result=ticket.test_result)
+        if ticket.worktree:
+            own = cfg.repo_config(ticket.repo)
+            first['worktree'] = os.path.join(folder, own.slug)
+            os.makedirs(folder, exist_ok=True)
+            p = run(['git', *GIT_HARDEN, 'worktree', 'move', ticket.worktree, first['worktree']], cwd=own.checkout,
+                    env=git_env(cfg), capture_output=True, text=True)
+            if p.returncode != 0:
+                raise PrepareError(f'git worktree move failed: {(p.stderr or p.stdout).strip()}')
+            ticket.worktree = folder
+        ticket.parts = [first]
+    repo = cfg.repo_config(name)
+    part = new_part(repo.name)
+    if ticket.worktree:
+        part['worktree'] = os.path.join(ticket.worktree, repo.slug)
+        _add_worktree(cfg, repo, part['worktree'], f'agent/{ticket.name}', run)
+    ticket.parts.append(part)
+
+
+def repo_added_message(cfg, ticket, name):
+    """What a resumed worker is told after `name` joined its Ticket: where each repo's worktree is now."""
+    lines = [f'A person approved adding {name} to this Ticket. This directory is now a ticket folder with one git '
+             f'worktree per repo, each on branch `agent/{ticket.name}` (an earlier worktree moved here: use these '
+             'paths, not the old one):']
+    for p in ticket.parts:
+        rc = cfg.repo_config(p['repo'])
+        lines.append(f"- {rc.name}: {p['worktree'] or '(made when you start)'}, base `{rc.base_branch}`"
+                     + (f', test command `{rc.test_command}`' if rc.test_command else ''))
+    lines.append('Make the change each repo needs and commit in each repo you change; the service runs each test '
+                 'command and opens one pull request per changed repo, linked to each other. Then report as usual.')
+    return '\n'.join(lines)
+
+
 def worker_model(cfg, ticket):
     """(provider, model) the Ticket's worker runs: the request's choice ('provider/model', or a model of the config's
     provider), else the config's."""
@@ -151,7 +231,46 @@ def copilot_argv(cfg, ticket):
     return [shutil.which(cfg.copilot) or cfg.copilot, '--acp', '--stdio', '--model', model,
             *reasoning, '--allow-all-tools', '--disable-builtin-mcps',
             '--no-ask-user', '--no-custom-instructions', '--no-auto-update',
-            *[a for s in ticket.skills for a in ('--add-dir', s)]]
+            *[a for s in ticket.skills for a in ('--add-dir', s)], '--add-dir', attachments_dir(cfg)]
+
+
+def attachments_dir(cfg):
+    """Where the files people attach to requests and answers are kept; a Copilot worker may read it (--add-dir)."""
+    return os.path.join(cfg.state_dir, 'attachments')
+
+
+def attachments_note(paths):
+    """The lines that tell a worker which files came with its message."""
+    if not paths:
+        return ''
+    lines = ['Files attached to this message (read them; images are also shown to you):']
+    for p in paths:
+        try:
+            size = f'{os.path.getsize(p) / 1024:,.0f} KB'
+        except OSError:
+            size = 'missing'
+        lines.append(f'- {p} ({size})')
+    return '\n'.join(lines)
+
+
+def image_blocks(paths):
+    """The attached images as model input ({type: image, data: base64, mimeType}), as many as fit MAX_IMAGE_BYTES;
+    other files and unreadable ones are left to the worker to open from attachments_note."""
+    blocks, total = [], 0
+    for p in paths:
+        mime = IMAGE_TYPES.get(os.path.splitext(p)[1].lower())
+        if not mime:
+            continue
+        try:
+            with open(p, 'rb') as f:
+                data = f.read()
+        except OSError:
+            continue
+        if total + len(data) > MAX_IMAGE_BYTES:
+            break
+        total += len(data)
+        blocks.append({'type': 'image', 'data': base64.b64encode(data).decode(), 'mimeType': mime})
+    return blocks
 
 
 def copilot_preamble(ticket):
@@ -289,13 +408,14 @@ class Worker:
         # Pi resumes the Ticket's session file when there is one; Copilot says whether it had to open a new session.
         self.new_session = bool(getattr(self.rpc, 'fresh', False)) if cfg.agent == 'copilot' else not had_pi_session
 
-    async def run(self, message, timeout):
+    async def run(self, message, timeout, images=()):
+        """`images`: image_blocks for the model, sent with this message."""
         if self.queued:
             message = followup_message([{'text': t} for t in self.queued]) + '\n\n' + message
             self.queued = []
         self.running = True
         try:
-            return await self.rpc.run(message, timeout)
+            return await self.rpc.run(message, timeout, **({'images': list(images)} if images else {}))
         finally:
             self.running = False
 
@@ -383,6 +503,18 @@ def cross_test_failure_message(failures, timeouts, attempt, max_attempts):
             'Fix the cause in each failing repo, rerun its test command, commit, and report ready again '
             f'(fix attempt {attempt} of {max_attempts}; then the Ticket is reported blocked).\n\n'
             + '\n\n'.join(parts))
+
+
+def push_refused_message(branch, error, attempt, max_attempts):
+    """Sent to the same session when GitHub refused to push its commits onto an existing branch."""
+    return (f'You reported ready, but GitHub refused the push to `{branch}`: it is not a fast-forward. The branch '
+            'on GitHub has commits your history does not contain (someone pushed to it, or you rebased, amended or '
+            'squashed published commits). The service never force-pushes an existing branch.\n'
+            f'The service has fetched `origin/{branch}` again. Run `git merge origin/{branch}`, resolve any '
+            'conflicts so your changes are kept, run the tests, commit, and report ready again. Do not rebase, '
+            'amend, squash or reset: every commit on the remote branch must stay in your history '
+            f'(fix attempt {attempt} of {max_attempts}; then the Ticket is reported blocked).\n'
+            f'GitHub said:\n```\n{error[-TEST_TAIL:]}\n```')
 
 
 def followup_message(inputs):

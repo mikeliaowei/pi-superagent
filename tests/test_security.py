@@ -16,7 +16,7 @@ from superagent.report import ReportServer
 from superagent.service import Service
 from superagent.store import Store
 from tests.fake_github import FakeGitHub
-from tests.test_service import GIT_ENV, TOKEN, Pi, git, until
+from tests.test_service import GIT_ENV, TOKEN, Pi, git, seeded_repo, until
 
 AUTH = base64.b64encode(f'x-access-token:{TOKEN}'.encode()).decode()
 GITHUB_URL = 'https://github.com/o/r.git'
@@ -43,16 +43,10 @@ class GitSecretsTest(unittest.IsolatedAsyncioTestCase):
         env = mock.patch.dict(os.environ, {**GIT_ENV, 'SUPERAGENT_GITHUB_TOKEN': TOKEN})
         env.start()
         self.addCleanup(env.stop)
-        origin, checkout = os.path.join(self.tmp, 'origin.git'), os.path.join(self.tmp, 'checkout')
+        origin, checkout = seeded_repo(self.tmp)
         self.github, self.evil = os.path.join(self.tmp, 'github.git'), os.path.join(self.tmp, 'evil.git')
-        for bare in (origin, self.github, self.evil):
+        for bare in (self.github, self.evil):
             git('init', '--bare', '-q', '-b', 'main', bare, cwd=self.tmp)
-        git('clone', '-q', origin, checkout, cwd=self.tmp)
-        with open(os.path.join(checkout, 'README'), 'w') as f:
-            f.write('hello\n')
-        git('add', 'README', cwd=checkout)
-        git('commit', '-q', '-m', 'init', cwd=checkout)
-        git('push', '-q', 'origin', 'HEAD:main', cwd=checkout)
         self.cfg = Config(repo='o/r', agent_login='bot', allowed=['alice'], checkout=checkout,
                           state_dir=os.path.join(self.tmp, 'state'), pi='/nonexistent/pi')
         self.store = Store(self.cfg.db_path)

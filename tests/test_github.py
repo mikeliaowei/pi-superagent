@@ -439,6 +439,22 @@ class GitTest(unittest.TestCase):
         push = run.calls[-1][0]
         self.assertEqual(push[-1], 'refs/heads/feature/x:refs/heads/feature/x')
 
+    def test_a_push_github_refuses_as_not_a_fast_forward_says_so(self):
+        def refusing(stderr):
+            def run(argv, **kw):
+                failed = 'push' in argv
+                return SimpleNamespace(returncode=1 if failed else 0, stdout='', stderr=stderr if failed else '')
+            return run
+
+        for reason in ('fetch first', 'non-fast-forward'):
+            stderr = f' ! [rejected]        feature/x -> feature/x ({reason})\nerror: failed to push'
+            with self.assertRaises(gh_mod.NotFastForward):
+                gh_mod.push_branch('/w/t', 'feature/x', TOKEN, REPO, self.push_dir, run=refusing(stderr), force=False)
+        with self.assertRaises(GitHubError) as cm:  # any other failure is not one
+            gh_mod.push_branch('/w/t', 'feature/x', TOKEN, REPO, self.push_dir, run=refusing('fatal: denied'),
+                               force=False)
+        self.assertNotIsInstance(cm.exception, gh_mod.NotFastForward)
+
     def test_a_planted_push_repo_config_is_never_used(self):
         # A path-specific key such as http.https://github.com/o/r.git.proxy beats any command-line pin, so the
         # only safe push repo is one nobody else could have written.
