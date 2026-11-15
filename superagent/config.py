@@ -15,7 +15,7 @@ AGENTS = ('pi', 'copilot')
 class RepoConfig:
     """One repository the service works in."""
     name: str  # owner/name
-    checkout: str  # local clone the worktrees are made from
+    checkout: str = ''  # local clone the worktrees are made from; empty: Config.own_checkout
     base_branch: str = 'main'
     test_command: str = ''  # run in the worktree before any pull request; empty: none
     test_timeout: int = 900  # seconds
@@ -34,7 +34,7 @@ class Config:
     allowed: list
     repo: str = ''  # owner/name: the single-repo form, with `checkout`
     checkout: str = ''  # local clone the worktrees are made from
-    token_env: str = 'SUPERAGENT_GITHUB_TOKEN'
+    token_env: str = 'SUPERAGENT_GITHUB_TOKEN'  # noqa: S105 - the name of the variable holding it, not a secret
     poll_seconds: int = 60
     state_dir: str = '~/.local/share/pi-superagent'
     work_dir: str = ''  # default: <state_dir>/work
@@ -56,6 +56,12 @@ class Config:
     max_test_retries: int = 2
     # Who `superagent ask` and `answer` act as (S15): the local operator. Default: the OS user name.
     local_user: str = ''
+    # [atlassian]: Jira issues and Confluence pages a request names are fetched by the service (read-only, with these
+    # tokens) and given to its worker as files. Empty URL: off. The token variables never reach a worker.
+    jira_url: str = ''
+    confluence_url: str = ''
+    jira_token_env: str = 'JIRA_API_TOKEN'  # noqa: S105 - the name of the variable holding it, not a secret
+    confluence_token_env: str = 'CONFLUENCE_API_TOKEN'  # noqa: S105 - likewise
 
     def __post_init__(self):
         if not self.local_user:
@@ -70,8 +76,7 @@ class Config:
         if self.repos is None:
             if '/' not in self.repo:
                 raise ValueError('repo must be owner/name')
-            if not self.checkout:
-                raise ValueError('checkout is required: the local clone of repo')
+            self.checkout = self.checkout or self.own_checkout(self.repo)
             self.repos = [RepoConfig(self.repo, self.checkout, self.base_branch, legacy=True)]
         else:
             self.repos = self._repo_list(self.repos)
@@ -81,6 +86,11 @@ class Config:
             raise ValueError('max_workers must be between 1 and 16')
         if self.agent not in AGENTS:
             raise ValueError(f"agent must be one of: {', '.join(AGENTS)}")
+
+    def own_checkout(self, name):
+        """Where superagent keeps its own clone of `name` (owner/name) when the config names no checkout: made on
+        first use (executor.ensure_checkout), so nobody has to clone the repo first."""
+        return os.path.join(self.state_dir, 'checkouts', name.replace('/', '__'))
 
     def _repo_list(self, tables):
         if self.repo or self.checkout:
@@ -94,24 +104,29 @@ class Config:
                 raise ValueError(f'repo must be owner/name: {r.name}')
             if r.name.lower() in seen:
                 raise ValueError(f'duplicate repo in [[repos]]: {r.name}')
-            if not r.checkout:
-                raise ValueError(f'repo {r.name} needs a checkout')
+            r.checkout = r.checkout or self.own_checkout(r.name)
             seen.add(r.name.lower())
             r.checkout, r.legacy = os.path.expanduser(r.checkout), False
             repos.append(r)
         return repos
 
     @property
+    def _repos(self):
+        """The repos: a list once __post_init__ has run (None only in the arguments)."""
+        assert self.repos is not None
+        return self.repos
+
+    @property
     def legacy(self):
         """True for the single `repo` + `checkout` form."""
-        return self.repos[0].legacy
+        return self._repos[0].legacy
 
     @property
     def repo_names(self):
-        return [r.name for r in self.repos]
+        return [r.name for r in self._repos]
 
     def repo_config(self, name):
-        for r in self.repos:
+        for r in self._repos:
             if r.name.lower() == (name or '').lower():
                 return r
         raise ValueError(f'repo {name} is not configured')
@@ -134,13 +149,15 @@ class Config:
         return os.environ.get(self.token_env, '')
 
     def worker_env(self, base=None):
-        """The environment a Pi worker gets: everything except the configured secrets."""
-        hidden = {self.token_env, *self.secret_env}
+        """The environment a worker gets: everything except the configured secrets (the GitHub token, `secret_env`,
+        and the Jira and Confluence tokens)."""
+        hidden = {self.token_env, *self.secret_env, self.jira_token_env, self.confluence_token_env}
         return {k: v for k, v in (base if base is not None else os.environ).items() if k not in hidden}
 
 
 def _flat(raw):
-    flat = {**raw.get('github', {}), **raw.get('policy', {}), **raw.get('executor', {}), **raw.get('service', {})}
+    flat = {**raw.get('github', {}), **raw.get('policy', {}), **raw.get('executor', {}), **raw.get('service', {}),
+            **raw.get('atlassian', {})}
     if 'repos' in raw:
         flat['repos'] = raw['repos']
     return flat
@@ -159,7 +176,7 @@ EDITABLE = {'agent': 'executor', 'provider': 'executor', 'model': 'executor', 't
 REPO_EDITABLE = ('name', 'checkout', 'base_branch', 'test_command', 'test_timeout')
 LEGACY_EDITABLE = {'checkout': 'executor', 'base_branch': 'executor'}  # the single repo + checkout form
 _HEADER = re.compile(r'\s*(\[\[?)\s*([A-Za-z0-9_.-]+)\s*\]\]?\s*(#.*)?$')
-FLAT_TABLES = ('github', 'policy', 'executor', 'service')  # merged into one flat Config by load()
+FLAT_TABLES = ('github', 'policy', 'executor', 'service', 'atlassian')  # merged into one flat Config by load()
 
 
 def _toml(v):
@@ -289,20 +306,21 @@ def remove_repo(path, name):
     _save(path, _joined(lines, nl), expected)
 
 
-def add_repo(path, name, checkout, base_branch='', test_command='', test_timeout=0):
+def add_repo(path, name, checkout='', base_branch='', test_command='', test_timeout=0):
     """Add a repository to the config file as a new [[repos]] table, keeping the file's comments and layout.
 
     A config in the single-repo form (`repo` + `checkout`) first gets its repo moved to a [[repos]] table too; the
     service carries that repo's cursors, Triggers and Tickets over (see github._Keys). Empty `base_branch` or
-    `test_command` and a 0 `test_timeout` keep the defaults. Nothing is written unless the result loads as exactly
+    `test_command` and a 0 `test_timeout` keep the defaults; an empty `checkout` lets superagent make its own
+    clone. Nothing is written unless the result loads as exactly
     that; ValueError says why. A running service applies it after a restart."""
     path = os.path.expanduser(path)
     with open(path, encoding='utf-8', newline='') as f:
         text = f.read()
     raw = tomllib.loads(text)
-    new = {'name': name.strip(), 'checkout': checkout.strip()}
-    for key, value in (('base_branch', base_branch.strip()), ('test_command', test_command.strip()),
-                       ('test_timeout', test_timeout)):
+    new = {'name': name.strip()}
+    for key, value in (('checkout', checkout.strip()), ('base_branch', base_branch.strip()),
+                       ('test_command', test_command.strip()), ('test_timeout', test_timeout)):
         if value:
             new[key] = value
     nl = '\r\n' if '\r\n' in text else '\n'

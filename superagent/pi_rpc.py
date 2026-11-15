@@ -135,14 +135,15 @@ class PiRpc:
         return rec.get('data') or {}
 
     # Runs
-    async def run(self, message, timeout):
-        """Prompt and wait for agent_settled. The result holds the last assistant message's text."""
+    async def run(self, message, timeout, images=()):
+        """Prompt and wait for agent_settled. The result holds the last assistant message's text. `images`:
+        [{type: image, data: base64, mimeType}] shown to the model with the message."""
         q = asyncio.Queue()
         self._subs.add(q)  # before the prompt, so a fast run cannot finish unseen
         result = RunResult()
         try:
             try:
-                data = await self.request('prompt', message=message)
+                data = await self.request('prompt', message=message, **({'images': list(images)} if images else {}))
             except RpcError as e:
                 return RunResult(error=str(e))
             if data.get('disposition') == 'handled':

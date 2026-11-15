@@ -4,8 +4,9 @@ Every side effect goes through the store's effect queue (reply, launch, deliver)
 acting replays the action instead of losing it. The philosophy follows dsh-superagent: confirm once, then stay
 quiet until there is a question, a result, or an honest failure.
 
-Operator actions from the CLI reach a running service through kv keys `operator:stop:<ticket>` and
-`operator:retry:<ticket>`; the service applies them at the start of each poll round (or at the next start).
+Operator actions from the CLI reach a running service through kv keys `operator:stop:<ticket>`,
+`operator:done:<ticket>` and `operator:retry:<ticket>`; the service applies them at the start of each poll round (or at
+the next start).
 Local requests (`superagent ask` and `answer`) wait in the store's `local_requests` table and are applied in the
 same place. A local Ticket's thread is `local:<request id>`; its replies go to the store's local outbox, not GitHub.
 """
@@ -21,7 +22,7 @@ import subprocess
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 
-from . import executor, github, policy
+from . import atlassian, executor, github, policy
 from .model import Assignment, Ticket, Trigger, named_repos, new_id, new_part, short_name, ticket_title
 from .pi_rpc import RunResult
 from .report import NotRunning
@@ -29,7 +30,9 @@ from .report import NotRunning
 log = logging.getLogger('superagent.service')
 
 RUN_TIMEOUT = 2 * 3600  # one worker run, seconds
+MAX_PENDING_PROPOSALS = 10  # Jira or Confluence writes of one Ticket waiting for a person
 DELIVER_ATTEMPTS = 5
+PUSH_FIXES = 2  # times a refused push onto an existing branch goes back to the worker before it is blocked
 REPLY_WORDS = 100
 LOCAL = 'local:'  # thread key prefix of local Tickets
 
@@ -120,10 +123,52 @@ class Service:
             raise NotRunning('this Ticket has no running assignment; the report was not recorded')
         self.loop.call_soon_threadsafe(self.handle_report, ticket_id, report)
 
+    def on_propose(self, ticket_id, proposal):
+        """A running worker proposes a Jira or Confluence write (POST /propose): kept until a person approves or
+        rejects it. Returns its id."""
+        if self.loop is None:
+            raise RuntimeError('service is not running')
+        t = self.store.ticket(ticket_id)
+        if not t or t.state == 'ended' or not t.current or t.current.state != 'running':
+            raise NotRunning('this Ticket has no running assignment; the proposal was not recorded')
+        pid = self.store.add_proposal(ticket_id, proposal, limit=MAX_PENDING_PROPOSALS)
+        self.loop.call_soon_threadsafe(self._proposed, ticket_id, pid)
+        return pid
+
+    def _proposed(self, tid, pid):
+        t, p = self.store.ticket(tid), self.store.proposal(pid)
+        if t and p:
+            self.reply(t, f'{tid}-proposal-{pid}', f'I propose to write {atlassian.target(p)}. Approve or reject it '
+                                                  f'on the ticket in the panel, or `superagent approve {pid}`.')
+            log.info('[%s] proposed #%s: %s', t.name, pid, atlassian.target(p))
+
+    async def apply_proposals(self):
+        """Write each approved proposal to Jira or Confluence with the service's tokens, once, and tell the thread
+        and (in its next message) the worker. A proposal stuck in 'writing' after a crash is left for a person to
+        check rather than written twice."""
+        for p in self.store.proposals(state='approved'):
+            if not self.store.update_proposal(p['id'], expect='approved', state='writing'):
+                continue
+            t = self.store.ticket(p['ticket_id'])
+            try:
+                what, url = await asyncio.to_thread(atlassian.write, self.cfg, p)
+            except atlassian.WriteError as ex:
+                self.store.update_proposal(p['id'], state='failed', error=str(ex))
+                note = f"Proposal #{p['id']} ({atlassian.target(p)}) was approved but could not be written: {ex}"
+                log.warning('[%s] proposal #%s failed: %s', t.name if t else p['ticket_id'], p['id'], ex)
+            else:
+                self.store.update_proposal(p['id'], state='done', result=url)
+                note = f"Proposal #{p['id']} was approved and written: {what} {url}"
+                log.info('[%s] wrote %s: %s', t.name if t else p['ticket_id'], what, url)
+            if t:
+                self.reply(t, f"{t.id}-proposal-{p['id']}-{'done' if 'written' in note else 'failed'}", note)
+                self.store.add_input(t.id, 'note', note, f"proposal|{p['id']}")  # in its next message
+
     # Polling
     async def poll_once(self):
         self.loop = asyncio.get_running_loop()
         await self.apply_operator_requests()
+        await self.apply_proposals()
         await self.take_local_requests()
         now = self.clock()
         if self.paused_until and now < self.paused_until:
@@ -231,7 +276,9 @@ class Service:
         worker = self.workers.get(tid)
         if worker and worker.running:
             inputs = self.store.pending_inputs(tid)
-            how = await worker.send(executor.followup_message(inputs))
+            await self._fetch_references(t, False, inputs)
+            note = executor.attachments_note(self._files(t, False, inputs))
+            how = await worker.send(executor.followup_message(inputs) + (f'\n\n{note}' if note else ''))
             self.store.mark_delivered([i['seq'] for i in inputs])
             log.info('[%s] follow-up from %s %s', t.name, trig.actor, how)
             return
@@ -323,6 +370,11 @@ class Service:
     # Operator requests
     async def apply_operator_requests(self):
         for t in self.store.tickets(state='open'):
+            if self.store.get(f'operator:done:{t.id}'):  # finished without a pull request, e.g. a Jira or wiki change
+                self.store.put(f'operator:done:{t.id}', None)
+                if await self.end_ticket(t.id, 'completed'):
+                    self.reply(self.store.ticket(t.id), f'{t.id}-done', 'Marked done by the operator.')
+                continue
             if self.store.get(f'operator:stop:{t.id}'):
                 self.store.put(f'operator:stop:{t.id}', None)
                 if await self.end_ticket(t.id, 'stopped'):
@@ -331,6 +383,26 @@ class Service:
             if self.store.get(f'operator:retry:{t.id}'):
                 self.store.put(f'operator:retry:{t.id}', None)
                 self.retry(t.id)
+            name, a = self.store.get(f'operator:add-repo:{t.id}'), t.current
+            # Only between runs: the worktree may move, which must not happen under a working worker.
+            if name and (not a or a.state == 'ended') and t.id not in self.workers and t.id not in self.test_tasks:
+                self.store.put(f'operator:add-repo:{t.id}', None)
+                await self.add_repo(t, name)
+
+    async def add_repo(self, t, name):
+        """Add a configured repo to an open Ticket, as its worker asked and a person approved, and resume the worker
+        with where each repo's worktree now is."""
+        try:
+            await asyncio.to_thread(executor.add_repo_to_ticket, self.cfg, t, name, self.run_git)
+        except (executor.PrepareError, ValueError) as ex:
+            log.warning('[%s] could not add %s: %s', t.name, name, ex)
+            self.reply(t, f'{t.id}-add-repo-{_digest(name, str(ex))}', f'I could not add {name}: {ex}')
+            return
+        self.store.save_ticket(t)
+        self.store.put(f'repo-request:{t.id}', None)
+        self.reply(t, f'{t.id}-added-{_digest(name)}', f'Added {name} to this ticket; continuing in both.')
+        log.info('[%s] added %s', t.name, name)
+        self._new_assignment(t, 'repo-added', executor.repo_added_message(self.cfg, t, name))
 
     def retry(self, tid):
         t = self.store.ticket(tid)
@@ -427,6 +499,10 @@ class Service:
         fresh = not any(x.get('started_at') for x in t.assignments[:-1])
         inputs = self.store.pending_inputs(t.id)
         message = self._message(t, d['mode'], fresh, inputs, d.get('message', ''))
+        await self._fetch_references(t, fresh, inputs)
+        files = self._files(t, fresh, inputs)
+        if files:
+            message += '\n\n' + executor.attachments_note(files)
         a.state, a.started_at = 'running', self.now_iso()
         self._set_current(t, a)
         self.store.save_ticket(t)
@@ -443,8 +519,32 @@ class Service:
             return
         self.store.mark_delivered([i['seq'] for i in inputs])
         self.store.effect_done(e['id'])
-        self.tasks[t.id] = asyncio.create_task(self._run_worker(t.id, a.id, worker, message))
+        self.tasks[t.id] = asyncio.create_task(self._run_worker(t.id, a.id, worker, message,
+                                                                executor.image_blocks(files)))
         log.info('[%s] worker launched (%s) in %s', t.name, d['mode'], path)
+
+    def _files(self, t, fresh, inputs):
+        """Paths of the files attached to what a run delivers: the request (on a fresh start) and the answers."""
+        ids = ([t.mandate.get('trigger_id')] if fresh else []) + [i['trigger_id'] for i in inputs]
+        return [f for tid in dict.fromkeys(ids) if tid for f in self.store.trigger_files(tid)]
+
+    async def _fetch_references(self, t, fresh, inputs):
+        """Fetch the Jira issues and Confluence pages that what a run delivers names (each text once), as files for
+        its worker: the service reads them with its tokens, read-only; the worker gets only the text."""
+        if not (self.cfg.jira_url or self.cfg.confluence_url):
+            return
+        trig = self._request(t) if fresh else None
+        texts = ([(trig.id, trig.text)] if trig else []) + [(i['trigger_id'], i['text']) for i in inputs]
+        for tid, text in texts:
+            refs = atlassian.references(self.cfg, text) if tid and not self.store.get(f'atlassian:{tid}') else []
+            if not refs:
+                continue
+            self.store.put(f'atlassian:{tid}', True)  # once, found or not: a key that is no issue is not retried
+            found = await asyncio.to_thread(atlassian.fetch_all, self.cfg, refs)
+            if found:
+                from .cli import save_attachments
+                self.store.add_trigger_files(tid, save_attachments(self.cfg, [(n, s.encode()) for n, s in found]))
+                log.info('[%s] attached %s', t.name, ', '.join(n for n, _ in found))
 
     def _message(self, t, mode, fresh, inputs, note=''):
         if fresh:
@@ -466,9 +566,9 @@ class Service:
         return ('The operator asked you to try this Ticket again. Check your directory and git log, '
                 'then continue and report.')
 
-    async def _run_worker(self, tid, aid, worker, message):
+    async def _run_worker(self, tid, aid, worker, message, images=()):
         try:
-            result = await worker.run(message, self.run_timeout)
+            result = await worker.run(message, self.run_timeout, images)
         except Exception as ex:
             result = RunResult(error=str(ex) or type(ex).__name__)
         finally:
@@ -522,6 +622,8 @@ class Service:
         a.report, a.summary, a.question = status, report['summary'], report.get('question', '')
         if status == 'ready':
             t.details = report.get('details', '')
+        # A repo the worker asks to add, until a person approves (operator add-repo) or a later report drops it.
+        self.store.put(f'repo-request:{t.id}', report.get('needs_repo') or None)
         self._set_current(t, a)
         self.store.save_ticket(t)
         log.info('[%s] report %s', t.name, status)
@@ -675,14 +777,19 @@ class Service:
         push_dir = self.cfg.push_dir(repo)
         os.makedirs(os.path.dirname(push_dir), exist_ok=True)
         # Never force onto an existing branch: someone else's commits there would be lost.
-        await asyncio.to_thread(github.push_branch, t.worktree, t.branch, self.cfg.token, repo.name, push_dir,
-                                self.run_git, env, force=not t.existing_branch)
+        try:
+            await asyncio.to_thread(github.push_branch, t.worktree, t.branch, self.cfg.token, repo.name, push_dir,
+                                    self.run_git, env, force=not t.existing_branch)
+        except github.NotFastForward as ex:
+            self._push_refused(e, t, ex)
+            return
         commits = await asyncio.to_thread(github.commit_subjects, t.worktree, base, self.run_git, env)
         number = await asyncio.to_thread(github.open_pull, self._gh(repo.name), t.branch, repo.base_branch, t.title,
                                          self._pr_body(t, a, repo, t.test_result, commits))
         t = self.store.ticket(t.id)
         t.pr_number = number
         t.delivery_error = ''
+        t.push_refusals = 0
         self.store.save_ticket(t)
         self.store.effect_done(e['id'])
         url = f'https://github.com/{repo.name}/pull/{number}'
@@ -691,6 +798,30 @@ class Service:
         else:
             self.reply(t, f'{t.id}-pr-{number}', f'Opened a pull request: {url}')
         log.info('[%s] delivered PR #%s', t.name, number)
+
+    def _push_refused(self, e, t, ex):
+        """GitHub refused the push onto an existing branch as not a fast-forward. Pushing the same history again can
+        never work, and the service never forces there, so the worker merges origin/<branch> and reports again; after
+        PUSH_FIXES tries the Ticket is blocked for a person (who may force-push it themselves)."""
+        self.store.effect_done(e['id'])
+        t = self.store.ticket(t.id)
+        a = t.current
+        t.push_refusals += 1
+        log.warning('[%s] push to %s refused as not a fast-forward, refusal %d', t.name, t.branch, t.push_refusals)
+        if t.push_refusals <= PUSH_FIXES:
+            self.store.save_ticket(t)
+            self._new_assignment(t, 'push', executor.push_refused_message(t.branch, str(ex), t.push_refusals,
+                                                                          PUSH_FIXES))
+            return
+        t.push_refusals = 0  # a person's next instruction starts with fresh attempts
+        a.report, a.summary, a.question = 'blocked', f'push to {t.branch} refused: not a fast-forward', ''
+        self._set_current(t, a)
+        self.store.save_ticket(t)
+        self.reply(t, f'{t.id}-{a.id}-push-blocked',
+                   f'I am blocked: GitHub refused the push to `{t.branch}` because the branch has commits my work does '
+                   f'not include, still after {PUSH_FIXES} attempts to merge them. I never force-push an existing '
+                   'branch. Tell me how to continue, or force-push the worktree yourself if replacing its history is '
+                   'intended.')
 
     def _pr_body(self, t, a, repo, test_result, commits=()):
         trig = self._request(t)

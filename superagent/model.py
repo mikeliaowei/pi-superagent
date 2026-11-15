@@ -120,6 +120,7 @@ class Ticket:
     test_failures: int = 0  # failed runs since the last pass
     test_output: str = ''  # the tail of the last failing run's output
     test_result: str = ''  # the PR body line of the last passing run
+    push_refusals: int = 0  # pushes onto an existing branch GitHub refused as not a fast-forward, since the last push
     # A cross-repo Ticket (S14) works in several repos: one part per repo, the thread's repo first. Each part is
     # {repo, worktree, pr_number, test_result, pushed}; `worktree` above is then the ticket folder holding them.
     # Empty for a single-repo Ticket, which keeps using worktree, pr_number and test_result above.
@@ -155,8 +156,8 @@ class Ticket:
 
 
 # Ticket fields added after the first release, with the value meaning "not used".
-LATER_FIELDS = {'test_failures': 0, 'test_output': '', 'test_result': '', 'parts': [], 'existing_branch': '',
-                'skills': [], 'model': '', 'thinking': '', 'details': ''}
+LATER_FIELDS = {'test_failures': 0, 'test_output': '', 'test_result': '', 'push_refusals': 0, 'parts': [],
+                'existing_branch': '', 'skills': [], 'model': '', 'thinking': '', 'details': ''}
 
 THINKING_LEVELS = ('off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
 

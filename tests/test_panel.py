@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -25,12 +26,20 @@ except ImportError:  # the panel extra is optional
     st = AppTest = None
 
 PANEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'superagent', 'panel.py')
-TOKEN_VALUE = 'ghp_SECRET_bot_token_value_123'
-TICKET_TOKEN = 'tok-SECRET-ticket-token-456'
+TOKEN_VALUE = 'ghp_SECRET_bot_token_value_123'  # noqa: S105 - fake: tests check it is never shown
+TICKET_TOKEN = 'tok-SECRET-ticket-token-456'  # noqa: S105 - likewise
 
 
 def _iso(dt):
     return dt.isoformat(timespec='seconds')
+
+
+def _attr(node, attr):
+    """An element attribute, or None: some AppTest elements raise for a field they do not have."""
+    try:
+        return getattr(node, attr)
+    except Exception:
+        return None
 
 
 def rendered_text(at):
@@ -39,10 +48,7 @@ def rendered_text(at):
 
     def walk(node):
         for attr in ('value', 'label', 'body', 'help', 'options'):
-            try:
-                v = getattr(node, attr)
-            except Exception:
-                continue
+            v = _attr(node, attr)
             if hasattr(v, 'to_csv'):
                 parts.append(v.to_csv())
             elif v is not None and not callable(v):
@@ -58,13 +64,18 @@ def rendered_text(at):
     return '\n'.join(parts)
 
 
+def plain(label):
+    """A tab label without its leading :material/icon:."""
+    return re.sub(r'^:material/\w+: ', '', label)
+
+
 SETTINGS_TABS = ['Repos', 'Worker and service', 'All settings', 'Service health', 'Incoming messages']
 
 
 @unittest.skipIf(AppTest is None, 'streamlit is not installed (pip install -e ".[panel]")')
 class PanelAppTest(unittest.TestCase):
     def tab(self, at, label):
-        (tab,) = [t for t in at.tabs if t.label == label]
+        (tab,) = [t for t in at.tabs if plain(t.label) == label]
         return tab
 
     MULTI = ('[github]\nagent_login = "bot"\ntoken_env = "SA_PANEL_TOKEN"\n[policy]\nallowed = ["alice"]\n'
@@ -92,7 +103,7 @@ class PanelAppTest(unittest.TestCase):
     def app(self, env=None):
         environ = {k: v for k, v in os.environ.items() if k != 'SA_PANEL_TOKEN'}
         environ.update({'SUPERAGENT_CONFIG': self.config, **(env or {})})
-        at = AppTest.from_file(PANEL, default_timeout=60)
+        at = AppTest.from_file(PANEL, default_timeout=180)  # room for parallel runs
         with mock.patch.dict(os.environ, environ, clear=True):
             at.run()
         self.assertFalse(at.exception, [e.value for e in at.exception])
@@ -123,7 +134,7 @@ class PanelAppTest(unittest.TestCase):
 
     def test_no_config_is_explained(self):
         environ = {k: v for k, v in os.environ.items() if k != 'SUPERAGENT_CONFIG'}
-        at = AppTest.from_file(PANEL, default_timeout=60)
+        at = AppTest.from_file(PANEL, default_timeout=180)  # room for parallel runs
         with mock.patch.dict(os.environ, environ, clear=True):
             at.run()
         self.assertFalse(at.exception)
@@ -133,6 +144,23 @@ class PanelAppTest(unittest.TestCase):
         self.store()
         at = self.app()
         self.assertIn('No tickets yet', rendered_text(at))
+
+    def test_every_tab_warns_when_the_service_is_not_polling(self):
+        store = self.store()
+        store.queue_ask('review the code', ['o/r'], 'alice')
+        at = self.app()
+        (warning,) = at.warning
+        self.assertIn('The service is not running: it has never polled.', warning.value)
+        self.assertIn('Start `superagent run`', warning.value)
+        self.assertIn('1 request(s) are waiting for it.', warning.value)
+        store.put('last-poll', _iso(self.now - timedelta(hours=2)))
+        with mock.patch.dict(os.environ, {'SUPERAGENT_CONFIG': self.config}):
+            at.run()
+        self.assertIn(f'its last poll was {_iso(self.now - timedelta(hours=2))}', at.warning[0].value)
+        store.put('last-poll', _iso(datetime.now(timezone.utc)))
+        with mock.patch.dict(os.environ, {'SUPERAGENT_CONFIG': self.config}):
+            at.run()
+        self.assertFalse(at.warning)  # polling: nothing to say
 
     def test_an_edited_store_module_gets_a_new_store_instead_of_the_cached_one(self):
         self.store()
@@ -158,18 +186,27 @@ class PanelAppTest(unittest.TestCase):
         self.ticket(store, 'tk-done', 'old-work', 3, report='ready', state='ended', outcome='merged')
         self.ticket(store, 'tk-gone', 'given-up', 4, report='failed', state='ended', outcome='stopped')
         at = self.app()
-        needs = self.tab(at, 'Overview').dataframe[0].value
-        self.assertEqual(list(needs['ID']), ['needs-answer'])
-        self.assertEqual(list(needs['title']), ['needs answer'])  # working and ended tickets do not need you
-        self.assertEqual(list(needs['status']), ['Waiting for your answer'])
-        self.assertEqual(list(needs['question or report']), ['Which database should I use?'])
-        self.assertEqual(list(needs['issue']), ['https://github.com/o/r/issues/2'])
+        home = self.tab(at, 'Home')
+        cards = '\n'.join(m.value for m in home.markdown)
+        self.assertIn('Needs you (1)', cards)  # working and ended tickets do not need you
+        self.assertIn(':orange-badge[:material/help: Waiting for your answer] **needs answer** · o/r', cards)
+        self.assertEqual([w.value for w in home.warning], ['Which database should I use?'])
+        self.assertEqual(at.text_area(key='home-answer-text-tk-ask').label, 'Answer')  # answered right on Home
+        self.assertIn('Working now (1)', cards)
+        self.assertIn('**busy work**', cards)
+        self.assertNotIn('old work', cards)
         metrics = {m.label: m.value for m in at.metric}
         self.assertEqual({k: metrics[k] for k in ('Tickets', 'Open', 'Need you', 'Succeeded', 'Not merged')},
                          {'Tickets': '4', 'Open': '2', 'Need you': '1', 'Succeeded': '1', 'Not merged': '1'})
         self.assertEqual(metrics['Running workers'], '0 / 3')
         self.assertEqual(metrics['Tickets opened (24 h)'], '4')
-        self.assertEqual(len(self.tab(at, 'Overview').get('vega_lite_chart')), 4)  # status, repo, days, tokens
+        self.assertEqual(len(self.tab(at, 'Stats').get('vega_lite_chart')), 4)  # status, repo, days, tokens
+        with mock.patch.dict(os.environ, {'SUPERAGENT_CONFIG': self.config}):
+            at.button(key='home-open-tk-ask').click().run()  # Open →: its details on the Tickets tab
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        self.assertEqual(plain(at.session_state['main-tabs']), 'Tickets')
+        self.assertIn('### needs answer', '\n'.join(m.value for m in self.tab(at, 'Tickets').markdown))
+        self.assertEqual(at.text_area(key='tk-answer-text-tk-ask').label, 'Answer')
 
     def test_a_count_card_opens_its_tickets_on_the_tickets_tab(self):
         store = self.store()
@@ -182,7 +219,7 @@ class PanelAppTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {'SUPERAGENT_CONFIG': self.config}):
             at.button(key='ov-show-Need you').click().run()
         self.assertFalse(at.exception, [e.value for e in at.exception])
-        self.assertEqual(at.session_state['main-tabs'], 'Tickets')
+        self.assertEqual(plain(at.session_state['main-tabs']), 'Tickets')
         self.assertEqual(sorted(self.tab(at, 'Tickets').dataframe[0].value['ID']), ['needs-answer', 'needs-review'])
         self.open_ticket(at, 'needs-answer')
         self.assertEqual(at.text_area(key='tk-answer-text-tk-ask').label, 'Answer')  # straight to the reply
@@ -237,7 +274,7 @@ class PanelAppTest(unittest.TestCase):
         self.ticket(store, 'tk-1', 'fix-it', 1)
         self.ticket(store, 'tk-2', 'other-work', 2)
         at = self.app()
-        self.assertIn('Click a ticket to see its details', rendered_text(at))
+        self.assertIn('Pick a ticket on the left', rendered_text(at))
         self.open_ticket(at, 'fix-it')
         self.assertIn('### fix it', '\n'.join(m.value for m in self.tab(at, 'Tickets').markdown))
         self.assertEqual([t.label for t in self.tab(at, 'Tickets').tabs],
@@ -271,6 +308,25 @@ class PanelAppTest(unittest.TestCase):
         self.assertEqual(store.ticket('tk-1').state, 'open')  # the service applies it
         self.assertIn('stop requested for fix-it (tk-1)', '\n'.join(s.value for s in at.success))
 
+    def test_mark_done_records_the_same_request_as_the_cli_and_counts_as_succeeded(self):
+        store = self.store()
+        self.ticket(store, 'tk-1', 'fix-it', 1, report='dropped', summary='Commented on RWT-1; no code change')
+        self.ticket(store, 'tk-2', 'wiki-page', 2, report='ready', state='ended', outcome='completed')
+        at = self.app()
+        with mock.patch.dict(os.environ, {'SUPERAGENT_CONFIG': self.config}):
+            at.button(key='busy-done-tk-1').click().run()  # right on its Home card (Working now: it is idle)
+        self.assertTrue(store.get('operator:done:tk-1'))
+        self.assertEqual(store.ticket('tk-1').state, 'open')  # the service applies it
+        self.assertIn('done requested for fix-it (tk-1)', '\n'.join(s.value for s in at.success))
+        self.assertEqual({m.label: m.value for m in at.metric}['Succeeded'], '1')  # done counts, like merged
+        at.radio(key='ticket-scope').set_value('all')
+        with mock.patch.dict(os.environ, {'SUPERAGENT_CONFIG': self.config}):
+            at.run()
+        table = self.tab(at, 'Tickets').dataframe[0].value.set_index('ID')
+        self.assertEqual(table.loc['wiki-page', 'status'], 'Done')
+        self.open_ticket(at, 'fix-it')
+        self.assertEqual(at.button(key='tk-done-tk-1').label, 'Mark done')  # in its details too
+
     def test_retry_records_the_same_request_as_the_cli(self):
         store = self.store()
         self.ticket(store, 'tk-1', 'fix-it', 1, report='failed', summary='Crashed')
@@ -291,7 +347,7 @@ class PanelAppTest(unittest.TestCase):
         store.add_trigger(Trigger(id='tr-ok', thread_key='github:o/r#6', actor='alice', human=True, addressed=True,
                                   at=_iso(self.now - timedelta(minutes=1)), text='@bot add tests'), 'accept')
         at = self.app()
-        self.assertEqual([t.label for t in at.tabs], ['Overview', 'Tickets', 'New request', 'Settings', *SETTINGS_TABS])
+        self.assertEqual([plain(t.label) for t in at.tabs], ['Home', 'Tickets', 'Stats', 'Settings', *SETTINGS_TABS])
         table = self.incoming(at)
         self.assertEqual(dict(zip(table['from'], table['what it did'], strict=True)),
                          {'mallory': 'Ignored', 'alice': 'Started work'})
@@ -314,12 +370,12 @@ class PanelAppTest(unittest.TestCase):
         at = self.open_ticket(self.app(), 'fix-it')
         tab = self.tab(at, 'Tickets')
         self.assertIn('ID `fix-it` · asked by alice', '\n'.join(c.value for c in tab.caption))
-        self.assertIn('**Ready for review** · o/r · branch `agent/fix-it`', '\n'.join(m.value for m in tab.markdown))
+        self.assertIn(':green-badge[:material/rate_review: Ready for review] · o/r · branch `agent/fix-it`', '\n'.join(m.value for m in tab.markdown))
         self.assertIn('@bot please fix-it', rendered_text(at))
         self.assertIn('also update docs', rendered_text(at))
         self.assertIn('Opened a PR', tab.dataframe[1].value.to_csv())
         inputs = tab.dataframe[2].value
-        self.assertEqual(dict(zip(inputs['text'], inputs['delivered'])),
+        self.assertEqual(dict(zip(inputs['text'], inputs['delivered'], strict=False)),
                          {'also update docs': 'yes', 'use the new API': 'no'})
 
     def session(self, tid, entries):
@@ -349,6 +405,35 @@ class PanelAppTest(unittest.TestCase):
             at.toggle(key='worker-reasoning-tk-1').set_value(True).run()
         self.assertIn('private chain of thought', rendered_text(at))
 
+    def test_worker_activity_colors_the_agent_shell_tools_results_errors_and_report_apart(self):
+        store = self.store()
+        self.ticket(store, 'tk-1', 'fix-it', 1)
+        report = 'superagent-report --status ready --summary "Fixed the nav and added tests" --details-file d.md'
+        self.session('tk-1', [
+            {'role': 'assistant', 'content': [
+                {'type': 'text', 'text': 'Looking at the nav manager.'},
+                {'type': 'toolCall', 'id': 'c1', 'name': 'bash', 'arguments': {'command': 'just test'}},
+                {'type': 'toolCall', 'id': 'c2', 'name': 'read', 'arguments': {'path': 'nav.py'}}]},
+            {'role': 'toolResult', 'toolName': 'bash', 'isError': False, 'content': [{'type': 'text', 'text': 'ok'}]},
+            {'role': 'toolResult', 'toolName': 'read', 'isError': True, 'content': [{'type': 'text', 'text': 'gone'}]},
+            {'role': 'assistant', 'content': [
+                {'type': 'toolCall', 'id': 'c3', 'name': 'bash', 'arguments': {'command': report}}]}])
+        at = self.open_ticket(self.app(), 'fix-it')
+        tab = self.tab(at, 'Tickets')
+        self.assertIn('**Agent**', tab.info[0].value)
+        self.assertIn('Looking at the nav manager.', tab.info[0].value)
+        badges = '\n'.join(m.value for m in tab.markdown)
+        self.assertIn(':violet-badge[:material/terminal: Shell · bash]', badges)
+        self.assertIn(':orange-badge[:material/build: read]', badges)
+        self.assertEqual([c.language for c in tab.code][:2], ['bash', 'plaintext'])
+        labels = [e.label for e in tab.expander]
+        self.assertTrue(any(x.startswith(':green[bash result]') for x in labels), labels)
+        self.assertTrue(any(x.startswith(':red[read failed]') for x in labels), labels)
+        (done,) = tab.success
+        self.assertIn('**Report: ready**', done.value)
+        self.assertIn('Fixed the nav and added tests', done.value)  # the summary, not the whole command
+        self.assertNotIn('--details-file', done.value)
+
     def test_ticket_detail_shows_only_the_latest_worker_steps_until_asked_for_all(self):
         store = self.store()
         self.ticket(store, 'tk-1', 'fix-it', 1)
@@ -364,6 +449,32 @@ class PanelAppTest(unittest.TestCase):
             at.toggle(key='worker-all-tk-1').set_value(True).run()
         self.assertIn('step-000', rendered_text(at))
 
+    def test_worker_steps_show_their_date_and_when_the_worker_started_and_last_acted(self):
+        store = self.store()
+        self.ticket(store, 'tk-1', 'fix-it', 1)
+        self.session('tk-1', [{'role': 'assistant', 'content': [{'type': 'text', 'text': 'Looking.'}]}])
+        at = self.open_ticket(self.app(), 'fix-it')
+        day = self.now.astimezone().strftime('%Y-%m-%d')
+        self.assertIn(f'**Agent** · {day} ', self.tab(at, 'Tickets').info[0].value)
+        self.assertIn(f'Started {day} ', rendered_text(at))
+
+    def test_worker_steps_can_be_shown_newest_first(self):
+        store = self.store()
+        self.ticket(store, 'tk-1', 'fix-it', 1)
+        self.session('tk-1', [{'role': 'assistant', 'content': [
+            {'type': 'toolCall', 'id': f'c{i}', 'name': 'bash', 'arguments': {'command': f'step-{i:03d}'}}]}
+            for i in range(60)])
+        at = self.open_ticket(self.app(), 'fix-it')
+
+        def commands():
+            return [c.value for c in self.tab(at, 'Tickets').code if c.value.startswith('step-')]
+
+        self.assertEqual(commands()[0], 'step-010')  # oldest first by default
+        with mock.patch.dict(os.environ, {'SUPERAGENT_CONFIG': self.config}):
+            at.toggle(key='worker-newest-tk-1').set_value(True).run()
+        self.assertEqual(commands()[:2], ['step-059', 'step-058'])
+        self.assertEqual(commands()[-1], 'step-010')  # still the latest 50 steps, only reversed
+
     def test_ticket_detail_without_a_worker_session_says_so(self):
         store = self.store()
         self.ticket(store, 'tk-1', 'fix-it', 1)
@@ -374,13 +485,13 @@ class PanelAppTest(unittest.TestCase):
         self.ticket(store, 'tk-1', 'fix-it', 1, report='waiting', question='Ok?')
         at = self.app(env={'SA_PANEL_TOKEN': TOKEN_VALUE})
         settings = at.tabs[3].dataframe[0].value
-        self.assertEqual(dict(zip(settings['setting'], settings['value']))['token set (SA_PANEL_TOKEN)'], 'yes')
+        self.assertEqual(dict(zip(settings['setting'], settings['value'], strict=False))['token set (SA_PANEL_TOKEN)'], 'yes')
         text = rendered_text(at)
         self.assertNotIn(TOKEN_VALUE, text)
         self.assertNotIn(TICKET_TOKEN, text)
         at = self.app()
         settings = at.tabs[3].dataframe[0].value
-        self.assertEqual(dict(zip(settings['setting'], settings['value']))['token set (SA_PANEL_TOKEN)'], 'no')
+        self.assertEqual(dict(zip(settings['setting'], settings['value'], strict=False))['token set (SA_PANEL_TOKEN)'], 'no')
 
 
     def test_with_several_repos_tickets_show_their_repo_and_link_to_it(self):
@@ -396,7 +507,7 @@ class PanelAppTest(unittest.TestCase):
         self.assertNotIn('https://github.com/o/r/', text)
         self.assertEqual(list(self.tab(at, 'Tickets').dataframe[0].value['repo']), ['b/two'])
         settings = self.tab(at, 'Settings').dataframe[0].value
-        values = dict(zip(settings['setting'], settings['value']))
+        values = dict(zip(settings['setting'], settings['value'], strict=False))
         self.assertEqual(values['repos'], 'a/one, b/two')
         self.assertEqual(at.text_input(key='set-b__two-test').value, 'make check')
         self.assertEqual(at.text_input(key='set-a__one-checkout').value, f'{self.tmp}/one')
@@ -547,9 +658,10 @@ class PanelAppTest(unittest.TestCase):
         at = self.app()
         self.save_settings(at)
         self.assertIn('Nothing changed.', '\n'.join(i.value for i in at.info))
-        at.text_input(key='set-o__r-checkout').input('')
+        missing = os.path.join(self.tmp, 'no-such-clone')
+        at.text_input(key='set-o__r-checkout').input(missing)
         self.save_repo(at, 'o__r')
-        self.assertIn('o/r not saved: checkout folder (empty) does not exist', '\n'.join(e.value for e in at.error))
+        self.assertIn(f'o/r not saved: checkout folder {missing} does not exist', '\n'.join(e.value for e in at.error))
         with open(self.config) as f:
             self.assertEqual(f.read(), before)
 
@@ -563,7 +675,7 @@ class PanelAppTest(unittest.TestCase):
     def test_adding_a_repo_keeps_the_same_tabs_and_lets_tickets_filter_by_it(self):
         self.store()
         at = self.app()
-        self.assertEqual([t.label for t in at.tabs], ['Overview', 'Tickets', 'New request', 'Settings', *SETTINGS_TABS])
+        self.assertEqual([plain(t.label) for t in at.tabs], ['Home', 'Tickets', 'Stats', 'Settings', *SETTINGS_TABS])
         self.assertIn('moves o/r into a [[repos]] table', rendered_text(at))
         with open(self.config) as f:
             before = f.read()
@@ -578,7 +690,7 @@ class PanelAppTest(unittest.TestCase):
         self.add_repo(at, 'b/two', two)
         self.assertFalse(at.exception, [e.value for e in at.exception])
         self.assertIn('Added b/two. Restart `superagent run`', '\n'.join(s.value for s in at.success))
-        self.assertEqual([t.label for t in at.tabs], ['Overview', 'Tickets', 'New request', 'Settings', *SETTINGS_TABS])
+        self.assertEqual([plain(t.label) for t in at.tabs], ['Home', 'Tickets', 'Stats', 'Settings', *SETTINGS_TABS])
         self.assertEqual(at.multiselect(key='new-request-repos').options, ['o/r', 'b/two'])
         c = cli.load_config(self.config)
         self.assertEqual([(r.name, r.checkout) for r in c.repos], [('o/r', f'{self.tmp}/checkout'), ('b/two', two)])
@@ -679,7 +791,7 @@ class PanelAppTest(unittest.TestCase):
         store = self.store()
         self.ticket(store, 'tk-1', 'fix-it', 1, report='ready', state='ended', outcome='merged')
         at = self.app()
-        self.assertIn('Nothing needs you right now.', '\n'.join(i.value for i in self.tab(at, 'Overview').info))
+        self.assertIn('Nothing needs you right now.', '\n'.join(i.value for i in self.tab(at, 'Home').info))
         self.assertIn('No open tickets match', '\n'.join(i.value for i in self.tab(at, 'Tickets').info))
 
     def test_a_new_request_can_continue_an_open_ticket_on_its_branch(self):
@@ -705,7 +817,7 @@ class PanelAppTest(unittest.TestCase):
         store = self.store()
         at = self.app()
         self.assertEqual(at.multiselect(key='new-request-repos').value, ['o/r'])  # the only configured repo
-        self.assertEqual(at.text_area(key='new-request-text').label, 'Requirements')
+        self.assertEqual(at.text_area(key='new-request-text').label, 'What should superagent do?')
         at.text_area(key='new-request-text').input('Fix the flaky test\nIt fails on CI.')
         with mock.patch.dict(os.environ, {'SUPERAGENT_CONFIG': self.config}):
             at.button(key='new-request-submit').click().run()
@@ -825,6 +937,7 @@ class PanelCommandTest(unittest.TestCase):
         self.assertEqual(argv[:4], [sys.executable, '-m', 'streamlit', 'run'])
         self.assertTrue(argv[4].endswith(os.path.join('superagent', 'panel.py')))
         for flag, value in (('--server.address', '127.0.0.1'), ('--server.port', '0'),
-                            ('--server.headless', 'true'), ('--browser.gatherUsageStats', 'false')):
+                            ('--server.headless', 'true'), ('--browser.gatherUsageStats', 'false'),
+                            ('--client.toolbarMode', 'minimal')):  # no Deploy button: the panel is local
             self.assertEqual(argv[argv.index(flag) + 1], value)
         self.assertEqual(env['SUPERAGENT_CONFIG'], self.config)

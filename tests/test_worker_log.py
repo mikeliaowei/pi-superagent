@@ -81,6 +81,25 @@ class WorkerLogTest(unittest.TestCase):
         self.assertEqual(worker_log.usage(paths), {'input': 10, 'output': 2, 'cacheRead': 5, 'cacheWrite': 1,
                                                    'tokens': 18, 'cost': 0.0})
 
+    def test_a_later_pi_run_comes_after_an_earlier_copilot_run(self):
+        # A Ticket first worked by Copilot and retried with Pi: session_files lists the Copilot events last, but
+        # the newest steps must be the Pi run's, or "the last N steps" shows a finished run as the current one.
+        home = worker_log.copilot_home(self.state)
+        events = os.path.join(home, 'session-state', 'sid-1', 'events.jsonl')
+        os.makedirs(os.path.dirname(events))
+        os.makedirs(os.path.join(self.state, 'copilot-sessions'))
+        with open(worker_log.copilot_session_file(self.state, 'tk-1'), 'w') as f:
+            f.write('sid-1')
+        with open(events, 'w', encoding='utf-8') as f:
+            for at, text in [('2026-11-11T15:19:00.000Z', 'copilot first'), ('2026-11-11T15:45:29.715Z', 'copilot last')]:
+                f.write(json.dumps({'type': 'assistant.message', 'timestamp': at, 'data': {'content': text}}) + '\n')
+        pi = [{'type': 'message', 'timestamp': at, 'message': {'role': 'assistant',
+                                                                 'content': [{'type': 'text', 'text': text}]}}
+              for at, text in [('2026-11-12T16:00:10.751Z', 'pi first'), ('2026-11-12T16:05:29.597Z', 'pi last')]]
+        self.write('2026-11-12T16-00-10-298Z_tk-1.jsonl', pi)
+        got = [s.text for s in worker_log.steps(worker_log.session_files(self.state, 'tk-1'))]
+        self.assertEqual(got, ['copilot first', 'copilot last', 'pi first', 'pi last'])
+
     def test_steps_follow_the_session_in_order(self):
         path = self.write('2026-11-09T03-24-39-408Z_tk-1.jsonl', SESSION)
         got = [(s.kind, s.title, s.text) for s in worker_log.steps([path])]

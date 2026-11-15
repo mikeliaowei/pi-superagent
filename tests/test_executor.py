@@ -118,7 +118,8 @@ class PiRpcTest(unittest.IsolatedAsyncioTestCase):
     async def test_handled_disposition_returns_immediately(self):
         rpc = await fake('handled')
         try:
-            r = await asyncio.wait_for(rpc.run('/cmd', timeout=10), 2)
+            # Returns at once, not after the run's own 60 s timeout; 15 s allows a slow process start (Windows, scanners).
+            r = await asyncio.wait_for(rpc.run('/cmd', timeout=60), 15)
         finally:
             await rpc.close()
         self.assertEqual((r.text, r.error, r.settled, r.aborted), ('', '', False, False))
@@ -258,11 +259,32 @@ class ArgvEnvTest(unittest.TestCase):
         self.assertNotIn('password=p', r.stdout)
 
 
+class EnsureCheckoutTest(unittest.TestCase):
+    def test_a_missing_checkout_is_made_with_origin_on_github_and_a_foreign_folder_is_left_alone(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        c = Config(agent_login='bot', allowed=['alice'], state_dir=tmp, repos=[{'name': 'o/r'}])
+        repo = c.repo_config('o/r')
+        self.assertEqual(repo.checkout, os.path.join(tmp, 'checkouts', 'o__r'))  # nobody cloned it
+        self.assertEqual(executor.ensure_checkout(c, repo), '')
+        origin = subprocess.run(['git', '-C', repo.checkout, 'remote', 'get-url', 'origin'], capture_output=True,
+                                text=True).stdout.strip()
+        self.assertEqual(origin, 'https://github.com/o/r.git')  # no token in it: fetch_origin brings that
+        self.assertEqual(executor.ensure_checkout(c, repo), '')  # made once, then left as it is
+        other = c.repo_config('o/r')
+        other.checkout = os.path.join(tmp, 'notes')
+        os.makedirs(other.checkout)
+        open(os.path.join(other.checkout, 'todo.txt'), 'w').close()
+        self.assertIn('is not a git clone of o/r', executor.ensure_checkout(c, other))
+        self.assertEqual(os.listdir(other.checkout), ['todo.txt'])
+
+
 class PrepareWorktreeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.cfg = cfg(self.tmp, base_branch='dev')
+        os.makedirs(os.path.join(self.tmp, 'checkout', '.git'))  # a clone already there: ensure_checkout leaves it
         self.calls, self.envs = [], []
 
     def run_ok(self, branch_exists=False, fail=None, origin_url=''):
@@ -305,12 +327,14 @@ class PrepareWorktreeTest(unittest.TestCase):
             self.assertEqual((env['GIT_CONFIG_NOSYSTEM'], env['GIT_CONFIG_GLOBAL'], env['GIT_TERMINAL_PROMPT']),
                              ('1', os.devnull, '0'))
 
-    def test_existing_worktree_is_reused(self):
+    def test_existing_worktree_is_reused_with_its_base_branch_fetched_again(self):
         path = os.path.join(self.cfg.work_dir, 'fix-bug')
         os.makedirs(path)
         open(os.path.join(path, '.git'), 'w').close()
         self.assertEqual(executor.prepare_worktree(self.cfg, ticket(), run=self.run_ok()), (path, 'agent/fix-bug'))
-        self.assertEqual(self.calls, [])
+        cmds = [c for c, _ in self.calls]
+        self.assertIn(['git', 'fetch', 'origin', 'dev'], cmds)  # a resumed worker cannot fetch: the service does
+        self.assertFalse([c for c in cmds if c[1] == 'worktree'])
 
     def test_existing_branch_is_checked_out_without_recreating_it(self):
         path, _ = executor.prepare_worktree(self.cfg, ticket(), run=self.run_ok(branch_exists=True))
@@ -481,8 +505,8 @@ class ReportServerTest(unittest.TestCase):
             conn.close()
 
     def test_bad_content_length_is_400_before_reading(self):
-        for length in ('abc', '-1'):
-            self.assertEqual(self.raw_post(length), 400, length)
+        for length in ('abc', '-1'):  # no body: one left unread would reset the connection on Windows before the reply
+            self.assertEqual(self.raw_post(length, body=b''), 400, length)
         self.assertEqual(self.seen, [])
 
     def test_report_for_an_assignment_that_is_not_running_is_409(self):
@@ -600,7 +624,7 @@ class CopilotTest(unittest.IsolatedAsyncioTestCase):
         for flag in ('--disable-builtin-mcps', '--no-custom-instructions', '--allow-all-tools', '--no-ask-user'):
             self.assertIn(flag, argv)
         self.assertEqual(argv[argv.index('--reasoning-effort') + 1], 'high')
-        self.assertEqual(argv[-2:], ['--add-dir', '/skills/a'])
+        self.assertEqual(argv[-4:], ['--add-dir', '/skills/a', '--add-dir', executor.attachments_dir(self.cfg)])
         argv = executor.copilot_argv(self.cfg, ticket())
         self.assertEqual((argv[argv.index('--model') + 1], argv[argv.index('--reasoning-effort') + 1]),
                          ('claude-sonnet-5.5', 'none'))

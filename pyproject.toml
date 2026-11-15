@@ -20,6 +20,7 @@ panel = ["streamlit>=1.67", "pandas>=2"]
 [project.scripts]
 superagent = "superagent.cli:main"
 superagent-report = "superagent.report:main"
+superagent-propose = "superagent.report:propose_main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -30,3 +31,12 @@ packages = ["superagent"]
 
 [tool.setuptools.package-data]
 superagent = ["skills/*/SKILL.md", "prompts/*.md", "pi/*.md", "pi/*/SKILL.md"]
+
+[atlassian]
+# Jira issues (KEY-123, or a /browse/ link) and Confluence page links in a request or answer are fetched by the
+# service, read-only, and given to the worker as files. Leave a URL empty to turn that side off.
+jira_url = "https://jira.example.com"
+confluence_url = "https://confluence.example.com"
+# Environment variables holding personal access tokens (sent as Bearer). They never reach a worker.
+jira_token_env = "JIRA_API_TOKEN"
+confluence_token_env = "CONFLUENCE_API_TOKEN"

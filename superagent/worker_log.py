@@ -126,6 +126,7 @@ def _entries(paths):
 
 
 USAGE_KEYS = ('input', 'output', 'cacheRead', 'cacheWrite')
+AI_CREDIT_DOLLARS = 0.01  # what one GitHub AI credit costs
 
 
 def _number(v):
@@ -133,13 +134,17 @@ def _number(v):
 
 
 def _usage_of(e):
-    """(timestamp, {input, output, cacheRead, cacheWrite, cost}) of a model call's entry, else None. Copilot bills
-    premium requests, not dollars: its calls cost 0 here."""
+    """(timestamp, {input, output, cacheRead, cacheWrite, cost}) of a model call's entry, else None. A Copilot call's
+    cost is its GitHub AI credits at list price: copilotUsage.totalNanoAiu is in 1e-9 credits, 1 credit = $0.01
+    (docs.github.com, Models and pricing for GitHub Copilot)."""
     if e.get('type') == 'session.usage_record':
         u = (e.get('data') or {}).get('usage')
         if isinstance(u, dict):
+            copilot = u.get('copilotUsage') if isinstance(u.get('copilotUsage'), dict) else {}
+            credits = _number(copilot.get('totalNanoAiu')) / 1e9
             return e.get('timestamp'), {'input': u.get('inputTokens'), 'output': u.get('outputTokens'),
-                                        'cacheRead': u.get('cacheReadTokens'), 'cacheWrite': u.get('cacheWriteTokens')}
+                                        'cacheRead': u.get('cacheReadTokens'), 'cacheWrite': u.get('cacheWriteTokens'),
+                                        'cost': {'total': credits * AI_CREDIT_DOLLARS}}
         return None
     m = e.get('message')
     u = m.get('usage') if e.get('type') == 'message' and isinstance(m, dict) else None
@@ -185,12 +190,27 @@ def usage(paths, since=None):
     return total
 
 
+def _time(at):
+    try:
+        dt = datetime.fromisoformat(str(at).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def steps(paths, secrets=()):
-    """Every step of the sessions, in order; secrets are masked. A half-written last line is skipped."""
+    """Every step of the sessions, oldest first; secrets are masked. A half-written last line is skipped.
+
+    Sessions are ordered by time, not by file: a Ticket worked by Copilot then retried with Pi (or the reverse) has
+    its Copilot events listed after its Pi files. A step without a readable time keeps its place after the one before.
+    """
     secrets = [s for s in secrets if s]
-    out = []
+    keyed, last = [], datetime.min.replace(tzinfo=timezone.utc)
     for e in _entries(paths):
-        out.extend(_entry_steps(e))
+        for s in _entry_steps(e):
+            last = _time(s.at) or last
+            keyed.append((last, len(keyed), s))
+    out = [s for _, _, s in sorted(keyed, key=lambda k: k[:2])]
     for s in out:
         for secret in secrets:
             s.text = s.text.replace(secret, MASK)

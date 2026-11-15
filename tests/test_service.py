@@ -1,10 +1,12 @@
 """End-to-end service tests: fake GitHub, the fake Pi script, a real report server and real git worktrees."""
 
 import asyncio
+import atexit
 import io
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -37,6 +39,39 @@ def git(*args, cwd):
     return subprocess.run(['git', *args], cwd=cwd, check=True, capture_output=True, text=True)
 
 
+_SEEDED = {}  # README text -> a folder holding origin.git and checkout, made once per test process
+
+
+def seeded_repo(tmp, origin='origin.git', checkout='checkout', readme='hello\n'):
+    """A bare origin <tmp>/<origin> with one commit (README) on main, and a clone of it at <tmp>/<checkout>; returns
+    (origin, checkout). Made with git once per test process, then copied: on Windows each git process can take most
+    of a second (process start, file scanning), and every service test needs a fresh pair."""
+    template = _SEEDED.get(readme)
+    if template is None:
+        template = tempfile.mkdtemp(prefix='superagent-seed-')
+        atexit.register(shutil.rmtree, template, True)
+        bare, clone = os.path.join(template, 'origin.git'), os.path.join(template, 'checkout')
+        env = {**os.environ, **GIT_ENV}
+        run = lambda *a, cwd: subprocess.run(['git', *a], cwd=cwd, env=env, check=True, capture_output=True)  # noqa: E731
+        run('init', '--bare', '-q', '-b', 'main', bare, cwd=template)
+        run('clone', '-q', bare, clone, cwd=template)
+        with open(os.path.join(clone, 'README'), 'w') as f:
+            f.write(readme)
+        run('add', 'README', cwd=clone)
+        run('commit', '-q', '-m', 'init', cwd=clone)
+        run('push', '-q', 'origin', 'HEAD:main', cwd=clone)
+        _SEEDED[readme] = template
+    origin, checkout = os.path.join(tmp, origin), os.path.join(tmp, checkout)
+    shutil.copytree(os.path.join(template, 'origin.git'), origin)
+    shutil.copytree(os.path.join(template, 'checkout'), checkout)
+    config = os.path.join(checkout, '.git', 'config')
+    with open(config, encoding='utf-8') as f:
+        text = f.read()
+    with open(config, 'w', encoding='utf-8') as f:  # point the copy at its own origin, escaped as git writes it
+        f.write(re.sub(r'(?m)^(\s*url = ).*$', lambda m: m.group(1) + origin.replace('\\', '\\\\'), text))
+    return origin, checkout
+
+
 def post_report(env, report):
     req = urllib.request.Request(env['SUPERAGENT_URL'] + '/report', data=json.dumps(report).encode(), method='POST',
                                  headers={'Authorization': f"Bearer {env['SUPERAGENT_TICKET_TOKEN']}",
@@ -50,15 +85,16 @@ class ScriptedRpc(PiRpc):
 
     def __init__(self, step):
         super().__init__()
-        self.step, self.messages = step, []
+        self.step, self.messages, self.images = step, [], []
 
     async def start(self, argv, cwd, env):
         self.argv, self.cwd, self.env = argv, cwd, env
         await super().start([sys.executable, FAKE_PI, *argv[1:]], cwd,
                             {**env, 'FAKE_PI_MODE': self.step.get('mode', 'ok')})
 
-    async def run(self, message, timeout):
+    async def run(self, message, timeout, images=()):
         self.messages.append(message)
+        self.images.append(list(images))
         if before := self.step.get('before'):
             before(self.cwd, self.env)  # runs as the worker would: in its worktree, with its environment
         if self.step.get('commit'):
@@ -87,14 +123,22 @@ class Pi:
 
 
 class Git:
-    """Real git, except pushes (which would reach github.com): those are recorded, or fail on demand."""
+    """Real git, except pushes (which would reach github.com): those are recorded, or fail on demand. `rejected`: how
+    many of the next pushes GitHub refuses as not a fast-forward (the branch has commits the push does not)."""
+
+    REJECTED = ('To https://github.com/o/r.git\n ! [rejected]        {0} -> {0} (fetch first)\n'
+                "error: failed to push some refs to 'https://github.com/o/r.git'\n"
+                'hint: Updates were rejected because the remote contains work that you do not\n')
 
     def __init__(self):
-        self.pushes, self.fail_push = [], False
+        self.pushes, self.fail_push, self.rejected = [], False, 0
 
     def __call__(self, argv, **kw):
         if 'push' in argv:
             self.pushes.append((argv, kw.get('env') or {}))
+            if self.rejected:
+                self.rejected -= 1
+                return subprocess.CompletedProcess(argv, 1, '', self.REJECTED.format(argv[-1].split(':')[-1]))
             return subprocess.CompletedProcess(argv, 1 if self.fail_push else 0, '', 'denied' if self.fail_push else '')
         return subprocess.run(argv, **kw)
 
@@ -114,14 +158,7 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         env = mock.patch.dict(os.environ, {**GIT_ENV, 'SUPERAGENT_GITHUB_TOKEN': TOKEN})
         env.start()
         self.addCleanup(env.stop)
-        origin, checkout = os.path.join(self.tmp, 'origin.git'), os.path.join(self.tmp, 'checkout')
-        git('init', '--bare', '-b', 'main', origin, cwd=self.tmp)
-        git('clone', origin, checkout, cwd=self.tmp)
-        with open(os.path.join(checkout, 'README'), 'w') as f:
-            f.write('hello\n')
-        git('add', 'README', cwd=checkout)
-        git('commit', '-m', 'init', cwd=checkout)
-        git('push', 'origin', 'HEAD:main', cwd=checkout)
+        origin, checkout = seeded_repo(self.tmp)
         self.cfg = Config(repo='o/r', agent_login='bot', allowed=['alice'], checkout=checkout,
                           state_dir=os.path.join(self.tmp, 'state'), pi='/nonexistent/pi')
         self.store = Store(self.cfg.db_path)
@@ -517,6 +554,21 @@ class ServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.store.get(f'operator:stop:{t.id}'))
         self.assertIn('operator', self.gh.posted(n)[-1])
 
+    async def test_operator_done_ends_a_ticket_as_completed_without_a_pull_request(self):
+        n = self.gh.add_issue('Comment on RWT-1', '@bot comment on RWT-1')
+        pi = Pi({'mode': 'hang'})
+        self.service(pi)
+        await self.round()
+        await until(lambda: self.svc.workers)
+        t = self.only_ticket()
+        self.store.put(f'operator:done:{t.id}', self.now.isoformat())
+        await self.round()
+        t = self.store.ticket(t.id)
+        self.assertEqual((t.state, t.outcome, t.pr_number), ('ended', 'completed', None))
+        self.assertIsNotNone(pi.runs[0].proc.returncode)  # its worker is stopped too
+        self.assertFalse(self.store.get(f'operator:done:{t.id}'))
+        self.assertEqual(self.gh.posted(n)[-1].split('<!--')[0].strip(), 'Marked done by the operator.')
+
     async def test_operator_retry_relaunches_a_failed_ticket(self):
         self.gh.add_issue('Fix it', '@bot fix')
         pi = Pi({'mode': 'error'}, {'mode': 'hang'})
@@ -603,6 +655,13 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(store.get('operator:stop:tk-1'))
         self.assertEqual(store.ticket('tk-1').state, 'open')  # the service applies it
+
+    def test_done_records_a_request_for_the_service(self):
+        store, _ = self.add_ticket()
+        code, out, _ = self.cli('done', 'fix-it')
+        self.assertEqual(code, 0)
+        self.assertIn('done requested for fix-it', out)
+        self.assertTrue(store.get('operator:done:tk-1'))
 
     def test_retry_records_a_request_and_unknown_ticket_is_exit_1(self):
         store, _ = self.add_ticket()

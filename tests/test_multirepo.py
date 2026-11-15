@@ -24,7 +24,7 @@ from superagent.report import ReportServer
 from superagent.service import Service
 from superagent.store import Store
 from tests.fake_github import FakeGitHub, FakeGitHubs
-from tests.test_service import GIT_ENV, TOKEN, Git, Pi, git, until
+from tests.test_service import GIT_ENV, TOKEN, Git, Pi, git, seeded_repo, until
 
 NOW = datetime(2026, 11, 8, 13, tzinfo=timezone.utc)
 
@@ -37,14 +37,7 @@ def write(path, text):
 
 def make_clone(tmp, slug):
     """A bare origin with one commit on main, and a local clone of it. Returns the clone's path."""
-    origin, checkout = os.path.join(tmp, f'{slug}.git'), os.path.join(tmp, slug)
-    git('init', '--bare', '-b', 'main', origin, cwd=tmp)
-    git('clone', origin, checkout, cwd=tmp)
-    write(os.path.join(checkout, 'README'), f'{slug}\n')
-    git('add', 'README', cwd=checkout)
-    git('commit', '-m', 'init', cwd=checkout)
-    git('push', 'origin', 'HEAD:main', cwd=checkout)
-    return checkout
+    return seeded_repo(tmp, f'{slug}.git', slug, f'{slug}\n')[1]
 
 
 class ConfigTest(unittest.TestCase):
@@ -89,8 +82,9 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'not both'):
             self.load(self.HEAD.replace('[github]\n', '[github]\nrepo = "o/r"\n')
                       + '[executor]\ncheckout = "/c"\n[[repos]]\nname = "a/one"\ncheckout = "/a"\n')
-        with self.assertRaises(TypeError):  # the CLI reports it as an unknown or missing field
-            self.load('[[repos]]\nname = "a/one"\n' + self.HEAD)
+        # A repo without a checkout is fine: superagent keeps its own copy (made on first use).
+        c = self.load('[[repos]]\nname = "a/one"\n' + self.HEAD)
+        self.assertEqual(c.repo_config('a/one').checkout, c.own_checkout('a/one'))
 
 
 class CheckTest(unittest.TestCase):
@@ -111,8 +105,10 @@ class CheckTest(unittest.TestCase):
         lines = out.getvalue().splitlines()
         self.assertEqual(lines[0], 'ok    config loads: a/one, b/two as bot')
         self.assertIn(f'ok    checkout: {good} is a git repo with origin {os.path.join(tmp, "one.git")}', lines)
-        self.assertIn(f'FAIL  checkout: {tmp}/missing is not a git clone with an origin remote; '
-                      f'run `git clone https://github.com/b/two.git {tmp}/missing`', lines)
+        self.assertIn(f'FAIL  checkout: {tmp}/missing is not a git clone with an origin remote; leave `checkout` out of '
+                      f'the config to let superagent make its own, or run `git clone https://github.com/b/two.git '
+                      f'{tmp}/missing`', lines)
+        self.assertFalse(os.path.exists(f'{tmp}/missing'))  # a configured checkout is never made
 
 
 class PollTest(unittest.TestCase):
@@ -425,12 +421,13 @@ class EnforcedTestsTest(ServiceBase):
         self.assertIn('echo nope; exit 1', posted[1])
 
     async def test_a_test_command_that_runs_too_long_is_killed_and_reported_as_a_timeout(self):
-        self.start('echo started; sleep 30 & wait', {'commit': True, 'report': {'status': 'ready', 'summary': 'x'}},
+        self.start('echo started; sleep 300 & wait', {'commit': True, 'report': {'status': 'ready', 'summary': 'x'}},
                    {'report': {'status': 'blocked', 'summary': 'cannot speed it up'}}, test_timeout=1)
         began = time.monotonic()
         await self.round()
         await self.drain()
-        self.assertLess(time.monotonic() - began, 20)
+        # Killed after 1 s, not waited for: far below the 300 s sleep, with room for a loaded machine (parallel runs).
+        self.assertLess(time.monotonic() - began, 90)
         msg = self.pi.runs[1].messages[0]
         self.assertIn('timed out after 1s', msg)
         self.assertIn('started', msg)
