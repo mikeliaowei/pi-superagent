@@ -12,6 +12,13 @@ MODE = os.environ.get('FAKE_COPILOT_MODE', 'ok')
 STATE = os.environ.get('FAKE_COPILOT_STATE', '.')
 pending_prompt = None
 
+# Like the real CLI, refuse to start when an --add-dir directory does not exist.
+for flag, value in zip(sys.argv, sys.argv[1:]):
+    if flag == '--add-dir' and not os.path.isdir(value):
+        sys.stderr.write(f"error: option '--add-dir <directory>' argument '{value}' is invalid. "
+                         f'Directory does not exist or cannot be accessed: {value}\n')
+        sys.exit(1)
+
 
 def emit(obj):
     sys.stdout.write(json.dumps(obj) + '\n')

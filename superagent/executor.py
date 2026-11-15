@@ -228,6 +228,8 @@ def copilot_argv(cfg, ticket):
     effort = ticket.thinking or cfg.thinking
     # Copilot picks the reasoning effort itself for its 'auto' model and refuses a session that sets one.
     reasoning = [] if model == 'auto' else ['--reasoning-effort', 'none' if effort == 'off' else effort]
+    # Copilot refuses to start when an --add-dir directory is missing, and nothing has been attached yet on a new setup.
+    os.makedirs(attachments_dir(cfg), exist_ok=True)
     return [shutil.which(cfg.copilot) or cfg.copilot, '--acp', '--stdio', '--model', model,
             *reasoning, '--allow-all-tools', '--disable-builtin-mcps',
             '--no-ask-user', '--no-custom-instructions', '--no-auto-update',
